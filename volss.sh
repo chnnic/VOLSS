@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.2.2
+#   版本: V1.2.3
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.2.2"
+VERSION="V1.2.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -955,11 +955,12 @@ RULESET_URLS=(
     ["adult"]="色情网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Adult"
     ["gambling"]="赌博网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Gambling"
     ["malware"]="恶意软件|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Malware"
-    ["scam"]="诈骗网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Scam"
+    ["scam"]="诈骗欺诈|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Scam"
     ["tracking"]="追踪统计|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Tracking"
-    ["crypto"]="加密货币挖矿|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Crypto"
+    ["crypto"]="挖矿劫持|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Crypto"
     ["dating"]="交友网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Dating"
     ["bt"]="BT下载|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Torrents"
+    ["finance"]="金融理财|https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling.txt"
 )
 
 # 初始化规则集目录
@@ -1042,7 +1043,7 @@ manage_rulesets() {
 
         # 显示所有可用规则集和安装状态
         local i=1
-        local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt")
+        local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt" "finance")
         for KEY in "${KEYS[@]}"; do
             IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
             if [ -f "$ACL_RULESET_DIR/${KEY}.acl" ]; then
@@ -1051,22 +1052,28 @@ manage_rulesets() {
             else
                 STATUS="${RED}○ 未安装${NC}"
             fi
-            printf "  ${GREEN}%2d)${NC} %-12s %-20s %b\n" "$i" "$KEY" "$DESC" "$STATUS"
+            # 中文字符占2列宽，手动补空格对齐
+            DESC_LEN=${#DESC}
+            # 每个中文字符多占1列，计算需要补的空格数
+            CN_CHARS=$(echo "$DESC" | grep -oP '[\x{4e00}-\x{9fff}]' | wc -l)
+            PAD=$((10 - DESC_LEN - CN_CHARS))
+            SPACES=$(printf '%*s' "$PAD" '')
+            printf "  \033[0;32m%2d)\033[0m %-12s %s%s %b\n" "$i" "$KEY" "$DESC" "$SPACES" "$STATUS"
             i=$((i+1))
         done
 
         echo -e "  ${BLUE}-------------------------------------------------${NC}"
-        echo -e "  ${GREEN}10)${NC} 安装全部规则集"
-        echo -e "  ${GREEN}11)${NC} 卸载某个规则集"
-        echo -e "  ${GREEN}12)${NC} 更新已安装规则集"
-        echo -e "  ${GREEN}13)${NC} 添加自定义规则集 URL"
-        echo -e "  ${GREEN}14)${NC} 查看当前生效规则数量"
+        echo -e "  ${GREEN}11)${NC} 安装全部规则集"
+        echo -e "  ${GREEN}12)${NC} 卸载某个规则集"
+        echo -e "  ${GREEN}13)${NC} 更新已安装规则集"
+        echo -e "  ${GREEN}14)${NC} 添加自定义规则集 URL"
+        echo -e "  ${GREEN}15)${NC} 查看当前生效规则数量"
         echo -e "  ${RED} 0)${NC} 返回主菜单"
         echo -e "${BLUE}  =================================================${NC}"
         read -p "  请选择: " CHOICE
 
         case $CHOICE in
-            [1-9])
+            [1-9]|10)
                 local IDX=$((CHOICE-1))
                 local KEY="${KEYS[$IDX]}"
                 IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
@@ -1077,9 +1084,9 @@ manage_rulesets() {
                 fi
                 download_ruleset "$KEY" "$URL" && rebuild_acl
                 ;;
-            10)
+            11)
                 echo -e "${YELLOW}>>> 安装全部规则集...${NC}"
-                local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt")
+                local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt" "finance")
                 for KEY in "${KEYS[@]}"; do
                     IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
                     download_ruleset "$KEY" "$URL"
@@ -1087,7 +1094,7 @@ manage_rulesets() {
                 rebuild_acl
                 echo -e "${GREEN}✅ 全部规则集安装完成${NC}"
                 ;;
-            11)
+            12)
                 echo -e "\n已安装的规则集："
                 ls $ACL_RULESET_DIR/*.acl 2>/dev/null | xargs -I{} basename {} .acl | nl -ba
                 read -p "输入要卸载的编号: " DEL_IDX
@@ -1100,7 +1107,7 @@ manage_rulesets() {
                     echo -e "${RED}无效编号${NC}"
                 fi
                 ;;
-            12)
+            13)
                 echo -e "${YELLOW}>>> 更新已安装规则集...${NC}"
                 for RULESET_FILE in $ACL_RULESET_DIR/*.acl; do
                     [ -f "$RULESET_FILE" ] || continue
@@ -1113,15 +1120,15 @@ manage_rulesets() {
                 rebuild_acl
                 echo -e "${GREEN}✅ 更新完成${NC}"
                 ;;
-            13)
-                read -p "规则集名称 (英文，如 finance): " CUSTOM_NAME
+            14)
+                read -p "规则集名称 (英文，如 mylist): " CUSTOM_NAME
                 read -p "规则集 URL: " CUSTOM_URL
                 if [ -n "$CUSTOM_NAME" ] && [ -n "$CUSTOM_URL" ]; then
                     RULESET_URLS["$CUSTOM_NAME"]="自定义|$CUSTOM_URL"
                     download_ruleset "$CUSTOM_NAME" "$CUSTOM_URL" && rebuild_acl
                 fi
                 ;;
-            14)
+            15)
                 echo -e "\n${BLUE}  =================================================${NC}"
                 echo -e "${BLUE}    当前生效规则统计${NC}"
                 echo -e "${BLUE}  =================================================${NC}"
@@ -1129,14 +1136,12 @@ manage_rulesets() {
                     TOTAL=$(grep "^||" "$ACL_PATH" | wc -l)
                     echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}"
                     echo ""
-                    # 分规则集统计
                     for RULESET_FILE in $ACL_RULESET_DIR/*.acl; do
                         [ -f "$RULESET_FILE" ] || continue
                         NAME=$(basename "$RULESET_FILE" .acl)
                         COUNT=$(wc -l < "$RULESET_FILE")
                         printf "  %-15s %s 条\n" "$NAME" "$COUNT"
                     done
-                    # 手动添加数量
                     MANUAL=$(grep "^||.*#manual" "$ACL_PATH" 2>/dev/null | wc -l)
                     [ "$MANUAL" -gt 0 ] && printf "  %-15s %s 条\n" "手动添加" "$MANUAL"
                 else
