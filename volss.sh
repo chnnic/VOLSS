@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.1.0
+#   版本: V1.1.2
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.1.0"
+VERSION="V1.1.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -341,12 +341,19 @@ for s in c['servers']:
 }
 
 install_shortcut() {
+    # 获取当前脚本绝对路径
+    CURRENT_SCRIPT=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+
     # 将脚本复制到固定路径
-    CURRENT_SCRIPT=$(realpath "$0")
     if [ "$CURRENT_SCRIPT" != "$SCRIPT_INSTALL_PATH" ]; then
         cp "$CURRENT_SCRIPT" "$SCRIPT_INSTALL_PATH"
-        chmod +x "$SCRIPT_INSTALL_PATH"
-        echo -e "${GREEN}✅ 脚本已安装至: ${YELLOW}$SCRIPT_INSTALL_PATH${NC}"
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}❌ 脚本复制失败，快捷命令将指向当前路径: $CURRENT_SCRIPT${NC}"
+            SCRIPT_INSTALL_PATH="$CURRENT_SCRIPT"
+        else
+            chmod +x "$SCRIPT_INSTALL_PATH"
+            echo -e "${GREEN}✅ 脚本已安装至: ${YELLOW}$SCRIPT_INSTALL_PATH${NC}"
+        fi
     fi
 
     # 如果已存在且不是 volss 脚本则跳过，避免覆盖其他快捷命令
@@ -362,7 +369,13 @@ install_shortcut() {
 bash $SCRIPT_INSTALL_PATH --menu
 EOF
     chmod +x $SHORTCUT
-    echo -e "${GREEN}✅ 快捷命令已注册: 输入 ${YELLOW}volss${GREEN} 呼出管理菜单${NC}"
+
+    # 验证快捷命令是否可用
+    if [ -f "$SCRIPT_INSTALL_PATH" ]; then
+        echo -e "${GREEN}✅ 快捷命令已注册: 输入 ${YELLOW}volss${GREEN} 呼出管理菜单${NC}"
+    else
+        echo -e "${RED}❌ 快捷命令注册失败，请手动运行: bash $CURRENT_SCRIPT${NC}"
+    fi
 }
 
 # ========== 完整安装流程 ==========
@@ -498,6 +511,7 @@ show_traffic() {
 
     python3 << PYEOF
 import json, subprocess, os
+from datetime import datetime
 
 with open('$CONFIG') as f:
     c = json.load(f)
@@ -540,10 +554,13 @@ for i, s in enumerate(c['servers'], 1):
     total_tx = (hist_tx + cur_tx) / 1024 / 1024 / 1024
     total_rx = (hist_rx + cur_rx) / 1024 / 1024 / 1024
 
+    # 最后重置时间
+    last_reset = history.get(key, {}).get('reset_time', '从未重置')
+
     status = '暂停' if s.get('disabled') else '正常'
     color  = '\033[0;31m' if s.get('disabled') else '\033[0;32m'
     reset  = '\033[0m'
-    print(f"  {i:<4} {port:<8} {total_tx:<14.2f} {total_rx:<14.2f} {color}{status}{reset}")
+    print(f"  {i:<4} {port:<8} {total_tx:<14.2f} {total_rx:<14.2f} {color}{status}{reset}  重置: {last_reset}")
 PYEOF
 
     echo -e "  ${BLUE}=================================================${NC}"
@@ -555,11 +572,20 @@ reset_traffic() {
     read -p "输入要重置的用户编号 (0=全部重置): " NUM
 
     if [ "$NUM" = "0" ]; then
-        # 保存当前计数后清零
         iptables -Z INPUT
         iptables -Z OUTPUT
-        # 清空历史文件
-        echo '{}' > $TRAFFIC_FILE
+        # 清空历史文件并记录重置时间
+        RESET_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+        python3 << PYEOF
+import json
+with open('$CONFIG') as f:
+    c = json.load(f)
+history = {}
+for s in c['servers']:
+    history[str(s['server_port'])] = {'tx': 0, 'rx': 0, 'reset_time': '$RESET_TIME'}
+with open('$TRAFFIC_FILE', 'w') as f:
+    json.dump(history, f, indent=2)
+PYEOF
         echo -e "${GREEN}✅ 所有用户流量已重置${NC}"
         return
     fi
@@ -581,15 +607,18 @@ if 0 <= idx < len(ports):
         [ -n "$LINE" ] && iptables -Z $CHAIN $LINE 2>/dev/null
     done
 
-    # 清空该端口历史数据
+    # 清空该端口历史数据并记录重置时间
+    RESET_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     python3 << PYEOF
 import json, os
 if os.path.exists('$TRAFFIC_FILE'):
     with open('$TRAFFIC_FILE') as f:
         history = json.load(f)
-    history.pop('$PORT', None)
-    with open('$TRAFFIC_FILE', 'w') as f:
-        json.dump(history, f, indent=2)
+else:
+    history = {}
+history['$PORT'] = {'tx': 0, 'rx': 0, 'reset_time': '$RESET_TIME'}
+with open('$TRAFFIC_FILE', 'w') as f:
+    json.dump(history, f, indent=2)
 PYEOF
 
     echo -e "${GREEN}✅ 端口 $PORT 流量已重置${NC}"
@@ -926,6 +955,24 @@ show_main_menu() {
 #   主入口
 # =============================================
 check_root
+
+# 自检：快捷命令不存在或指向错误时自动修复
+if [ "$1" != "--save-traffic" ]; then
+    if [ ! -f "$SHORTCUT" ] || ! grep -q "volss" "$SHORTCUT" 2>/dev/null; then
+        CURRENT_SCRIPT=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+        if [ "$CURRENT_SCRIPT" != "$SCRIPT_INSTALL_PATH" ] && [ -f "$CURRENT_SCRIPT" ]; then
+            cp "$CURRENT_SCRIPT" "$SCRIPT_INSTALL_PATH" && chmod +x "$SCRIPT_INSTALL_PATH"
+        fi
+        if [ -f "$SCRIPT_INSTALL_PATH" ]; then
+            cat > $SHORTCUT << EOF
+#!/bin/bash
+bash $SCRIPT_INSTALL_PATH --menu
+EOF
+            chmod +x $SHORTCUT
+            echo -e "${GREEN}✅ 快捷命令已自动修复，输入 ${YELLOW}volss${GREEN} 呼出管理菜单${NC}"
+        fi
+    fi
+fi
 
 case "$1" in
     --menu)         show_main_menu ;;
