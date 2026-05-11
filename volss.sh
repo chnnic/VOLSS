@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.1.4
+#   版本: V1.1.5
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.1.4"
+VERSION="V1.1.5"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -206,7 +206,7 @@ config_acl() {
         echo -e "${BLUE}示例: ippure.com${NC}"
 
         cat > $ACL_PATH << 'ACLEOF'
-[bypass_list]
+[accept_all]
 
 [outbound_block_list]
 ACLEOF
@@ -214,7 +214,9 @@ ACLEOF
         while true; do
             read -p "域名 (空行结束): " DOMAIN
             [ -z "$DOMAIN" ] && break
-            echo "domain-suffix:$DOMAIN" >> $ACL_PATH
+            # 去掉用户可能输入的前缀
+            DOMAIN=$(echo "$DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//')
+            echo "||$DOMAIN" >> $ACL_PATH
             echo -e "  ${GREEN}已添加: $DOMAIN${NC}"
         done
 
@@ -869,7 +871,14 @@ with open(runtime_file, 'w') as f:
 print("✅ runtime.json 已更新")
 PYEOF
 
-        # 更新服务文件（修复旧版 Restart=on-failure）
+        # 修复旧版 ACL 格式（domain-suffix: → ||）
+        if [ -f "$ACL_PATH" ] && grep -q "domain-suffix:" "$ACL_PATH"; then
+            sed -i 's/^domain-suffix:/||/' $ACL_PATH
+            sed -i 's/^\[bypass_list\]/[accept_all]/' $ACL_PATH
+            sed -i '/^\[proxy_list\]$/d' $ACL_PATH
+            systemctl restart shadowsocks-rust
+            echo -e "${GREEN}✅ ACL 格式已自动升级${NC}"
+        fi
         if grep -q "Restart=on-failure" $SERVICE 2>/dev/null; then
             sed -i 's/Restart=on-failure/Restart=always/' $SERVICE
             echo -e "${GREEN}✅ 服务文件已修复${NC}"
@@ -894,14 +903,15 @@ PYEOF
 add_acl_domain() {
     if [ ! -f "$ACL_PATH" ]; then
         cat > $ACL_PATH << 'ACLEOF'
-[bypass_list]
+[accept_all]
 
 [outbound_block_list]
 ACLEOF
     fi
     read -p "输入要屏蔽的域名: " NEW_DOMAIN
     if [ -n "$NEW_DOMAIN" ]; then
-        echo "domain-suffix:$NEW_DOMAIN" >> $ACL_PATH
+        NEW_DOMAIN=$(echo "$NEW_DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//')
+        echo "||$NEW_DOMAIN" >> $ACL_PATH
         systemctl restart shadowsocks-rust
         echo -e "${GREEN}✅ 已添加并重启: $NEW_DOMAIN${NC}"
     fi
@@ -914,14 +924,14 @@ del_acl_domain() {
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    当前 ACL 黑名单${NC}"
     echo -e "${BLUE}  =================================================${NC}"
-    grep "domain-suffix:" $ACL_PATH | nl -ba
+    grep "^||" $ACL_PATH | sed 's/^||//' | nl -ba
     echo -e "  ${BLUE}=================================================${NC}"
     read -p "输入要删除的编号: " DEL_NUM
-    DOMAIN_LINE=$(grep "domain-suffix:" $ACL_PATH | sed -n "${DEL_NUM}p")
+    DOMAIN_LINE=$(grep "^||" $ACL_PATH | sed -n "${DEL_NUM}p")
     if [ -z "$DOMAIN_LINE" ]; then echo -e "${RED}无效编号${NC}"; return; fi
-    sed -i "/${DOMAIN_LINE}/d" $ACL_PATH
+    sed -i "\|^${DOMAIN_LINE}$|d" $ACL_PATH
     systemctl restart shadowsocks-rust
-    echo -e "${GREEN}✅ 已删除: $DOMAIN_LINE${NC}"
+    echo -e "${GREEN}✅ 已删除: $(echo $DOMAIN_LINE | sed 's/^||//')${NC}"
 }
 
 # =============================================
@@ -1003,7 +1013,7 @@ show_main_menu() {
                 echo -e "\n${BLUE}  =================================================${NC}"
                 echo -e "${BLUE}    ACL 黑名单${NC}"
                 echo -e "${BLUE}  =================================================${NC}"
-                [ -f "$ACL_PATH" ] && grep "domain-suffix:" $ACL_PATH || echo "  未配置 ACL"
+                [ -f "$ACL_PATH" ] && grep "^||" $ACL_PATH | sed 's/^||//' || echo "  未配置 ACL"
                 read -p "按回车继续..."
                 ;;
             14) systemctl status shadowsocks-rust --no-pager; read -p "按回车继续..." ;;
