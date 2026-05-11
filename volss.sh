@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.1.5
+#   版本: V1.1.6
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.1.5"
+VERSION="V1.1.6"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -62,7 +62,7 @@ port_in_use() {
 install_deps() {
     echo -e "\n${YELLOW}>>> 安装依赖...${NC}"
     apt-get update -qq
-    apt-get install -y curl openssl python3 iproute2 iptables-persistent -qq
+    apt-get install -y curl wget openssl python3 iproute2 xz-utils iptables-persistent -qq
     echo -e "${GREEN}✅ 依赖安装完成${NC}"
 }
 
