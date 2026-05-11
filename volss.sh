@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.0.7
+#   版本: V1.0.8
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.0.7"
+VERSION="V1.0.8"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -16,6 +16,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SS_BIN="/usr/local/bin/ssserver"
+SCRIPT_INSTALL_PATH="/usr/local/bin/volss.sh"
 CONFIG="/etc/shadowsocks-rust/config.json"
 RUNTIME="/etc/shadowsocks-rust/runtime.json"
 ACL_PATH="/etc/shadowsocks-rust/blocklist.acl"
@@ -338,7 +339,13 @@ for s in c['servers']:
 }
 
 install_shortcut() {
-    SCRIPT_PATH=$(realpath "$0")
+    # 将脚本复制到固定路径
+    CURRENT_SCRIPT=$(realpath "$0")
+    if [ "$CURRENT_SCRIPT" != "$SCRIPT_INSTALL_PATH" ]; then
+        cp "$CURRENT_SCRIPT" "$SCRIPT_INSTALL_PATH"
+        chmod +x "$SCRIPT_INSTALL_PATH"
+        echo -e "${GREEN}✅ 脚本已安装至: ${YELLOW}$SCRIPT_INSTALL_PATH${NC}"
+    fi
 
     # 如果已存在且不是 volss 脚本则跳过，避免覆盖其他快捷命令
     if [ -f "$SHORTCUT" ]; then
@@ -350,7 +357,7 @@ install_shortcut() {
 
     cat > $SHORTCUT << EOF
 #!/bin/bash
-bash $SCRIPT_PATH --menu
+bash $SCRIPT_INSTALL_PATH --menu
 EOF
     chmod +x $SHORTCUT
     echo -e "${GREEN}✅ 快捷命令已注册: 输入 ${YELLOW}volss${GREEN} 呼出管理菜单${NC}"
@@ -390,7 +397,7 @@ do_uninstall() {
 
     systemctl stop    shadowsocks-rust 2>/dev/null
     systemctl disable shadowsocks-rust 2>/dev/null
-    rm -f $SS_BIN $SERVICE $SHORTCUT
+    rm -f $SS_BIN $SERVICE $SHORTCUT $SCRIPT_INSTALL_PATH ${SCRIPT_INSTALL_PATH}.bak
     rm -rf /etc/shadowsocks-rust
     systemctl daemon-reload
 
@@ -676,18 +683,18 @@ do_update() {
     fi
 
     # 备份当前脚本
-    cp $SCRIPT_PATH ${SCRIPT_PATH}.bak
-    echo -e "已备份当前脚本至: ${YELLOW}${SCRIPT_PATH}.bak${NC}"
+    cp $SCRIPT_INSTALL_PATH ${SCRIPT_INSTALL_PATH}.bak
+    echo -e "已备份当前脚本至: ${YELLOW}${SCRIPT_INSTALL_PATH}.bak${NC}"
 
-    # 替换脚本
-    mv $TMP_NEW $SCRIPT_PATH
-    chmod +x $SCRIPT_PATH
+    # 替换脚本到固定路径
+    mv $TMP_NEW $SCRIPT_INSTALL_PATH
+    chmod +x $SCRIPT_INSTALL_PATH
 
     # 更新快捷命令（仅当是 volss 自己的快捷命令时才更新）
     if [ ! -f "$SHORTCUT" ] || grep -q "volss" "$SHORTCUT" 2>/dev/null; then
         cat > $SHORTCUT << EOF
 #!/bin/bash
-bash $SCRIPT_PATH --menu
+bash $SCRIPT_INSTALL_PATH --menu
 EOF
         chmod +x $SHORTCUT
     fi
@@ -695,7 +702,7 @@ EOF
     echo -e "${GREEN}✅ 更新完成！已从 $LOCAL_VER 更新到 $REMOTE_VER${NC}"
     echo -e "${YELLOW}脚本将重新启动...${NC}"
     sleep 2
-    exec bash $SCRIPT_PATH --menu
+    exec bash $SCRIPT_INSTALL_PATH --menu
 }
 
 add_acl_domain() {
