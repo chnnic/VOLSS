@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.0.1
+#   版本: V1.0.2
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.0.1"
+VERSION="V1.0.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -87,16 +87,16 @@ install_ssrust() {
             ;;
     esac
 
-    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${LATEST}/shadowsocks-${LATEST}.${ARCH_NAME}.tar.gz"
+    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${LATEST}/shadowsocks-${LATEST}.${ARCH_NAME}.tar.xz"
     echo "下载中: $URL"
-    curl -L -o /tmp/ss-rust.tar.gz "$URL"
+    wget -O /tmp/ss-rust.tar.xz "$URL"
 
-    if [ $? -ne 0 ]; then
+    if [ $? -ne 0 ] || [ ! -s /tmp/ss-rust.tar.xz ]; then
         echo -e "${RED}❌ 下载失败${NC}"
         return 1
     fi
 
-    tar -xzf /tmp/ss-rust.tar.gz -C /tmp/
+    tar -xJf /tmp/ss-rust.tar.xz -C /tmp/
     mv /tmp/ssserver $SS_BIN
     chmod +x $SS_BIN
     mkdir -p /etc/shadowsocks-rust
@@ -632,6 +632,62 @@ print(len(c['servers']))
     show_links
 }
 
+# ========== 更新脚本 ==========
+do_update() {
+    REMOTE_URL="https://raw.githubusercontent.com/chnnic/VOLSS/refs/heads/main/volss.sh"
+    SCRIPT_PATH=$(realpath "$0")
+    TMP_NEW="/tmp/volss_new.sh"
+
+    echo -e "\n${YELLOW}>>> 检查更新...${NC}"
+    echo -e "远程地址: ${BLUE}$REMOTE_URL${NC}"
+
+    # 下载新版本
+    wget -q -O $TMP_NEW "$REMOTE_URL"
+    if [ $? -ne 0 ] || [ ! -s $TMP_NEW ]; then
+        echo -e "${RED}❌ 下载失败，请检查网络或 GitHub 地址${NC}"
+        return 1
+    fi
+
+    # 获取远程版本号
+    REMOTE_VER=$(grep '^VERSION=' $TMP_NEW | cut -d'"' -f2)
+    LOCAL_VER=$VERSION
+
+    echo -e "本地版本: ${YELLOW}$LOCAL_VER${NC}"
+    echo -e "远程版本: ${GREEN}$REMOTE_VER${NC}"
+
+    if [ "$REMOTE_VER" = "$LOCAL_VER" ]; then
+        echo -e "${GREEN}✅ 已是最新版本，无需更新${NC}"
+        rm -f $TMP_NEW
+        return 0
+    fi
+
+    read -p "发现新版本 $REMOTE_VER，确认更新？[y/N]: " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        rm -f $TMP_NEW
+        return
+    fi
+
+    # 备份当前脚本
+    cp $SCRIPT_PATH ${SCRIPT_PATH}.bak
+    echo -e "已备份当前脚本至: ${YELLOW}${SCRIPT_PATH}.bak${NC}"
+
+    # 替换脚本
+    mv $TMP_NEW $SCRIPT_PATH
+    chmod +x $SCRIPT_PATH
+
+    # 更新快捷命令
+    cat > $SHORTCUT << EOF
+#!/bin/bash
+bash $SCRIPT_PATH --menu
+EOF
+    chmod +x $SHORTCUT
+
+    echo -e "${GREEN}✅ 更新完成！已从 $LOCAL_VER 更新到 $REMOTE_VER${NC}"
+    echo -e "${YELLOW}脚本将重新启动...${NC}"
+    sleep 2
+    exec bash $SCRIPT_PATH --menu
+}
+
 add_acl_domain() {
     if [ ! -f "$ACL_PATH" ]; then
         cat > $ACL_PATH << 'ACLEOF'
@@ -697,6 +753,7 @@ show_main_menu() {
         echo -e "  ${CYAN}  -- 安装管理 --${NC}"
         echo -e "      1)  安装 Shadowsocks-Rust"
         echo -e "      2)  卸载 Shadowsocks-Rust"
+        echo -e "     19)  更新脚本"
         echo -e "  ${CYAN}  -- 用户管理 --${NC}"
         echo -e "      3)  查看用户列表"
         echo -e "      4)  查看所有 SS 链接"
@@ -720,7 +777,7 @@ show_main_menu() {
         echo -e "  ${BLUE}-------------------------------------------------${NC}"
         echo -e "   ${RED}  0)  退出${NC}"
         echo -e "  ${BLUE}=================================================${NC}"
-        read -p "  请选择 [0-18]: " CHOICE
+        read -p "  请选择 [0-19]: " CHOICE
 
         # 未安装时拦截管理功能
         if ! check_installed && [[ "$CHOICE" =~ ^([3-9]|1[0-8])$ ]]; then
@@ -757,6 +814,7 @@ show_main_menu() {
                 echo -e "${YELLOW}按 Ctrl+C 退出日志${NC}"
                 journalctl -u shadowsocks-rust -f
                 ;;
+            19) do_update ;;
             0)
                 echo -e "${GREEN}再见！${NC}"
                 exit 0
