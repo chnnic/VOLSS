@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.2.1
+#   版本: V1.2.2
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.2.1"
+VERSION="V1.2.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1181,35 +1181,35 @@ show_main_menu() {
         echo -e "  ${CYAN}  -- 安装管理 --${NC}"
         echo -e "      1)  安装 Shadowsocks-Rust"
         echo -e "      2)  卸载 Shadowsocks-Rust"
-        echo -e "     19)  更新脚本"
+        echo -e "      3)  更新脚本"
         echo -e "  ${CYAN}  -- 用户管理 --${NC}"
-        echo -e "      3)  查看用户列表"
-        echo -e "      4)  查看所有 SS 链接"
-        echo -e "      5)  暂停某个用户"
-        echo -e "      6)  恢复某个用户"
-        echo -e "      7)  删除某个用户"
-        echo -e "      8)  重新生成所有用户"
+        echo -e "      4)  查看用户列表"
+        echo -e "      5)  查看所有 SS 链接"
+        echo -e "      6)  暂停某个用户"
+        echo -e "      7)  恢复某个用户"
+        echo -e "      8)  删除某个用户"
+        echo -e "      9)  重新生成所有用户"
         echo -e "  ${CYAN}  -- 流量统计 --${NC}"
-        echo -e "      9)  查看流量统计"
-        echo -e "     10)  重置流量统计"
+        echo -e "     10)  查看流量统计"
+        echo -e "     11)  重置流量统计"
         echo -e "  ${CYAN}  -- ACL 黑名单 --${NC}"
-        echo -e "     11)  手动添加屏蔽域名"
-        echo -e "     12)  手动删除屏蔽域名"
-        echo -e "     13)  查看黑名单列表"
-        echo -e "     20)  规则集管理（广告/色情/赌博/BT等）"
+        echo -e "     12)  手动添加屏蔽域名"
+        echo -e "     13)  手动删除屏蔽域名"
+        echo -e "     14)  查看黑名单列表"
+        echo -e "     15)  规则集管理（广告/色情/赌博/BT等）"
         echo -e "  ${CYAN}  -- 服务管理 --${NC}"
-        echo -e "     14)  查看服务状态"
-        echo -e "     15)  启动服务"
-        echo -e "     16)  停止服务"
-        echo -e "     17)  重启服务"
-        echo -e "     18)  查看实时日志"
+        echo -e "     16)  查看服务状态"
+        echo -e "     17)  启动服务"
+        echo -e "     18)  停止服务"
+        echo -e "     19)  重启服务"
+        echo -e "     20)  查看实时日志"
         echo -e "  ${BLUE}-------------------------------------------------${NC}"
         echo -e "   ${RED}  0)  退出${NC}"
         echo -e "  ${BLUE}=================================================${NC}"
-        read -p "  请选择 [0-19]: " CHOICE
+        read -p "  请选择 [0-20]: " CHOICE
 
         # 未安装时拦截管理功能
-        if ! check_installed && [[ "$CHOICE" =~ ^([3-9]|1[0-8])$ ]]; then
+        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|20)$ ]]; then
             echo -e "${RED}⚠ 请先安装 Shadowsocks-Rust（选项 1）${NC}"
             sleep 2
             continue
@@ -1218,17 +1218,18 @@ show_main_menu() {
         case $CHOICE in
             1)  do_install ;;
             2)  do_uninstall ;;
-            3)  list_users;    read -p "按回车继续..." ;;
-            4)  show_links;    read -p "按回车继续..." ;;
-            5)  disable_user;  read -p "按回车继续..." ;;
-            6)  enable_user;   read -p "按回车继续..." ;;
-            7)  delete_user;   read -p "按回车继续..." ;;
-            8)  regen_users;   read -p "按回车继续..." ;;
-            9)  show_traffic;  read -p "按回车继续..." ;;
-            10) reset_traffic; read -p "按回车继续..." ;;
-            11) add_acl_domain; read -p "按回车继续..." ;;
-            12) del_acl_domain; read -p "按回车继续..." ;;
-            13)
+            3)  do_update ;;
+            4)  list_users;    read -p "按回车继续..." ;;
+            5)  show_links;    read -p "按回车继续..." ;;
+            6)  disable_user;  read -p "按回车继续..." ;;
+            7)  enable_user;   read -p "按回车继续..." ;;
+            8)  delete_user;   read -p "按回车继续..." ;;
+            9)  regen_users;   read -p "按回车继续..." ;;
+            10) show_traffic;  read -p "按回车继续..." ;;
+            11) reset_traffic; read -p "按回车继续..." ;;
+            12) add_acl_domain; read -p "按回车继续..." ;;
+            13) del_acl_domain; read -p "按回车继续..." ;;
+            14)
                 echo -e "\n${BLUE}  =================================================${NC}"
                 echo -e "${BLUE}    ACL 黑名单${NC}"
                 echo -e "${BLUE}  =================================================${NC}"
@@ -1237,7 +1238,6 @@ show_main_menu() {
                     TOTAL=$(grep "^||" "$ACL_PATH" | wc -l)
                     MANUAL_COUNT=$(grep "^||.*#manual" "$ACL_PATH" | wc -l)
                     RULESET_COUNT=$((TOTAL - MANUAL_COUNT))
-
                     echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}（手动: $MANUAL_COUNT 条，规则集: $RULESET_COUNT 条）"
                     echo -e "\n  ${CYAN}── 手动添加 ──${NC}"
                     if [ -n "$MANUAL" ]; then
@@ -1261,16 +1261,15 @@ show_main_menu() {
                 fi
                 read -p "按回车继续..."
                 ;;
-            20) manage_rulesets ;;
-            14) systemctl status shadowsocks-rust --no-pager; read -p "按回车继续..." ;;
-            15) systemctl start   shadowsocks-rust && echo -e "${GREEN}✅ 服务已启动${NC}"; read -p "按回车继续..." ;;
-            16) systemctl stop    shadowsocks-rust && echo -e "${YELLOW}⏹ 服务已停止${NC}"; read -p "按回车继续..." ;;
-            17) systemctl restart shadowsocks-rust && echo -e "${GREEN}🔄 服务已重启${NC}"; read -p "按回车继续..." ;;
-            18)
+            15) manage_rulesets ;;
+            16) systemctl status shadowsocks-rust --no-pager; read -p "按回车继续..." ;;
+            17) systemctl start   shadowsocks-rust && echo -e "${GREEN}✅ 服务已启动${NC}"; read -p "按回车继续..." ;;
+            18) systemctl stop    shadowsocks-rust && echo -e "${YELLOW}⏹ 服务已停止${NC}"; read -p "按回车继续..." ;;
+            19) systemctl restart shadowsocks-rust && echo -e "${GREEN}🔄 服务已重启${NC}"; read -p "按回车继续..." ;;
+            20)
                 echo -e "${YELLOW}按 Ctrl+C 退出日志${NC}"
                 journalctl -u shadowsocks-rust -f
                 ;;
-            19) do_update ;;
             0)
                 echo -e "${GREEN}再见！${NC}"
                 exit 0
