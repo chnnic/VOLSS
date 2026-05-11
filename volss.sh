@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.0.0
+#   版本: V1.0.1
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.0.0"
+VERSION="V1.0.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -39,12 +39,11 @@ check_installed() {
 # ========== 打印 Banner ==========
 print_banner() {
     clear
-    echo -e "${BLUE}"
-    echo "  ╔═══════════════════════════════════════════════╗"
-    echo "  ║       Shadowsocks-Rust 管理脚本               ║"
-    echo "  ║       版本: ${VERSION}   快捷命令: volss         ║"
-    echo "  ╚═══════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    echo -e "${BLUE}  =================================================${NC}"
+    echo -e "${BLUE}    Shadowsocks-Rust 管理脚本${NC}"
+    echo -e "${BLUE}    版本: ${VERSION}    快捷命令: volss${NC}"
+    echo -e "${BLUE}  =================================================${NC}"
+    echo ""
 }
 
 # ========== 检查端口是否被占用 ==========
@@ -125,7 +124,7 @@ select_method() {
     echo -e "已选择: ${GREEN}$METHOD${NC}"
 }
 
-# ========== 端口分配（顺序 or 随机）==========
+# ========== 端口分配 ==========
 select_ports() {
     echo -e "\n${YELLOW}>>> 端口分配方式：${NC}"
     echo "  1) 顺序端口（从指定端口开始，自动跳过占用端口）"
@@ -138,7 +137,6 @@ select_ports() {
     [ "$USER_COUNT" -gt 50 ] && USER_COUNT=50
 
     if [ "$PORT_MODE" = "1" ]; then
-        # 顺序模式
         read -p "起始端口 [默认 30001]: " START_PORT
         START_PORT=${START_PORT:-30001}
 
@@ -153,7 +151,6 @@ select_ports() {
                 echo -e "  ${GREEN}端口 $CURRENT 可用 ✓${NC}"
             fi
             CURRENT=$((CURRENT + 1))
-            # 防止无限循环
             if [ $CURRENT -gt 65535 ]; then
                 echo -e "${RED}❌ 端口耗尽，无法分配足够端口${NC}"
                 return 1
@@ -161,7 +158,6 @@ select_ports() {
         done
 
     else
-        # 随机模式
         read -p "端口范围起始 [默认 20000]: " RANGE_START
         read -p "端口范围结束 [默认 60000]: " RANGE_END
         RANGE_START=${RANGE_START:-20000}
@@ -170,11 +166,10 @@ select_ports() {
         echo -e "\n${YELLOW}>>> 正在随机分配端口（跳过已占用）...${NC}"
         PORT_LIST=()
         TRIED=0
-        MAX_TRY=$(( (RANGE_END - RANGE_START) ))
+        MAX_TRY=$(( RANGE_END - RANGE_START ))
 
         while [ ${#PORT_LIST[@]} -lt $USER_COUNT ]; do
             RAND_PORT=$(( RANGE_START + RANDOM % (RANGE_END - RANGE_START + 1) ))
-            # 检查是否重复或占用
             if [[ " ${PORT_LIST[@]} " =~ " $RAND_PORT " ]] || port_in_use $RAND_PORT; then
                 TRIED=$((TRIED + 1))
                 if [ $TRIED -gt $MAX_TRY ]; then
@@ -193,7 +188,6 @@ select_ports() {
 
 basic_config() {
     echo -e "\n${YELLOW}>>> 服务器信息${NC}"
-
     read -p "服务器域名或IP [默认自动检测]: " HOST
     if [ -z "$HOST" ]; then
         HOST=$(curl -s4 ifconfig.me 2>/dev/null || curl -s4 ip.sb)
@@ -401,11 +395,11 @@ do_uninstall() {
 # =============================================
 
 list_users() {
-    echo -e "\n${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║                   当前用户列表                       ║${NC}"
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "\n${BLUE}  =================================================${NC}"
+    echo -e "${BLUE}    当前用户列表${NC}"
+    echo -e "${BLUE}  =================================================${NC}"
     printf "  ${CYAN}%-4s %-8s %-36s %-6s${NC}\n" "编号" "端口" "加密方式" "状态"
-    echo -e "${BLUE}  ──────────────────────────────────────────────────${NC}"
+    echo -e "  ${BLUE}-------------------------------------------------${NC}"
 
     python3 << PYEOF
 import json
@@ -418,24 +412,24 @@ for i, s in enumerate(c['servers'], 1):
     print(f"  {i:<4} {s['server_port']:<8} {s['method']:<36} {color}{status}{reset}")
 PYEOF
 
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "  ${BLUE}=================================================${NC}"
 }
 
 show_links() {
-    echo -e "\n${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║                    SS 链接列表                       ║${NC}"
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "\n${BLUE}  =================================================${NC}"
+    echo -e "${BLUE}    SS 链接列表${NC}"
+    echo -e "${BLUE}  =================================================${NC}"
     cat $LINKS_FILE
-    echo -e "${BLUE}══════════════════════════════════════════════════════${NC}"
+    echo -e "  ${BLUE}=================================================${NC}"
     echo -e "  链接已保存至: ${YELLOW}$LINKS_FILE${NC}"
 }
 
 show_traffic() {
-    echo -e "\n${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║                     流量统计                         ║${NC}"
-    echo -e "${BLUE}╠══════════════════════════════════════════════════════╣${NC}"
+    echo -e "\n${BLUE}  =================================================${NC}"
+    echo -e "${BLUE}    流量统计${NC}"
+    echo -e "${BLUE}  =================================================${NC}"
     printf "  ${CYAN}%-4s %-8s %-14s %-14s %-6s${NC}\n" "编号" "端口" "上行(MB)" "下行(MB)" "状态"
-    echo -e "${BLUE}  ──────────────────────────────────────────────────${NC}"
+    echo -e "  ${BLUE}-------------------------------------------------${NC}"
 
     python3 << PYEOF
 import json, subprocess
@@ -469,7 +463,7 @@ for i, s in enumerate(c['servers'], 1):
     print(f"  {i:<4} {port:<8} {tx:<14.2f} {rx:<14.2f} {color}{status}{reset}")
 PYEOF
 
-    echo -e "${BLUE}╚══════════════════════════════════════════════════════╝${NC}"
+    echo -e "  ${BLUE}=================================================${NC}"
     echo -e "  ${YELLOW}提示: 流量从规则创建后开始统计，重启服务器后重置${NC}"
 }
 
@@ -660,9 +654,11 @@ del_acl_domain() {
     if [ ! -f "$ACL_PATH" ]; then
         echo -e "${RED}ACL 文件不存在${NC}"; return
     fi
-    echo -e "\n${BLUE}========== 当前 ACL 黑名单 ==========${NC}"
+    echo -e "\n${BLUE}  =================================================${NC}"
+    echo -e "${BLUE}    当前 ACL 黑名单${NC}"
+    echo -e "${BLUE}  =================================================${NC}"
     grep "domain-suffix:" $ACL_PATH | nl -ba
-    echo -e "${BLUE}=====================================${NC}"
+    echo -e "  ${BLUE}=================================================${NC}"
     read -p "输入要删除的编号: " DEL_NUM
     DOMAIN_LINE=$(grep "domain-suffix:" $ACL_PATH | sed -n "${DEL_NUM}p")
     if [ -z "$DOMAIN_LINE" ]; then echo -e "${RED}无效编号${NC}"; return; fi
@@ -693,39 +689,38 @@ show_main_menu() {
             SVC_LABEL="${RED}● 未运行${NC}"
         fi
 
-        echo -e "${BLUE}╔══════════════════════════════════════════════════════╗${NC}"
-        echo -e "${BLUE}║       Shadowsocks-Rust 管理脚本  ${VERSION}          ║${NC}"
-        echo -e "${BLUE}║       快捷命令: volss                                ║${NC}"
-        echo -e "${BLUE}╠══════════════════════════════════════════════════════╣${NC}"
-        printf "${BLUE}║${NC}  安装: %-30b 服务: %-20b${BLUE}║${NC}\n" "$SS_STATUS" "$SVC_LABEL"
-        echo -e "${BLUE}╠══════════════════════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}── 安装管理 ──────────────────────────────────${BLUE}  ║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN} 1)${NC} 安装 Shadowsocks-Rust                      ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN} 2)${NC} 卸载 Shadowsocks-Rust                      ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}── 用户管理 ──────────────────────────────────${BLUE}  ║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN} 3)${NC} 查看用户列表                               ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN} 4)${NC} 查看所有 SS 链接                           ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN} 5)${NC} 暂停某个用户                               ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN} 6)${NC} 恢复某个用户                               ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN} 7)${NC} 删除某个用户                               ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN} 8)${NC} 重新生成所有用户                           ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}── 流量统计 ──────────────────────────────────${BLUE}  ║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN} 9)${NC} 查看流量统计                               ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}10)${NC} 重置流量统计                               ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}── ACL 黑名单 ────────────────────────────────${BLUE}  ║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}11)${NC} 添加屏蔽域名                               ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}12)${NC} 删除屏蔽域名                               ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}13)${NC} 查看黑名单列表                             ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}  ${CYAN}── 服务管理 ──────────────────────────────────${BLUE}  ║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}14)${NC} 查看服务状态                               ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}15)${NC} 启动服务                                   ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}16)${NC} 停止服务                                   ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}17)${NC} 重启服务                                   ${BLUE}║${NC}"
-        echo -e "${BLUE}║${NC}   ${GREEN}18)${NC} 查看实时日志                               ${BLUE}║${NC}"
-        echo -e "${BLUE}╠══════════════════════════════════════════════════════╣${NC}"
-        echo -e "${BLUE}║${NC}   ${RED} 0)${NC} 退出                                       ${BLUE}║${NC}"
-        echo -e "${BLUE}╚══════════════════════════════════════════════════════╝${NC}"
-        read -p "请选择 [0-18]: " CHOICE
+        echo -e "  ${BLUE}=================================================${NC}"
+        echo -e "    Shadowsocks-Rust 管理脚本    ${VERSION}    快捷命令: volss"
+        echo -e "  ${BLUE}=================================================${NC}"
+        printf "    安装: %-20b 服务: %-20b\n" "$SS_STATUS" "$SVC_LABEL"
+        echo -e "  ${BLUE}-------------------------------------------------${NC}"
+        echo -e "  ${CYAN}  -- 安装管理 --${NC}"
+        echo -e "      1)  安装 Shadowsocks-Rust"
+        echo -e "      2)  卸载 Shadowsocks-Rust"
+        echo -e "  ${CYAN}  -- 用户管理 --${NC}"
+        echo -e "      3)  查看用户列表"
+        echo -e "      4)  查看所有 SS 链接"
+        echo -e "      5)  暂停某个用户"
+        echo -e "      6)  恢复某个用户"
+        echo -e "      7)  删除某个用户"
+        echo -e "      8)  重新生成所有用户"
+        echo -e "  ${CYAN}  -- 流量统计 --${NC}"
+        echo -e "      9)  查看流量统计"
+        echo -e "     10)  重置流量统计"
+        echo -e "  ${CYAN}  -- ACL 黑名单 --${NC}"
+        echo -e "     11)  添加屏蔽域名"
+        echo -e "     12)  删除屏蔽域名"
+        echo -e "     13)  查看黑名单列表"
+        echo -e "  ${CYAN}  -- 服务管理 --${NC}"
+        echo -e "     14)  查看服务状态"
+        echo -e "     15)  启动服务"
+        echo -e "     16)  停止服务"
+        echo -e "     17)  重启服务"
+        echo -e "     18)  查看实时日志"
+        echo -e "  ${BLUE}-------------------------------------------------${NC}"
+        echo -e "   ${RED}  0)  退出${NC}"
+        echo -e "  ${BLUE}=================================================${NC}"
+        read -p "  请选择 [0-18]: " CHOICE
 
         # 未安装时拦截管理功能
         if ! check_installed && [[ "$CHOICE" =~ ^([3-9]|1[0-8])$ ]]; then
@@ -748,8 +743,10 @@ show_main_menu() {
             11) add_acl_domain; read -p "按回车继续..." ;;
             12) del_acl_domain; read -p "按回车继续..." ;;
             13)
-                echo -e "\n${BLUE}========== ACL 黑名单 ==========${NC}"
-                [ -f "$ACL_PATH" ] && grep "domain-suffix:" $ACL_PATH || echo "未配置 ACL"
+                echo -e "\n${BLUE}  =================================================${NC}"
+                echo -e "${BLUE}    ACL 黑名单${NC}"
+                echo -e "${BLUE}  =================================================${NC}"
+                [ -f "$ACL_PATH" ] && grep "domain-suffix:" $ACL_PATH || echo "  未配置 ACL"
                 read -p "按回车继续..."
                 ;;
             14) systemctl status shadowsocks-rust --no-pager; read -p "按回车继续..." ;;
