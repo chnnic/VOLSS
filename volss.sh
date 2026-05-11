@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.1.2
+#   版本: V1.1.4
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.1.2"
+VERSION="V1.1.4"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -237,13 +237,13 @@ gen_password() {
 generate_config() {
     echo -e "\n${YELLOW}>>> 生成配置文件和 SS 链接...${NC}"
 
+    # ACL 写在顶层，不写在每个 server 块里
     if [ "$USE_ACL_FLAG" = true ]; then
-        ACL_LINE=",\"acl\":\"$ACL_PATH\""
+        echo "{\"acl\":\"$ACL_PATH\",\"servers\":[" > $CONFIG
     else
-        ACL_LINE=""
+        echo '{"servers":[' > $CONFIG
     fi
 
-    echo '{"servers":[' > $CONFIG
     > $LINKS_FILE
 
     TOTAL=${#PORT_LIST[@]}
@@ -253,9 +253,9 @@ generate_config() {
         NUM=$((i + 1))
 
         if [ $NUM -lt $TOTAL ]; then
-            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\"$ACL_LINE}," >> $CONFIG
+            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\"}," >> $CONFIG
         else
-            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\"$ACL_LINE}" >> $CONFIG
+            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\"}" >> $CONFIG
         fi
 
         USERINFO=$(echo -n "$METHOD:$PASS" | base64 -w 0)
@@ -268,14 +268,24 @@ generate_config() {
 
 apply_config() {
     python3 << PYEOF
-import json
+import json, os
 
 with open('$CONFIG', 'r') as f:
     config = json.load(f)
 
-runtime = {'servers': [dict(s) for s in config['servers'] if not s.get('disabled', False)]}
-for s in runtime['servers']:
+# 过滤禁用用户
+servers = [dict(s) for s in config['servers'] if not s.get('disabled', False)]
+for s in servers:
     s.pop('disabled', None)
+    s.pop('acl', None)  # 移除 server 块里的旧 acl 字段
+
+runtime = {'servers': servers}
+
+# 顶层 ACL 继承
+if 'acl' in config and os.path.exists(config['acl']):
+    runtime['acl'] = config['acl']
+elif os.path.exists('$ACL_PATH'):
+    runtime['acl'] = '$ACL_PATH'
 
 with open('$RUNTIME', 'w') as f:
     json.dump(runtime, f, indent=2)
@@ -763,7 +773,6 @@ print(len(c['servers']))
 # ========== 更新脚本 ==========
 do_update() {
     REMOTE_URL="https://raw.githubusercontent.com/chnnic/VOLSS/refs/heads/main/volss.sh"
-    SCRIPT_PATH=$(realpath "$0")
     TMP_NEW="/tmp/volss_new.sh"
 
     echo -e "\n${YELLOW}>>> 检查更新...${NC}"
@@ -796,7 +805,7 @@ do_update() {
     fi
 
     # 备份当前脚本
-    cp $SCRIPT_INSTALL_PATH ${SCRIPT_INSTALL_PATH}.bak
+    cp $SCRIPT_INSTALL_PATH ${SCRIPT_INSTALL_PATH}.bak 2>/dev/null
     echo -e "已备份当前脚本至: ${YELLOW}${SCRIPT_INSTALL_PATH}.bak${NC}"
 
     # 替换脚本到固定路径
@@ -813,7 +822,71 @@ EOF
     fi
 
     echo -e "${GREEN}✅ 更新完成！已从 $LOCAL_VER 更新到 $REMOTE_VER${NC}"
-    echo -e "${YELLOW}脚本将重新启动...${NC}"
+
+    # 自动迁移修复（兼容旧版配置）
+    if [ -f "$CONFIG" ]; then
+        echo -e "\n${YELLOW}>>> 自动修复旧版配置...${NC}"
+        python3 << PYEOF
+import json, os
+
+config_file = '$CONFIG'
+runtime_file = '$RUNTIME'
+acl_path = '$ACL_PATH'
+
+with open(config_file) as f:
+    c = json.load(f)
+
+changed = False
+
+# 检查 server 块里是否有 acl 字段（旧版写法），迁移到顶层
+for s in c['servers']:
+    if 'acl' in s:
+        s.pop('acl')
+        changed = True
+
+# 如果 ACL 文件存在但顶层没有配置，自动补上
+if os.path.exists(acl_path) and c.get('acl') != acl_path:
+    c['acl'] = acl_path
+    changed = True
+
+if changed:
+    with open(config_file, 'w') as f:
+        json.dump(c, f, indent=2)
+    print("✅ config.json 已迁移")
+
+# 重新生成 runtime
+servers = [dict(s) for s in c['servers'] if not s.get('disabled', False)]
+for s in servers:
+    s.pop('disabled', None)
+    s.pop('acl', None)
+
+runtime = {'servers': servers}
+if os.path.exists(acl_path):
+    runtime['acl'] = acl_path
+
+with open(runtime_file, 'w') as f:
+    json.dump(runtime, f, indent=2)
+print("✅ runtime.json 已更新")
+PYEOF
+
+        # 更新服务文件（修复旧版 Restart=on-failure）
+        if grep -q "Restart=on-failure" $SERVICE 2>/dev/null; then
+            sed -i 's/Restart=on-failure/Restart=always/' $SERVICE
+            echo -e "${GREEN}✅ 服务文件已修复${NC}"
+        fi
+
+        # 确保 ExecStop 存在
+        if ! grep -q "ExecStop" $SERVICE 2>/dev/null; then
+            sed -i "/ExecStart=.*/a ExecStop=/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'" $SERVICE
+            echo -e "${GREEN}✅ 服务停止钩子已添加${NC}"
+        fi
+
+        systemctl daemon-reload
+        systemctl restart shadowsocks-rust
+        echo -e "${GREEN}✅ 服务已重启${NC}"
+    fi
+
+    echo -e "\n${YELLOW}脚本将重新启动...${NC}"
     sleep 2
     exec bash $SCRIPT_INSTALL_PATH --menu
 }
