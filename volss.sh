@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.0.4
+#   版本: V1.0.5
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.0.4"
+VERSION="V1.0.5"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -293,8 +293,9 @@ After=network.target
 
 [Service]
 Type=simple
+User=root
 ExecStart=$SS_BIN -c $RUNTIME
-Restart=on-failure
+Restart=always
 RestartSec=5s
 
 [Install]
