@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.0.3
+#   版本: V1.0.4
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.0.3"
+VERSION="V1.0.4"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -426,7 +426,7 @@ show_traffic() {
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    流量统计${NC}"
     echo -e "${BLUE}  =================================================${NC}"
-    printf "  ${CYAN}%-4s %-8s %-14s %-14s %-6s${NC}\n" "编号" "端口" "上行(MB)" "下行(MB)" "状态"
+    printf "  ${CYAN}%-4s %-8s %-14s %-14s %-6s${NC}\n" "编号" "端口" "上行(GB)" "下行(GB)" "状态"
     echo -e "  ${BLUE}-------------------------------------------------${NC}"
 
     python3 << PYEOF
@@ -447,7 +447,7 @@ def get_mb(chain, port, direction):
                         total += int(parts[1])
                     elif direction == 'dport' and f'dpt:{port}' in line:
                         total += int(parts[1])
-        return total / 1024 / 1024
+        return total / 1024 / 1024 / 1024
     except:
         return 0.0
 
