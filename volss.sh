@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.0.5
+#   版本: V1.0.6
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.0.5"
+VERSION="V1.0.6"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -731,8 +731,7 @@ show_main_menu() {
         # 状态检测
         if check_installed; then
             SS_STATUS="${GREEN}● 已安装${NC}"
-            SVC_STATUS=$(systemctl is-active shadowsocks-rust 2>/dev/null)
-            if [ "$SVC_STATUS" = "active" ]; then
+            if pgrep -x ssserver > /dev/null 2>&1; then
                 SVC_LABEL="${GREEN}● 运行中${NC}"
             else
                 SVC_LABEL="${RED}● 已停止${NC}"
