@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.1.6
+#   版本: V1.2.1
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.1.6"
+VERSION="V1.2.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -911,7 +911,7 @@ ACLEOF
     read -p "输入要屏蔽的域名: " NEW_DOMAIN
     if [ -n "$NEW_DOMAIN" ]; then
         NEW_DOMAIN=$(echo "$NEW_DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//')
-        echo "||$NEW_DOMAIN" >> $ACL_PATH
+        echo "||$NEW_DOMAIN #manual" >> $ACL_PATH
         systemctl restart shadowsocks-rust
         echo -e "${GREEN}✅ 已添加并重启: $NEW_DOMAIN${NC}"
     fi
@@ -921,18 +921,236 @@ del_acl_domain() {
     if [ ! -f "$ACL_PATH" ]; then
         echo -e "${RED}ACL 文件不存在${NC}"; return
     fi
+
+    # 只列出手动添加的域名
+    MANUAL_LIST=$(grep "^||.*#manual" "$ACL_PATH" 2>/dev/null | sed 's/ #manual//')
+
+    if [ -z "$MANUAL_LIST" ]; then
+        echo -e "${YELLOW}没有手动添加的域名${NC}"; return
+    fi
+
     echo -e "\n${BLUE}  =================================================${NC}"
-    echo -e "${BLUE}    当前 ACL 黑名单${NC}"
+    echo -e "${BLUE}    手动添加的域名${NC}"
     echo -e "${BLUE}  =================================================${NC}"
-    grep "^||" $ACL_PATH | sed 's/^||//' | nl -ba
+    echo "$MANUAL_LIST" | sed 's/^||//' | nl -ba
     echo -e "  ${BLUE}=================================================${NC}"
+
     read -p "输入要删除的编号: " DEL_NUM
-    DOMAIN_LINE=$(grep "^||" $ACL_PATH | sed -n "${DEL_NUM}p")
+    DOMAIN_LINE=$(echo "$MANUAL_LIST" | sed -n "${DEL_NUM}p")
     if [ -z "$DOMAIN_LINE" ]; then echo -e "${RED}无效编号${NC}"; return; fi
-    sed -i "\|^${DOMAIN_LINE}$|d" $ACL_PATH
+
+    # 精确删除该行（含 #manual 标记）
+    sed -i "\|^${DOMAIN_LINE} #manual$|d" $ACL_PATH
     systemctl restart shadowsocks-rust
     echo -e "${GREEN}✅ 已删除: $(echo $DOMAIN_LINE | sed 's/^||//')${NC}"
 }
+
+# ========== ACL 规则集管理 ==========
+ACL_RULESET_DIR="/etc/shadowsocks-rust/rulesets"
+
+# 规则集定义：名称|描述|来源URL
+declare -A RULESET_URLS
+RULESET_URLS=(
+    ["ads"]="广告拦截|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Ads"
+    ["adult"]="色情网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Adult"
+    ["gambling"]="赌博网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Gambling"
+    ["malware"]="恶意软件|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Malware"
+    ["scam"]="诈骗网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Scam"
+    ["tracking"]="追踪统计|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Tracking"
+    ["crypto"]="加密货币挖矿|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Crypto"
+    ["dating"]="交友网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Dating"
+    ["bt"]="BT下载|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Torrents"
+)
+
+# 初始化规则集目录
+init_ruleset_dir() {
+    mkdir -p $ACL_RULESET_DIR
+    # 初始化已安装记录文件
+    [ ! -f "$ACL_RULESET_DIR/installed.txt" ] && touch "$ACL_RULESET_DIR/installed.txt"
+}
+
+# 下载并转换规则集为 ss-rust ACL 格式
+download_ruleset() {
+    local NAME=$1
+    local URL=$2
+    local TMP="/tmp/ruleset_${NAME}.tmp"
+    local OUT="$ACL_RULESET_DIR/${NAME}.acl"
+
+    echo -e "  ${YELLOW}下载中: $NAME ...${NC}"
+    wget -q -O "$TMP" "$URL"
+    if [ $? -ne 0 ] || [ ! -s "$TMP" ]; then
+        echo -e "  ${RED}❌ 下载失败: $NAME${NC}"
+        rm -f "$TMP"
+        return 1
+    fi
+
+    # 转换格式：过滤注释和空行，每行加 || 前缀
+    grep -v "^#" "$TMP" | grep -v "^$" | sed 's/^/||/' > "$OUT"
+    COUNT=$(wc -l < "$OUT")
+    rm -f "$TMP"
+    echo -e "  ${GREEN}✅ $NAME 已下载，共 $COUNT 条规则${NC}"
+    return 0
+}
+
+# 重新合并所有规则集到 ACL 文件
+rebuild_acl() {
+    init_ruleset_dir
+
+    # 读取手动添加的域名（保留）
+    MANUAL_DOMAINS=""
+    if [ -f "$ACL_PATH" ]; then
+        # 提取不属于任何规则集的手动条目（带 #manual 标记）
+        MANUAL_DOMAINS=$(grep "^||.*#manual" "$ACL_PATH" 2>/dev/null | sed 's/ #manual//')
+    fi
+
+    # 重建 ACL 文件
+    cat > $ACL_PATH << 'ACLEOF'
+[accept_all]
+
+[outbound_block_list]
+ACLEOF
+
+    # 写入手动域名
+    if [ -n "$MANUAL_DOMAINS" ]; then
+        echo "# ---- 手动添加 ----" >> $ACL_PATH
+        echo "$MANUAL_DOMAINS" | while read line; do
+            echo "$line #manual" >> $ACL_PATH
+        done
+    fi
+
+    # 写入各规则集
+    for RULESET_FILE in $ACL_RULESET_DIR/*.acl; do
+        [ -f "$RULESET_FILE" ] || continue
+        NAME=$(basename "$RULESET_FILE" .acl)
+        COUNT=$(wc -l < "$RULESET_FILE")
+        echo "" >> $ACL_PATH
+        echo "# ---- $NAME ($COUNT 条) ----" >> $ACL_PATH
+        cat "$RULESET_FILE" >> $ACL_PATH
+    done
+
+    systemctl restart shadowsocks-rust
+}
+
+# 显示规则集菜单
+manage_rulesets() {
+    init_ruleset_dir
+
+    while true; do
+        echo -e "\n${BLUE}  =================================================${NC}"
+        echo -e "${BLUE}    ACL 规则集管理${NC}"
+        echo -e "${BLUE}  =================================================${NC}"
+
+        # 显示所有可用规则集和安装状态
+        local i=1
+        local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt")
+        for KEY in "${KEYS[@]}"; do
+            IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
+            if [ -f "$ACL_RULESET_DIR/${KEY}.acl" ]; then
+                COUNT=$(wc -l < "$ACL_RULESET_DIR/${KEY}.acl")
+                STATUS="${GREEN}● 已安装 ($COUNT 条)${NC}"
+            else
+                STATUS="${RED}○ 未安装${NC}"
+            fi
+            printf "  ${GREEN}%2d)${NC} %-12s %-20s %b\n" "$i" "$KEY" "$DESC" "$STATUS"
+            i=$((i+1))
+        done
+
+        echo -e "  ${BLUE}-------------------------------------------------${NC}"
+        echo -e "  ${GREEN}10)${NC} 安装全部规则集"
+        echo -e "  ${GREEN}11)${NC} 卸载某个规则集"
+        echo -e "  ${GREEN}12)${NC} 更新已安装规则集"
+        echo -e "  ${GREEN}13)${NC} 添加自定义规则集 URL"
+        echo -e "  ${GREEN}14)${NC} 查看当前生效规则数量"
+        echo -e "  ${RED} 0)${NC} 返回主菜单"
+        echo -e "${BLUE}  =================================================${NC}"
+        read -p "  请选择: " CHOICE
+
+        case $CHOICE in
+            [1-9])
+                local IDX=$((CHOICE-1))
+                local KEY="${KEYS[$IDX]}"
+                IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
+                if [ -f "$ACL_RULESET_DIR/${KEY}.acl" ]; then
+                    echo -e "${YELLOW}$DESC 已安装，重新下载更新？[y/N]${NC}"
+                    read -p "" CONFIRM
+                    [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && continue
+                fi
+                download_ruleset "$KEY" "$URL" && rebuild_acl
+                ;;
+            10)
+                echo -e "${YELLOW}>>> 安装全部规则集...${NC}"
+                local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt")
+                for KEY in "${KEYS[@]}"; do
+                    IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
+                    download_ruleset "$KEY" "$URL"
+                done
+                rebuild_acl
+                echo -e "${GREEN}✅ 全部规则集安装完成${NC}"
+                ;;
+            11)
+                echo -e "\n已安装的规则集："
+                ls $ACL_RULESET_DIR/*.acl 2>/dev/null | xargs -I{} basename {} .acl | nl -ba
+                read -p "输入要卸载的编号: " DEL_IDX
+                DEL_NAME=$(ls $ACL_RULESET_DIR/*.acl 2>/dev/null | xargs -I{} basename {} .acl | sed -n "${DEL_IDX}p")
+                if [ -n "$DEL_NAME" ]; then
+                    rm -f "$ACL_RULESET_DIR/${DEL_NAME}.acl"
+                    rebuild_acl
+                    echo -e "${GREEN}✅ 已卸载: $DEL_NAME${NC}"
+                else
+                    echo -e "${RED}无效编号${NC}"
+                fi
+                ;;
+            12)
+                echo -e "${YELLOW}>>> 更新已安装规则集...${NC}"
+                for RULESET_FILE in $ACL_RULESET_DIR/*.acl; do
+                    [ -f "$RULESET_FILE" ] || continue
+                    KEY=$(basename "$RULESET_FILE" .acl)
+                    if [ -n "${RULESET_URLS[$KEY]}" ]; then
+                        IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
+                        download_ruleset "$KEY" "$URL"
+                    fi
+                done
+                rebuild_acl
+                echo -e "${GREEN}✅ 更新完成${NC}"
+                ;;
+            13)
+                read -p "规则集名称 (英文，如 finance): " CUSTOM_NAME
+                read -p "规则集 URL: " CUSTOM_URL
+                if [ -n "$CUSTOM_NAME" ] && [ -n "$CUSTOM_URL" ]; then
+                    RULESET_URLS["$CUSTOM_NAME"]="自定义|$CUSTOM_URL"
+                    download_ruleset "$CUSTOM_NAME" "$CUSTOM_URL" && rebuild_acl
+                fi
+                ;;
+            14)
+                echo -e "\n${BLUE}  =================================================${NC}"
+                echo -e "${BLUE}    当前生效规则统计${NC}"
+                echo -e "${BLUE}  =================================================${NC}"
+                if [ -f "$ACL_PATH" ]; then
+                    TOTAL=$(grep "^||" "$ACL_PATH" | wc -l)
+                    echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}"
+                    echo ""
+                    # 分规则集统计
+                    for RULESET_FILE in $ACL_RULESET_DIR/*.acl; do
+                        [ -f "$RULESET_FILE" ] || continue
+                        NAME=$(basename "$RULESET_FILE" .acl)
+                        COUNT=$(wc -l < "$RULESET_FILE")
+                        printf "  %-15s %s 条\n" "$NAME" "$COUNT"
+                    done
+                    # 手动添加数量
+                    MANUAL=$(grep "^||.*#manual" "$ACL_PATH" 2>/dev/null | wc -l)
+                    [ "$MANUAL" -gt 0 ] && printf "  %-15s %s 条\n" "手动添加" "$MANUAL"
+                else
+                    echo -e "  未配置 ACL"
+                fi
+                echo -e "${BLUE}  =================================================${NC}"
+                ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}" ;;
+        esac
+        read -p "按回车继续..."
+    done
+}
+
 
 # =============================================
 #   主菜单
@@ -975,9 +1193,10 @@ show_main_menu() {
         echo -e "      9)  查看流量统计"
         echo -e "     10)  重置流量统计"
         echo -e "  ${CYAN}  -- ACL 黑名单 --${NC}"
-        echo -e "     11)  添加屏蔽域名"
-        echo -e "     12)  删除屏蔽域名"
+        echo -e "     11)  手动添加屏蔽域名"
+        echo -e "     12)  手动删除屏蔽域名"
         echo -e "     13)  查看黑名单列表"
+        echo -e "     20)  规则集管理（广告/色情/赌博/BT等）"
         echo -e "  ${CYAN}  -- 服务管理 --${NC}"
         echo -e "     14)  查看服务状态"
         echo -e "     15)  启动服务"
@@ -1013,9 +1232,36 @@ show_main_menu() {
                 echo -e "\n${BLUE}  =================================================${NC}"
                 echo -e "${BLUE}    ACL 黑名单${NC}"
                 echo -e "${BLUE}  =================================================${NC}"
-                [ -f "$ACL_PATH" ] && grep "^||" $ACL_PATH | sed 's/^||//' || echo "  未配置 ACL"
+                if [ -f "$ACL_PATH" ]; then
+                    MANUAL=$(grep "^||.*#manual" "$ACL_PATH" | sed 's/^||//; s/ #manual//')
+                    TOTAL=$(grep "^||" "$ACL_PATH" | wc -l)
+                    MANUAL_COUNT=$(grep "^||.*#manual" "$ACL_PATH" | wc -l)
+                    RULESET_COUNT=$((TOTAL - MANUAL_COUNT))
+
+                    echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}（手动: $MANUAL_COUNT 条，规则集: $RULESET_COUNT 条）"
+                    echo -e "\n  ${CYAN}── 手动添加 ──${NC}"
+                    if [ -n "$MANUAL" ]; then
+                        echo "$MANUAL" | nl -ba | sed 's/^/  /'
+                    else
+                        echo "  （无）"
+                    fi
+                    echo -e "\n  ${CYAN}── 已安装规则集 ──${NC}"
+                    if [ -d "$ACL_RULESET_DIR" ]; then
+                        for f in $ACL_RULESET_DIR/*.acl; do
+                            [ -f "$f" ] || continue
+                            NAME=$(basename "$f" .acl)
+                            COUNT=$(wc -l < "$f")
+                            echo -e "  ${GREEN}●${NC} $NAME ($COUNT 条)"
+                        done
+                    else
+                        echo "  （未安装任何规则集）"
+                    fi
+                else
+                    echo "  未配置 ACL"
+                fi
                 read -p "按回车继续..."
                 ;;
+            20) manage_rulesets ;;
             14) systemctl status shadowsocks-rust --no-pager; read -p "按回车继续..." ;;
             15) systemctl start   shadowsocks-rust && echo -e "${GREEN}✅ 服务已启动${NC}"; read -p "按回车继续..." ;;
             16) systemctl stop    shadowsocks-rust && echo -e "${YELLOW}⏹ 服务已停止${NC}"; read -p "按回车继续..." ;;
