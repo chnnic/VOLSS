@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.0.9
+#   版本: V1.1.0
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.0.9"
+VERSION="V1.1.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -21,6 +21,7 @@ CONFIG="/etc/shadowsocks-rust/config.json"
 RUNTIME="/etc/shadowsocks-rust/runtime.json"
 ACL_PATH="/etc/shadowsocks-rust/blocklist.acl"
 LINKS_FILE="/etc/shadowsocks-rust/ss_links.txt"
+TRAFFIC_FILE="/etc/shadowsocks-rust/traffic.json"
 SERVICE="/etc/systemd/system/shadowsocks-rust.service"
 SHORTCUT="/usr/local/bin/volss"
 
@@ -296,6 +297,7 @@ After=network.target
 Type=simple
 User=root
 ExecStart=$SS_BIN -c $RUNTIME
+ExecStop=/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'
 Restart=always
 RestartSec=5s
 
@@ -439,20 +441,25 @@ show_links() {
     echo -e "  链接已保存至: ${YELLOW}$LINKS_FILE${NC}"
 }
 
-show_traffic() {
-    echo -e "\n${BLUE}  =================================================${NC}"
-    echo -e "${BLUE}    流量统计  ${YELLOW}(单向流量，实际带宽消耗约为 x2)${NC}"
-    echo -e "${BLUE}  =================================================${NC}"
-    printf "  ${CYAN}%-4s %-8s %-14s %-14s %-6s${NC}\n" "编号" "端口" "上行(GB)" "下行(GB)" "状态"
-    echo -e "  ${BLUE}-------------------------------------------------${NC}"
-
+# ========== 保存当前 iptables 计数到文件 ==========
+save_traffic() {
     python3 << PYEOF
-import json, subprocess
+import json, subprocess, os
 
-with open('$CONFIG') as f:
+config_file = '$CONFIG'
+traffic_file = '$TRAFFIC_FILE'
+
+with open(config_file) as f:
     c = json.load(f)
 
-def get_mb(chain, port, direction):
+# 读取已有历史数据
+if os.path.exists(traffic_file):
+    with open(traffic_file) as f:
+        history = json.load(f)
+else:
+    history = {}
+
+def get_bytes(chain, port, direction):
     try:
         out = subprocess.check_output(['iptables', '-nvxL', chain], text=True)
         total = 0
@@ -464,22 +471,83 @@ def get_mb(chain, port, direction):
                         total += int(parts[1])
                     elif direction == 'dport' and f'dpt:{port}' in line:
                         total += int(parts[1])
-        return total / 1024 / 1024 / 1024
+        return total
     except:
-        return 0.0
+        return 0
+
+for s in c['servers']:
+    port = str(s['server_port'])
+    tx = get_bytes('OUTPUT', s['server_port'], 'sport')
+    rx = get_bytes('INPUT',  s['server_port'], 'dport')
+    if port not in history:
+        history[port] = {'tx': 0, 'rx': 0}
+    history[port]['tx'] += tx
+    history[port]['rx'] += rx
+
+with open(traffic_file, 'w') as f:
+    json.dump(history, f, indent=2)
+PYEOF
+}
+
+show_traffic() {
+    echo -e "\n${BLUE}  =================================================${NC}"
+    echo -e "${BLUE}    流量统计  ${YELLOW}(单向流量，实际带宽消耗约为 x2)${NC}"
+    echo -e "${BLUE}  =================================================${NC}"
+    printf "  ${CYAN}%-4s %-8s %-14s %-14s %-6s${NC}\n" "编号" "端口" "上行(GB)" "下行(GB)" "状态"
+    echo -e "  ${BLUE}-------------------------------------------------${NC}"
+
+    python3 << PYEOF
+import json, subprocess, os
+
+with open('$CONFIG') as f:
+    c = json.load(f)
+
+# 读取历史累计数据
+if os.path.exists('$TRAFFIC_FILE'):
+    with open('$TRAFFIC_FILE') as f:
+        history = json.load(f)
+else:
+    history = {}
+
+def get_bytes(chain, port, direction):
+    try:
+        out = subprocess.check_output(['iptables', '-nvxL', chain], text=True)
+        total = 0
+        for line in out.splitlines():
+            if str(port) in line:
+                parts = line.split()
+                if len(parts) >= 10:
+                    if direction == 'sport' and f'spt:{port}' in line:
+                        total += int(parts[1])
+                    elif direction == 'dport' and f'dpt:{port}' in line:
+                        total += int(parts[1])
+        return total
+    except:
+        return 0
 
 for i, s in enumerate(c['servers'], 1):
-    port   = s['server_port']
-    tx     = get_mb('OUTPUT', port, 'sport')
-    rx     = get_mb('INPUT',  port, 'dport')
+    port = s['server_port']
+    key  = str(port)
+
+    # 当前 iptables 计数
+    cur_tx = get_bytes('OUTPUT', port, 'sport')
+    cur_rx = get_bytes('INPUT',  port, 'dport')
+
+    # 历史累计
+    hist_tx = history.get(key, {}).get('tx', 0)
+    hist_rx = history.get(key, {}).get('rx', 0)
+
+    total_tx = (hist_tx + cur_tx) / 1024 / 1024 / 1024
+    total_rx = (hist_rx + cur_rx) / 1024 / 1024 / 1024
+
     status = '暂停' if s.get('disabled') else '正常'
     color  = '\033[0;31m' if s.get('disabled') else '\033[0;32m'
     reset  = '\033[0m'
-    print(f"  {i:<4} {port:<8} {tx:<14.2f} {rx:<14.2f} {color}{status}{reset}")
+    print(f"  {i:<4} {port:<8} {total_tx:<14.2f} {total_rx:<14.2f} {color}{status}{reset}")
 PYEOF
 
     echo -e "  ${BLUE}=================================================${NC}"
-    echo -e "  ${YELLOW}提示: 流量从规则创建后开始统计，重启服务器后重置${NC}"
+    echo -e "  ${YELLOW}提示: 手动重置前流量数据永久累计，不受重启影响${NC}"
 }
 
 reset_traffic() {
@@ -487,8 +555,11 @@ reset_traffic() {
     read -p "输入要重置的用户编号 (0=全部重置): " NUM
 
     if [ "$NUM" = "0" ]; then
+        # 保存当前计数后清零
         iptables -Z INPUT
         iptables -Z OUTPUT
+        # 清空历史文件
+        echo '{}' > $TRAFFIC_FILE
         echo -e "${GREEN}✅ 所有用户流量已重置${NC}"
         return
     fi
@@ -504,10 +575,23 @@ if 0 <= idx < len(ports):
 ")
     if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
 
+    # 清零该端口 iptables 计数
     for CHAIN in INPUT OUTPUT; do
         LINE=$(iptables -nvL $CHAIN --line-numbers | awk -v p="$PORT" '$0~p{print $1}' | head -1)
         [ -n "$LINE" ] && iptables -Z $CHAIN $LINE 2>/dev/null
     done
+
+    # 清空该端口历史数据
+    python3 << PYEOF
+import json, os
+if os.path.exists('$TRAFFIC_FILE'):
+    with open('$TRAFFIC_FILE') as f:
+        history = json.load(f)
+    history.pop('$PORT', None)
+    with open('$TRAFFIC_FILE', 'w') as f:
+        json.dump(history, f, indent=2)
+PYEOF
+
     echo -e "${GREEN}✅ 端口 $PORT 流量已重置${NC}"
 }
 
@@ -844,7 +928,8 @@ show_main_menu() {
 check_root
 
 case "$1" in
-    --menu)    show_main_menu ;;
-    --version) echo -e "Shadowsocks-Rust 管理脚本 ${GREEN}$VERSION${NC}" ;;
-    *)         show_main_menu ;;
+    --menu)         show_main_menu ;;
+    --save-traffic) save_traffic ;;
+    --version)      echo -e "Shadowsocks-Rust 管理脚本 ${GREEN}$VERSION${NC}" ;;
+    *)              show_main_menu ;;
 esac
