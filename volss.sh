@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.0.6
+#   版本: V1.0.7
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.0.6"
+VERSION="V1.0.7"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -339,6 +339,15 @@ for s in c['servers']:
 
 install_shortcut() {
     SCRIPT_PATH=$(realpath "$0")
+
+    # 如果已存在且不是 volss 脚本则跳过，避免覆盖其他快捷命令
+    if [ -f "$SHORTCUT" ]; then
+        if ! grep -q "volss" "$SHORTCUT" 2>/dev/null; then
+            echo -e "${YELLOW}⚠ $SHORTCUT 已被其他脚本占用，跳过注册${NC}"
+            return
+        fi
+    fi
+
     cat > $SHORTCUT << EOF
 #!/bin/bash
 bash $SCRIPT_PATH --menu
@@ -674,12 +683,14 @@ do_update() {
     mv $TMP_NEW $SCRIPT_PATH
     chmod +x $SCRIPT_PATH
 
-    # 更新快捷命令
-    cat > $SHORTCUT << EOF
+    # 更新快捷命令（仅当是 volss 自己的快捷命令时才更新）
+    if [ ! -f "$SHORTCUT" ] || grep -q "volss" "$SHORTCUT" 2>/dev/null; then
+        cat > $SHORTCUT << EOF
 #!/bin/bash
 bash $SCRIPT_PATH --menu
 EOF
-    chmod +x $SHORTCUT
+        chmod +x $SHORTCUT
+    fi
 
     echo -e "${GREEN}✅ 更新完成！已从 $LOCAL_VER 更新到 $REMOTE_VER${NC}"
     echo -e "${YELLOW}脚本将重新启动...${NC}"
