@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.0.2
+#   版本: V1.0.3
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.0.2"
+VERSION="V1.0.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -204,9 +204,7 @@ config_acl() {
         echo -e "${BLUE}示例: ippure.com${NC}"
 
         cat > $ACL_PATH << 'ACLEOF'
-[bypass_all]
-
-[proxy_list]
+[bypass_list]
 
 [outbound_block_list]
 ACLEOF
@@ -691,9 +689,7 @@ EOF
 add_acl_domain() {
     if [ ! -f "$ACL_PATH" ]; then
         cat > $ACL_PATH << 'ACLEOF'
-[bypass_all]
-
-[proxy_list]
+[bypass_list]
 
 [outbound_block_list]
 ACLEOF
