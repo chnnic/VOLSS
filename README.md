@@ -33,29 +33,23 @@
 
 ## 快速开始
 
-**1. 下载脚本**
+**1. 下载并运行脚本**
 
 ```bash
-wget -O volss.sh https://your-host/volss.sh
-# 或
-curl -o volss.sh https://your-host/volss.sh
+wget -O volss.sh https://raw.githubusercontent.com/chnnic/VOLSS/refs/heads/main/volss.sh && chmod +x volss.sh && bash volss.sh
 ```
 
-**2. 添加执行权限**
+或者分步执行：
 
 ```bash
+wget -O volss.sh https://raw.githubusercontent.com/chnnic/VOLSS/refs/heads/main/volss.sh
 chmod +x volss.sh
-```
-
-**3. 运行脚本**
-
-```bash
 bash volss.sh
 ```
 
 首次运行进入主菜单，选择 `1) 安装 Shadowsocks-Rust` 开始安装。
 
-**4. 安装完成后使用快捷命令**
+**2. 安装完成后使用快捷命令**
 
 ```bash
 volss
