@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.3.4
+#   版本: V1.3.5
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.3.4"
+VERSION="V1.3.5"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1371,20 +1371,6 @@ EOF
             fi
             systemctl restart shadowsocks-rust 2>/dev/null
             echo -e "${GREEN}✅ ACL 格式已自动修复并重启服务${NC}"
-        fi
-
-        # 给没有 #manual 标记的 || 域名补上标记（规则集域名有 # ---- 注释行区分）
-        if [ -f "$ACL_PATH" ] && grep -q "^||" "$ACL_PATH"; then
-            sed -i '/^||/{ /\(#manual\|# ----\)/! s/$/ #manual/ }' $ACL_PATH
-        fi
-
-        # 迁移旧版 #manual 格式到独立 manual.list 文件
-        if [ -f "$ACL_PATH" ] && grep -q "#manual" "$ACL_PATH"; then
-            grep "^||.*#manual" "$ACL_PATH" | sed 's/^||//; s/ #manual$//' >> "$MANUAL_FILE"
-            # 去重
-            sort -u "$MANUAL_FILE" -o "$MANUAL_FILE" 2>/dev/null
-            rebuild_acl
-            echo -e "${GREEN}✅ 手动域名已迁移到独立文件${NC}"
         fi
     fi
 fi
