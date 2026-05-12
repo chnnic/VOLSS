@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.2.3
+#   版本: V1.2.6
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.2.3"
+VERSION="V1.2.6"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -215,9 +215,9 @@ ACLEOF
             read -p "域名 (空行结束): " DOMAIN
             [ -z "$DOMAIN" ] && break
             # 去掉用户可能输入的前缀
-            DOMAIN=$(echo "$DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//')
-            echo "||$DOMAIN" >> $ACL_PATH
-            echo -e "  ${GREEN}已添加: $DOMAIN${NC}"
+            DOMAIN=$(echo "$DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//')
+            echo "||$DOMAIN #manual" >> $ACL_PATH
+            echo -e "  ${GREEN}已添加: $DOMAIN（含所有子域名）${NC}"
         done
 
         USE_ACL_FLAG=true
@@ -876,8 +876,14 @@ PYEOF
             sed -i 's/^domain-suffix:/||/' $ACL_PATH
             sed -i 's/^\[bypass_list\]/[accept_all]/' $ACL_PATH
             sed -i '/^\[proxy_list\]$/d' $ACL_PATH
-            systemctl restart shadowsocks-rust
             echo -e "${GREEN}✅ ACL 格式已自动升级${NC}"
+        fi
+
+        # 修复无 #manual 标记的域名（安装时写入的旧格式）
+        if [ -f "$ACL_PATH" ] && grep -q "^||" "$ACL_PATH"; then
+            # 找出没有 #manual 且不是注释行的 || 开头域名，补上标记
+            sed -i '/^||/{ /\(#manual\|# ----\)/! s/$/ #manual/ }' $ACL_PATH
+            echo -e "${GREEN}✅ 手动域名标记已自动修复${NC}"
         fi
         if grep -q "Restart=on-failure" $SERVICE 2>/dev/null; then
             sed -i 's/Restart=on-failure/Restart=always/' $SERVICE
@@ -910,10 +916,10 @@ ACLEOF
     fi
     read -p "输入要屏蔽的域名: " NEW_DOMAIN
     if [ -n "$NEW_DOMAIN" ]; then
-        NEW_DOMAIN=$(echo "$NEW_DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//')
+        NEW_DOMAIN=$(echo "$NEW_DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//')
         echo "||$NEW_DOMAIN #manual" >> $ACL_PATH
         systemctl restart shadowsocks-rust
-        echo -e "${GREEN}✅ 已添加并重启: $NEW_DOMAIN${NC}"
+        echo -e "${GREEN}✅ 已添加并重启: $NEW_DOMAIN（含所有子域名）${NC}"
     fi
 }
 
@@ -942,7 +948,7 @@ del_acl_domain() {
     # 精确删除该行（含 #manual 标记）
     sed -i "\|^${DOMAIN_LINE} #manual$|d" $ACL_PATH
     systemctl restart shadowsocks-rust
-    echo -e "${GREEN}✅ 已删除: $(echo $DOMAIN_LINE | sed 's/^||//')${NC}"
+    echo -e "${GREEN}✅ 已删除: $(echo $DOMAIN_LINE | sed 's/^||//')（含所有子域名）${NC}"
 }
 
 # ========== ACL 规则集管理 ==========
@@ -1251,16 +1257,17 @@ show_main_menu() {
                         echo "  （无）"
                     fi
                     echo -e "\n  ${CYAN}── 已安装规则集 ──${NC}"
+                    FOUND=0
                     if [ -d "$ACL_RULESET_DIR" ]; then
                         for f in $ACL_RULESET_DIR/*.acl; do
                             [ -f "$f" ] || continue
                             NAME=$(basename "$f" .acl)
                             COUNT=$(wc -l < "$f")
                             echo -e "  ${GREEN}●${NC} $NAME ($COUNT 条)"
+                            FOUND=1
                         done
-                    else
-                        echo "  （未安装任何规则集）"
                     fi
+                    [ "$FOUND" -eq 0 ] && echo "  （未安装任何规则集，请选择选项 15 安装）"
                 else
                     echo "  未配置 ACL"
                 fi
