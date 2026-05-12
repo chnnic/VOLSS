@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.3.2
+#   版本: V1.3.3
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.3.2"
+VERSION="V1.3.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -584,9 +584,13 @@ reset_traffic() {
     read -p "输入要重置的用户编号 (0=全部重置): " NUM
 
     if [ "$NUM" = "0" ]; then
+        # 先停服务（触发 ExecStop 保存当前数据），然后清零
+        systemctl stop shadowsocks-rust 2>/dev/null
+        sleep 1
+        # 清零 iptables
         iptables -Z INPUT
         iptables -Z OUTPUT
-        # 清空历史文件并记录重置时间
+        # 写入归零数据并记录重置时间
         RESET_TIME=$(date '+%Y-%m-%d %H:%M:%S')
         python3 << PYEOF
 import json
@@ -598,6 +602,8 @@ for s in c['servers']:
 with open('$TRAFFIC_FILE', 'w') as f:
     json.dump(history, f, indent=2)
 PYEOF
+        # 重启服务
+        systemctl start shadowsocks-rust
         echo -e "${GREEN}✅ 所有用户流量已重置${NC}"
         return
     fi
@@ -613,13 +619,15 @@ if 0 <= idx < len(ports):
 ")
     if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
 
-    # 清零该端口 iptables 计数
+    # 停服务 → 清零 iptables → 写归零 → 重启
+    systemctl stop shadowsocks-rust 2>/dev/null
+    sleep 1
+
     for CHAIN in INPUT OUTPUT; do
         LINE=$(iptables -nvL $CHAIN --line-numbers | awk -v p="$PORT" '$0~p{print $1}' | head -1)
         [ -n "$LINE" ] && iptables -Z $CHAIN $LINE 2>/dev/null
     done
 
-    # 清空该端口历史数据并记录重置时间
     RESET_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     python3 << PYEOF
 import json, os
@@ -632,6 +640,8 @@ history['$PORT'] = {'tx': 0, 'rx': 0, 'reset_time': '$RESET_TIME'}
 with open('$TRAFFIC_FILE', 'w') as f:
     json.dump(history, f, indent=2)
 PYEOF
+
+    systemctl start shadowsocks-rust
 
     echo -e "${GREEN}✅ 端口 $PORT 流量已重置${NC}"
 }
