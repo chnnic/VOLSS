@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.3.0
+#   版本: V1.3.1
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.3.0"
+VERSION="V1.3.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -22,6 +22,7 @@ RUNTIME="/etc/shadowsocks-rust/runtime.json"
 ACL_PATH="/etc/shadowsocks-rust/blocklist.acl"
 LINKS_FILE="/etc/shadowsocks-rust/ss_links.txt"
 TRAFFIC_FILE="/etc/shadowsocks-rust/traffic.json"
+MANUAL_FILE="/etc/shadowsocks-rust/manual.list"
 SERVICE="/etc/systemd/system/shadowsocks-rust.service"
 SHORTCUT="/usr/local/bin/volss"
 
@@ -214,11 +215,12 @@ ACLEOF
             [ -z "$DOMAIN" ] && break
             # 去掉用户可能输入的前缀
             DOMAIN=$(echo "$DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//')
-            echo "||$DOMAIN #manual" >> $ACL_PATH
+            echo "$DOMAIN" >> $MANUAL_FILE
             echo -e "  ${GREEN}已添加: $DOMAIN（含所有子域名）${NC}"
         done
 
         USE_ACL_FLAG=true
+        rebuild_acl
         echo -e "${GREEN}✅ ACL 配置完成${NC}"
     else
         USE_ACL_FLAG=false
@@ -904,37 +906,32 @@ PYEOF
 }
 
 add_acl_domain() {
-    if [ ! -f "$ACL_PATH" ]; then
-        cat > $ACL_PATH << 'ACLEOF'
-[outbound_block_list]
-ACLEOF
-    fi
     read -p "输入要屏蔽的域名: " NEW_DOMAIN
     if [ -n "$NEW_DOMAIN" ]; then
         NEW_DOMAIN=$(echo "$NEW_DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//')
-        echo "||$NEW_DOMAIN #manual" >> $ACL_PATH
-        systemctl restart shadowsocks-rust
-        echo -e "${GREEN}✅ 已添加并重启: $NEW_DOMAIN（含所有子域名）${NC}"
+        # 检查是否已存在
+        if grep -qx "$NEW_DOMAIN" "$MANUAL_FILE" 2>/dev/null; then
+            echo -e "${YELLOW}⚠ $NEW_DOMAIN 已存在${NC}"
+            return
+        fi
+        echo "$NEW_DOMAIN" >> $MANUAL_FILE
+        rebuild_acl
+        echo -e "${GREEN}✅ 已添加: $NEW_DOMAIN（含所有子域名）${NC}"
     fi
 }
 
 del_acl_domain() {
-    if [ ! -f "$ACL_PATH" ]; then
-        echo -e "${RED}ACL 文件不存在${NC}"; return
-    fi
-
-    # 只列出手动添加的域名，存入数组
-    mapfile -t MANUAL_ARR < <(grep "^||.*#manual" "$ACL_PATH" 2>/dev/null | sed 's/ #manual//' | sed 's/^||//')
-
-    if [ ${#MANUAL_ARR[@]} -eq 0 ]; then
+    if [ ! -f "$MANUAL_FILE" ] || [ ! -s "$MANUAL_FILE" ]; then
         echo -e "${YELLOW}没有手动添加的域名${NC}"; return
     fi
+
+    mapfile -t MANUAL_ARR < "$MANUAL_FILE"
 
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    手动添加的域名${NC}"
     echo -e "${BLUE}  =================================================${NC}"
     for i in "${!MANUAL_ARR[@]}"; do
-        echo "  $((i+1))) ${MANUAL_ARR[$i]}"
+        echo "    $((i+1))) ${MANUAL_ARR[$i]}"
     done
     echo -e "  ${BLUE}=================================================${NC}"
 
@@ -942,6 +939,8 @@ del_acl_domain() {
 
     IFS=',' read -ra NUMS <<< "$INPUT"
     DELETED=0
+    # 收集要删除的域名
+    declare -a TO_DELETE
     for NUM in "${NUMS[@]}"; do
         NUM=$(echo "$NUM" | tr -d ' ')
         [ -z "$NUM" ] && continue
@@ -950,16 +949,18 @@ del_acl_domain() {
             echo -e "${RED}编号 $NUM 无效，跳过${NC}"
             continue
         fi
-        DOMAIN="${MANUAL_ARR[$IDX]}"
-        # 用 grep -v 过滤掉该行，兼容所有系统
-        grep -v "^||${DOMAIN} #manual$" "$ACL_PATH" > /tmp/acl_tmp.txt
-        mv /tmp/acl_tmp.txt "$ACL_PATH"
-        echo -e "${GREEN}✅ 已删除: $DOMAIN${NC}"
+        TO_DELETE+=("${MANUAL_ARR[$IDX]}")
+        echo -e "${GREEN}✅ 已删除: ${MANUAL_ARR[$IDX]}${NC}"
         DELETED=$((DELETED+1))
     done
 
     if [ "$DELETED" -gt 0 ]; then
-        systemctl restart shadowsocks-rust
+        # 从 manual.list 删除对应行
+        for DOMAIN in "${TO_DELETE[@]}"; do
+            grep -vx "$DOMAIN" "$MANUAL_FILE" > /tmp/manual_tmp.txt
+            mv /tmp/manual_tmp.txt "$MANUAL_FILE"
+        done
+        rebuild_acl
         echo -e "${GREEN}✅ 共删除 $DELETED 条，服务已重启${NC}"
     fi
 }
@@ -1016,33 +1017,20 @@ download_ruleset() {
 rebuild_acl() {
     init_ruleset_dir
 
-    # 读取手动添加的域名（保留）
-    MANUAL_DOMAINS=""
-    if [ -f "$ACL_PATH" ]; then
-        # 提取不属于任何规则集的手动条目（带 #manual 标记）
-        MANUAL_DOMAINS=$(grep "^||.*#manual" "$ACL_PATH" 2>/dev/null | sed 's/ #manual//')
-    fi
+    # 重建 ACL 文件，从 [outbound_block_list] 开始
+    echo "[outbound_block_list]" > $ACL_PATH
 
-    # 重建 ACL 文件
-    cat > $ACL_PATH << 'ACLEOF'
-[outbound_block_list]
-ACLEOF
-
-    # 写入手动域名
-    if [ -n "$MANUAL_DOMAINS" ]; then
-        echo "# ---- 手动添加 ----" >> $ACL_PATH
-        echo "$MANUAL_DOMAINS" | while read line; do
-            echo "$line #manual" >> $ACL_PATH
-        done
+    # 写入手动域名（从 manual.list 读取，纯净格式无标记）
+    if [ -f "$MANUAL_FILE" ] && [ -s "$MANUAL_FILE" ]; then
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            echo "||$line" >> $ACL_PATH
+        done < "$MANUAL_FILE"
     fi
 
     # 写入各规则集
     for RULESET_FILE in $ACL_RULESET_DIR/*.acl; do
         [ -f "$RULESET_FILE" ] || continue
-        NAME=$(basename "$RULESET_FILE" .acl)
-        COUNT=$(wc -l < "$RULESET_FILE")
-        echo "" >> $ACL_PATH
-        echo "# ---- $NAME ($COUNT 条) ----" >> $ACL_PATH
         cat "$RULESET_FILE" >> $ACL_PATH
     done
 
@@ -1256,17 +1244,19 @@ show_main_menu() {
                 echo -e "${BLUE}    ACL 黑名单${NC}"
                 echo -e "${BLUE}  =================================================${NC}"
                 if [ -f "$ACL_PATH" ]; then
-                    MANUAL=$(grep "^||.*#manual" "$ACL_PATH" | sed 's/^||//; s/ #manual//')
                     TOTAL=$(grep "^||" "$ACL_PATH" | wc -l)
-                    MANUAL_COUNT=$(grep "^||.*#manual" "$ACL_PATH" | wc -l)
+                    MANUAL_COUNT=0
+                    [ -f "$MANUAL_FILE" ] && MANUAL_COUNT=$(grep -c "." "$MANUAL_FILE" 2>/dev/null || echo 0)
                     RULESET_COUNT=$((TOTAL - MANUAL_COUNT))
                     echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}（手动: $MANUAL_COUNT 条，规则集: $RULESET_COUNT 条）"
                     echo -e "\n  ${CYAN}── 手动添加 ──${NC}"
-                    mapfile -t MANUAL_ARR < <(grep "^||.*#manual" "$ACL_PATH" | sed 's/ #manual//' | sed 's/^||//')
-                    if [ ${#MANUAL_ARR[@]} -gt 0 ]; then
-                        for i in "${!MANUAL_ARR[@]}"; do
-                            echo "    $((i+1))) ${MANUAL_ARR[$i]}"
-                        done
+                    if [ -f "$MANUAL_FILE" ] && [ -s "$MANUAL_FILE" ]; then
+                        i=1
+                        while IFS= read -r line; do
+                            [ -z "$line" ] && continue
+                            echo "    $i) $line"
+                            i=$((i+1))
+                        done < "$MANUAL_FILE"
                     else
                         echo "  （无）"
                     fi
@@ -1349,6 +1339,15 @@ EOF
         # 给没有 #manual 标记的 || 域名补上标记（规则集域名有 # ---- 注释行区分）
         if [ -f "$ACL_PATH" ] && grep -q "^||" "$ACL_PATH"; then
             sed -i '/^||/{ /\(#manual\|# ----\)/! s/$/ #manual/ }' $ACL_PATH
+        fi
+
+        # 迁移旧版 #manual 格式到独立 manual.list 文件
+        if [ -f "$ACL_PATH" ] && grep -q "#manual" "$ACL_PATH"; then
+            grep "^||.*#manual" "$ACL_PATH" | sed 's/^||//; s/ #manual$//' >> "$MANUAL_FILE"
+            # 去重
+            sort -u "$MANUAL_FILE" -o "$MANUAL_FILE" 2>/dev/null
+            rebuild_acl
+            echo -e "${GREEN}✅ 手动域名已迁移到独立文件${NC}"
         fi
     fi
 fi
