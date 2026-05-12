@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.2.8
+#   版本: V1.2.9
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.2.8"
+VERSION="V1.2.9"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -936,14 +936,28 @@ del_acl_domain() {
     echo "$MANUAL_LIST" | sed 's/^||//' | nl -ba
     echo -e "  ${BLUE}=================================================${NC}"
 
-    read -p "输入要删除的编号: " DEL_NUM
-    DOMAIN_LINE=$(echo "$MANUAL_LIST" | sed -n "${DEL_NUM}p")
-    if [ -z "$DOMAIN_LINE" ]; then echo -e "${RED}无效编号${NC}"; return; fi
+    read -p "输入要删除的编号（多个用逗号分隔，如 1,3,5）: " INPUT
 
-    # 精确删除该行（含 #manual 标记）
-    sed -i "\|^${DOMAIN_LINE} #manual$|d" $ACL_PATH
-    systemctl restart shadowsocks-rust
-    echo -e "${GREEN}✅ 已删除: $(echo $DOMAIN_LINE | sed 's/^||//')（含所有子域名）${NC}"
+    # 解析编号，支持逗号分隔
+    IFS=',' read -ra NUMS <<< "$INPUT"
+    DELETED=0
+    for NUM in "${NUMS[@]}"; do
+        NUM=$(echo "$NUM" | tr -d ' ')
+        [ -z "$NUM" ] && continue
+        DOMAIN_LINE=$(echo "$MANUAL_LIST" | sed -n "${NUM}p")
+        if [ -z "$DOMAIN_LINE" ]; then
+            echo -e "${RED}编号 $NUM 无效，跳过${NC}"
+            continue
+        fi
+        sed -i "\|^${DOMAIN_LINE} #manual$|d" $ACL_PATH
+        echo -e "${GREEN}✅ 已删除: $(echo $DOMAIN_LINE | sed 's/^||//')${NC}"
+        DELETED=$((DELETED+1))
+    done
+
+    if [ "$DELETED" -gt 0 ]; then
+        systemctl restart shadowsocks-rust
+        echo -e "${GREEN}✅ 共删除 $DELETED 条，服务已重启${NC}"
+    fi
 }
 
 # ========== ACL 规则集管理 ==========
@@ -1323,6 +1337,11 @@ EOF
             fi
             systemctl restart shadowsocks-rust 2>/dev/null
             echo -e "${GREEN}✅ ACL 格式已自动修复并重启服务${NC}"
+        fi
+
+        # 给没有 #manual 标记的 || 域名补上标记（规则集域名有 # ---- 注释行区分）
+        if [ -f "$ACL_PATH" ] && grep -q "^||" "$ACL_PATH"; then
+            sed -i '/^||/{ /\(#manual\|# ----\)/! s/$/ #manual/ }' $ACL_PATH
         fi
     fi
 fi
