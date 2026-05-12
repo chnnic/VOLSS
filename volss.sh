@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.2.9
+#   版本: V1.3.0
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.2.9"
+VERSION="V1.3.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -923,34 +923,38 @@ del_acl_domain() {
         echo -e "${RED}ACL 文件不存在${NC}"; return
     fi
 
-    # 只列出手动添加的域名
-    MANUAL_LIST=$(grep "^||.*#manual" "$ACL_PATH" 2>/dev/null | sed 's/ #manual//')
+    # 只列出手动添加的域名，存入数组
+    mapfile -t MANUAL_ARR < <(grep "^||.*#manual" "$ACL_PATH" 2>/dev/null | sed 's/ #manual//' | sed 's/^||//')
 
-    if [ -z "$MANUAL_LIST" ]; then
+    if [ ${#MANUAL_ARR[@]} -eq 0 ]; then
         echo -e "${YELLOW}没有手动添加的域名${NC}"; return
     fi
 
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    手动添加的域名${NC}"
     echo -e "${BLUE}  =================================================${NC}"
-    echo "$MANUAL_LIST" | sed 's/^||//' | nl -ba
+    for i in "${!MANUAL_ARR[@]}"; do
+        echo "  $((i+1))) ${MANUAL_ARR[$i]}"
+    done
     echo -e "  ${BLUE}=================================================${NC}"
 
     read -p "输入要删除的编号（多个用逗号分隔，如 1,3,5）: " INPUT
 
-    # 解析编号，支持逗号分隔
     IFS=',' read -ra NUMS <<< "$INPUT"
     DELETED=0
     for NUM in "${NUMS[@]}"; do
         NUM=$(echo "$NUM" | tr -d ' ')
         [ -z "$NUM" ] && continue
-        DOMAIN_LINE=$(echo "$MANUAL_LIST" | sed -n "${NUM}p")
-        if [ -z "$DOMAIN_LINE" ]; then
+        IDX=$((NUM-1))
+        if [ $IDX -lt 0 ] || [ $IDX -ge ${#MANUAL_ARR[@]} ]; then
             echo -e "${RED}编号 $NUM 无效，跳过${NC}"
             continue
         fi
-        sed -i "\|^${DOMAIN_LINE} #manual$|d" $ACL_PATH
-        echo -e "${GREEN}✅ 已删除: $(echo $DOMAIN_LINE | sed 's/^||//')${NC}"
+        DOMAIN="${MANUAL_ARR[$IDX]}"
+        # 用 grep -v 过滤掉该行，兼容所有系统
+        grep -v "^||${DOMAIN} #manual$" "$ACL_PATH" > /tmp/acl_tmp.txt
+        mv /tmp/acl_tmp.txt "$ACL_PATH"
+        echo -e "${GREEN}✅ 已删除: $DOMAIN${NC}"
         DELETED=$((DELETED+1))
     done
 
@@ -1258,8 +1262,11 @@ show_main_menu() {
                     RULESET_COUNT=$((TOTAL - MANUAL_COUNT))
                     echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}（手动: $MANUAL_COUNT 条，规则集: $RULESET_COUNT 条）"
                     echo -e "\n  ${CYAN}── 手动添加 ──${NC}"
-                    if [ -n "$MANUAL" ]; then
-                        echo "$MANUAL" | nl -ba | sed 's/^/  /'
+                    mapfile -t MANUAL_ARR < <(grep "^||.*#manual" "$ACL_PATH" | sed 's/ #manual//' | sed 's/^||//')
+                    if [ ${#MANUAL_ARR[@]} -gt 0 ]; then
+                        for i in "${!MANUAL_ARR[@]}"; do
+                            echo "    $((i+1))) ${MANUAL_ARR[$i]}"
+                        done
                     else
                         echo "  （无）"
                     fi
