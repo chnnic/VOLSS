@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.3.1
+#   版本: V1.3.2
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.3.1"
+VERSION="V1.3.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -980,14 +980,28 @@ RULESET_URLS=(
     ["crypto"]="挖矿劫持|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Crypto"
     ["dating"]="交友网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Dating"
     ["bt"]="BT下载|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Torrents"
-    ["finance"]="金融理财|https://raw.githubusercontent.com/hagezi/dns-blocklists/main/wildcard/gambling.txt"
+    ["finance"]="金融理财|https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/gambling.txt"
+)
+
+# GitHub 镜像列表，下载失败时自动切换
+GITHUB_MIRRORS=(
+    "https://raw.githubusercontent.com"
+    "https://raw.gitmirror.com"
+    "https://raw.fastgit.org"
+    "https://gh.api.99988866.xyz/https://raw.githubusercontent.com"
 )
 
 # 初始化规则集目录
 init_ruleset_dir() {
     mkdir -p $ACL_RULESET_DIR
-    # 初始化已安装记录文件
     [ ! -f "$ACL_RULESET_DIR/installed.txt" ] && touch "$ACL_RULESET_DIR/installed.txt"
+}
+
+# 将 URL 替换为镜像地址
+mirror_url() {
+    local URL=$1
+    local MIRROR=$2
+    echo "$URL" | sed "s|https://raw.githubusercontent.com|$MIRROR|"
 }
 
 # 下载并转换规则集为 ss-rust ACL 格式
@@ -998,15 +1012,26 @@ download_ruleset() {
     local OUT="$ACL_RULESET_DIR/${NAME}.acl"
 
     echo -e "  ${YELLOW}下载中: $NAME ...${NC}"
-    wget -q -O "$TMP" "$URL"
-    if [ $? -ne 0 ] || [ ! -s "$TMP" ]; then
-        echo -e "  ${RED}❌ 下载失败: $NAME${NC}"
+
+    # 依次尝试各镜像
+    local SUCCESS=0
+    for MIRROR in "${GITHUB_MIRRORS[@]}"; do
+        local TRY_URL=$(mirror_url "$URL" "$MIRROR")
+        wget -q --timeout=15 -O "$TMP" "$TRY_URL" 2>/dev/null
+        if [ $? -eq 0 ] && [ -s "$TMP" ]; then
+            SUCCESS=1
+            break
+        fi
         rm -f "$TMP"
+    done
+
+    if [ $SUCCESS -eq 0 ]; then
+        echo -e "  ${RED}❌ 下载失败: $NAME（所有镜像均不可用）${NC}"
         return 1
     fi
 
     # 转换格式：过滤注释和空行，每行加 || 前缀
-    grep -v "^#" "$TMP" | grep -v "^$" | sed 's/^/||/' > "$OUT"
+    grep -v "^#" "$TMP" | grep -v "^$" | grep -v "^\*\." | sed 's/^/||/' > "$OUT"
     COUNT=$(wc -l < "$OUT")
     rm -f "$TMP"
     echo -e "  ${GREEN}✅ $NAME 已下载，共 $COUNT 条规则${NC}"
