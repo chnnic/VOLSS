@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.3.3
+#   版本: V1.3.4
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.3.3"
+VERSION="V1.3.4"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1284,7 +1284,8 @@ show_main_menu() {
                     [ -f "$MANUAL_FILE" ] && MANUAL_COUNT=$(grep -c "." "$MANUAL_FILE" 2>/dev/null || echo 0)
                     RULESET_COUNT=$((TOTAL - MANUAL_COUNT))
                     echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}（手动: $MANUAL_COUNT 条，规则集: $RULESET_COUNT 条）"
-                    echo -e "\n  ${CYAN}── 手动添加 ──${NC}"
+
+                    echo -e "\n  ${CYAN}── 手动添加 ($MANUAL_COUNT 条) ──${NC}"
                     if [ -f "$MANUAL_FILE" ] && [ -s "$MANUAL_FILE" ]; then
                         i=1
                         while IFS= read -r line; do
@@ -1295,6 +1296,7 @@ show_main_menu() {
                     else
                         echo "  （无）"
                     fi
+
                     echo -e "\n  ${CYAN}── 已安装规则集 ──${NC}"
                     FOUND=0
                     if [ -d "$ACL_RULESET_DIR" ]; then
@@ -1302,7 +1304,7 @@ show_main_menu() {
                             [ -f "$f" ] || continue
                             NAME=$(basename "$f" .acl)
                             COUNT=$(wc -l < "$f")
-                            echo -e "  ${GREEN}●${NC} $NAME ($COUNT 条)"
+                            echo -e "  ${GREEN}●${NC} $NAME ($COUNT 条)  ${YELLOW}[查看详情请进入选项 15]${NC}"
                             FOUND=1
                         done
                     fi
