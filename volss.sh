@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.2.7
+#   版本: V1.2.8
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.2.7"
+VERSION="V1.2.8"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1303,6 +1303,26 @@ bash $SCRIPT_INSTALL_PATH --menu
 EOF
             chmod +x $SHORTCUT
             echo -e "${GREEN}✅ 快捷命令已自动修复，输入 ${YELLOW}volss${GREEN} 呼出管理菜单${NC}"
+        fi
+    fi
+
+    # 自检：ACL 格式修复（移除无效头部，确保 outbound_block_list 存在）
+    if [ -f "$ACL_PATH" ]; then
+        NEED_FIX=0
+        grep -q "^\[accept_all\]" "$ACL_PATH" && NEED_FIX=1
+        grep -q "^\[bypass_list\]" "$ACL_PATH" && NEED_FIX=1
+        grep -q "^domain-suffix:" "$ACL_PATH" && NEED_FIX=1
+        if [ "$NEED_FIX" -eq 1 ]; then
+            sed -i 's/^domain-suffix:/||/' $ACL_PATH
+            sed -i '/^\[bypass_list\]$/d' $ACL_PATH
+            sed -i '/^\[accept_all\]$/d' $ACL_PATH
+            sed -i '/^\[proxy_list\]$/d' $ACL_PATH
+            sed -i '/^$/d' $ACL_PATH
+            if ! grep -q "^\[outbound_block_list\]" $ACL_PATH; then
+                sed -i '1i [outbound_block_list]' $ACL_PATH
+            fi
+            systemctl restart shadowsocks-rust 2>/dev/null
+            echo -e "${GREEN}✅ ACL 格式已自动修复并重启服务${NC}"
         fi
     fi
 fi
