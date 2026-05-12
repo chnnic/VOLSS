@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.2.6
+#   版本: V1.2.7
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.2.6"
+VERSION="V1.2.7"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -206,8 +206,6 @@ config_acl() {
         echo -e "${BLUE}示例: ippure.com${NC}"
 
         cat > $ACL_PATH << 'ACLEOF'
-[accept_all]
-
 [outbound_block_list]
 ACLEOF
 
@@ -871,19 +869,18 @@ with open(runtime_file, 'w') as f:
 print("✅ runtime.json 已更新")
 PYEOF
 
-        # 修复旧版 ACL 格式（domain-suffix: → ||）
-        if [ -f "$ACL_PATH" ] && grep -q "domain-suffix:" "$ACL_PATH"; then
+        # 修复旧版 ACL 格式（domain-suffix: → ||，移除无效头部）
+        if [ -f "$ACL_PATH" ]; then
             sed -i 's/^domain-suffix:/||/' $ACL_PATH
-            sed -i 's/^\[bypass_list\]/[accept_all]/' $ACL_PATH
+            sed -i '/^\[bypass_list\]$/d' $ACL_PATH
+            sed -i '/^\[accept_all\]$/d' $ACL_PATH
             sed -i '/^\[proxy_list\]$/d' $ACL_PATH
-            echo -e "${GREEN}✅ ACL 格式已自动升级${NC}"
-        fi
-
-        # 修复无 #manual 标记的域名（安装时写入的旧格式）
-        if [ -f "$ACL_PATH" ] && grep -q "^||" "$ACL_PATH"; then
-            # 找出没有 #manual 且不是注释行的 || 开头域名，补上标记
-            sed -i '/^||/{ /\(#manual\|# ----\)/! s/$/ #manual/ }' $ACL_PATH
-            echo -e "${GREEN}✅ 手动域名标记已自动修复${NC}"
+            sed -i '/^$/d' $ACL_PATH
+            # 确保文件以 [outbound_block_list] 开头
+            if ! grep -q "^\[outbound_block_list\]" $ACL_PATH; then
+                sed -i '1i [outbound_block_list]' $ACL_PATH
+            fi
+            echo -e "${GREEN}✅ ACL 格式已自动修复${NC}"
         fi
         if grep -q "Restart=on-failure" $SERVICE 2>/dev/null; then
             sed -i 's/Restart=on-failure/Restart=always/' $SERVICE
@@ -909,8 +906,6 @@ PYEOF
 add_acl_domain() {
     if [ ! -f "$ACL_PATH" ]; then
         cat > $ACL_PATH << 'ACLEOF'
-[accept_all]
-
 [outbound_block_list]
 ACLEOF
     fi
@@ -1012,8 +1007,6 @@ rebuild_acl() {
 
     # 重建 ACL 文件
     cat > $ACL_PATH << 'ACLEOF'
-[accept_all]
-
 [outbound_block_list]
 ACLEOF
 
