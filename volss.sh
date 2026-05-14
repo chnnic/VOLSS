@@ -2,11 +2,11 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.3.8
+#   版本: V1.3.9
 #   快捷命令: volss
 # ========================================
 
-VERSION="V1.3.8"
+VERSION="V1.3.9"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -309,7 +309,7 @@ After=network.target
 Type=simple
 User=root
 ExecStart=$SS_BIN -c $RUNTIME
-ExecStop=/bin/bash $SCRIPT_INSTALL_PATH --save-traffic
+ExecStop=/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'
 Restart=always
 RestartSec=5s
 
@@ -330,9 +330,8 @@ EOF
     fi
 }
 
-# ========== 修改流量统计逻辑 ==========
 init_traffic() {
-    echo -e "\n${YELLOW}>>> 初始化流量统计规则 (置顶模式)...${NC}"
+    echo -e "\n${YELLOW}>>> 初始化流量统计规则...${NC}"
 
     PORTS=$(python3 -c "
 import json
@@ -344,18 +343,20 @@ for s in c['servers']:
 
     for PORT in $PORTS; do
         for PROTO in tcp udp; do
-            # 彻底清理旧规则，防止冗余计数
-            while iptables -D INPUT -p $PROTO --dport $PORT 2>/dev/null; do :; done
+            # 清理该端口所有旧规则，避免冗余
+            while iptables -D INPUT  -p $PROTO --dport $PORT 2>/dev/null; do :; done
             while iptables -D OUTPUT -p $PROTO --sport $PORT 2>/dev/null; do :; done
-            # 插入置顶规则
-            iptables -I INPUT 1 -p $PROTO --dport $PORT
+            # 置顶插入（位置1），确保 ACCEPT 之前匹配
+            iptables -I INPUT  1 -p $PROTO --dport $PORT
             iptables -I OUTPUT 1 -p $PROTO --sport $PORT
         done
     done
 
-    iptables -Z 2>/dev/null
+    # 重置内核计数器
+    iptables -Z
+
     netfilter-persistent save 2>/dev/null
-    echo -e "${GREEN}✅ 流量统计初始化完成，已置顶规则并归零计数${NC}"
+    echo -e "${GREEN}✅ 流量统计初始化完成${NC}"
 }
 
 install_shortcut() {
@@ -472,7 +473,7 @@ show_links() {
     echo -e "  链接已保存至: ${YELLOW}$LINKS_FILE${NC}"
 }
 
-# ========== 修改：保存当前增量并归零计数器 ==========
+# ========== 保存当前 iptables 计数到文件 ==========
 save_traffic() {
     python3 << PYEOF
 import json, subprocess, os
@@ -480,16 +481,15 @@ import json, subprocess, os
 config_file = '$CONFIG'
 traffic_file = '$TRAFFIC_FILE'
 
-if not os.path.exists(config_file): exit()
-
 with open(config_file) as f:
     c = json.load(f)
 
+# 读取已有历史数据
 if os.path.exists(traffic_file):
-    try:
-        with open(traffic_file) as f: history = json.load(f)
-    except: history = {}
-else: history = {}
+    with open(traffic_file) as f:
+        history = json.load(f)
+else:
+    history = {}
 
 def get_bytes(chain, port, direction):
     try:
@@ -498,14 +498,16 @@ def get_bytes(chain, port, direction):
         for line in out.splitlines():
             if str(port) in line:
                 parts = line.split()
-                if len(parts) >= 2:
+                if len(parts) >= 10:
                     if direction == 'sport' and f'spt:{port}' in line:
                         total += int(parts[1])
                     elif direction == 'dport' and f'dpt:{port}' in line:
                         total += int(parts[1])
         return total
-    except: return 0
+    except:
+        return 0
 
+# 读取增量并累加
 for s in c['servers']:
     port = str(s['server_port'])
     tx = get_bytes('OUTPUT', s['server_port'], 'sport')
@@ -515,59 +517,46 @@ for s in c['servers']:
     history[port]['tx'] += tx
     history[port]['rx'] += rx
 
-# 关键：读取后清空内核计数器，防止下次重复累加
-subprocess.run(['iptables', '-Z'])
-
 with open(traffic_file, 'w') as f:
     json.dump(history, f, indent=2)
+
+# 关键：读取后立即清零内核计数器，避免下次重复累加
+subprocess.run(['iptables', '-Z'], check=False)
 PYEOF
 }
 
-# ========== 修改：显示累计流量 + 当前实时增量 ==========
 show_traffic() {
+    # 先同步当前 iptables 增量到历史文件，并清零计数器
+    save_traffic
+
     echo -e "\n${BLUE}  =================================================${NC}"
-    echo -e "${BLUE}    流量统计  ${YELLOW}(误差修正版)${NC}"
+    echo -e "${BLUE}    流量统计  ${YELLOW}(单向流量，实际带宽消耗约为 x2)${NC}"
     echo -e "${BLUE}  =================================================${NC}"
     printf "  ${CYAN}%-4s %-8s %-14s %-14s %-6s${NC}\n" "编号" "端口" "上行(GB)" "下行(GB)" "状态"
     echo -e "  ${BLUE}-------------------------------------------------${NC}"
 
     python3 << PYEOF
-import json, subprocess, os
+import json, os
+from datetime import datetime
 
 with open('$CONFIG') as f:
     c = json.load(f)
 
+# 读取累计数据（已包含最新增量）
 if os.path.exists('$TRAFFIC_FILE'):
-    try:
-        with open('$TRAFFIC_FILE') as f: history = json.load(f)
-    except: history = {}
-else: history = {}
-
-def get_bytes(chain, port, direction):
-    try:
-        out = subprocess.check_output(['iptables', '-nvxL', chain], text=True)
-        total = 0
-        for line in out.splitlines():
-            if str(port) in line:
-                parts = line.split()
-                if len(parts) >= 2:
-                    if direction == 'sport' and f'spt:{port}' in line:
-                        total += int(parts[1])
-                    elif direction == 'dport' and f'dpt:{port}' in line:
-                        total += int(parts[1])
-        return total
-    except: return 0
+    with open('$TRAFFIC_FILE') as f:
+        history = json.load(f)
+else:
+    history = {}
 
 for i, s in enumerate(c['servers'], 1):
     port = s['server_port']
     key  = str(port)
-    cur_tx = get_bytes('OUTPUT', port, 'sport')
-    cur_rx = get_bytes('INPUT',  port, 'dport')
-    hist_tx = history.get(key, {}).get('tx', 0)
-    hist_rx = history.get(key, {}).get('rx', 0)
-    total_tx = (hist_tx + cur_tx) / 1073741824
-    total_rx = (hist_rx + cur_rx) / 1073741824
+
+    total_tx = history.get(key, {}).get('tx', 0) / 1024 / 1024 / 1024
+    total_rx = history.get(key, {}).get('rx', 0) / 1024 / 1024 / 1024
     last_reset = history.get(key, {}).get('reset_time', '从未重置')
+
     status = '暂停' if s.get('disabled') else '正常'
     color  = '\033[0;31m' if s.get('disabled') else '\033[0;32m'
     reset  = '\033[0m'
@@ -575,6 +564,7 @@ for i, s in enumerate(c['servers'], 1):
 PYEOF
 
     echo -e "  ${BLUE}=================================================${NC}"
+    echo -e "  ${YELLOW}提示: 手动重置前流量数据永久累计，不受重启影响${NC}"
 }
 
 reset_traffic() {
@@ -582,12 +572,8 @@ reset_traffic() {
     read -p "输入要重置的用户编号 (0=全部重置): " NUM
 
     if [ "$NUM" = "0" ]; then
-        # 先停服务（触发 ExecStop 保存当前数据），然后清零
-        systemctl stop shadowsocks-rust 2>/dev/null
-        sleep 1
-        # 清零 iptables
-        iptables -Z INPUT
-        iptables -Z OUTPUT
+        # 清零内核计数器
+        iptables -Z
         # 写入归零数据并记录重置时间
         RESET_TIME=$(date '+%Y-%m-%d %H:%M:%S')
         python3 << PYEOF
@@ -600,8 +586,6 @@ for s in c['servers']:
 with open('$TRAFFIC_FILE', 'w') as f:
     json.dump(history, f, indent=2)
 PYEOF
-        # 重启服务
-        systemctl start shadowsocks-rust
         echo -e "${GREEN}✅ 所有用户流量已重置${NC}"
         return
     fi
@@ -617,15 +601,22 @@ if 0 <= idx < len(ports):
 ")
     if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
 
-    # 停服务 → 清零 iptables → 写归零 → 重启
-    systemctl stop shadowsocks-rust 2>/dev/null
-    sleep 1
+    # 先把当前所有端口的增量保存到文件，再清零该端口
+    save_traffic
 
+    # 单独清零该端口的 iptables 规则计数
     for CHAIN in INPUT OUTPUT; do
-        LINE=$(iptables -nvL $CHAIN --line-numbers | awk -v p="$PORT" '$0~p{print $1}' | head -1)
-        [ -n "$LINE" ] && iptables -Z $CHAIN $LINE 2>/dev/null
+        for PROTO in tcp udp; do
+            for DIR in "--dport" "--sport"; do
+                LINE=$(iptables -nvL $CHAIN --line-numbers | awk -v p="$PORT" -v pr="$PROTO" '$0~("dpt:"p"$") || $0~("spt:"p"$") {print $1}' | head -5)
+                for L in $LINE; do
+                    iptables -Z $CHAIN $L 2>/dev/null
+                done
+            done
+        done
     done
 
+    # 写入该端口归零
     RESET_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     python3 << PYEOF
 import json, os
@@ -638,8 +629,6 @@ history['$PORT'] = {'tx': 0, 'rx': 0, 'reset_time': '$RESET_TIME'}
 with open('$TRAFFIC_FILE', 'w') as f:
     json.dump(history, f, indent=2)
 PYEOF
-
-    systemctl start shadowsocks-rust
 
     echo -e "${GREEN}✅ 端口 $PORT 流量已重置${NC}"
 }
@@ -899,7 +888,7 @@ PYEOF
 
         # 确保 ExecStop 存在
         if ! grep -q "ExecStop" $SERVICE 2>/dev/null; then
-            sed -i "/ExecStart=.*/a ExecStop=/bin/bash $SCRIPT_INSTALL_PATH --save-traffic" $SERVICE
+            sed -i "/ExecStart=.*/a ExecStop=/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'" $SERVICE
             echo -e "${GREEN}✅ 服务停止钩子已添加${NC}"
         fi
 
