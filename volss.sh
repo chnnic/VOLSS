@@ -1,1370 +1,1832 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# =============================================================================
+#   VOLSB — sing-box 服务端一键部署与管理脚本
+#   版本   : 1.1.8
+#   项目   : https://github.com/chnnic/VOLSB
+#   模式   : 部署机(落地机) / 线路机(中转机)
+#   协议   : VLESS+Reality / Hysteria2 / VMess-WS / Trojan / ShadowTLS
+#   系统   : Alpine(OpenRC) / Debian / Ubuntu / CentOS / RHEL /
+#             Alma / Rocky / Fedora / openSUSE / Arch
+#   快捷键 : 安装后输入 volsb 进入管理界面
+# =============================================================================
 
-# ========================================
-#   Shadowsocks-Rust 管理脚本
-#   版本: V1.3.9
-#   快捷命令: volss
-# ========================================
+# 注意：不使用全局 set -e，交互式脚本需要手动处理每处错误
+set -uo pipefail
 
-VERSION="V1.3.9"
+# ──────────────────────── 颜色 & 输出 ────────────────────────
+C_RED='\033[0;31m'; C_GREEN='\033[0;32m'; C_YELLOW='\033[1;33m'
+# shellcheck disable=SC2034
+C_BLUE='\033[0;34m'; C_CYAN='\033[0;36m'; C_MAGENTA='\033[0;35m'
+C_BOLD='\033[1m'; C_DIM='\033[2m'; NC='\033[0m'
 
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m'
+info()    { echo -e "${C_GREEN}[✓]${NC} $*"; }
+warn()    { echo -e "${C_YELLOW}[!]${NC} $*"; }
+err()     { echo -e "${C_RED}[✗]${NC} $*" >&2; }
+step()    { echo -e "\n${C_CYAN}${C_BOLD}▶ $*${NC}"; }
+ask()     { printf "${C_YELLOW}[?]${NC} %s" "$*"; }
+die()     { err "$*"; exit 1; }
+hr()      { echo -e "${C_DIM}$(printf '─%.0s' {1..60})${NC}"; }
+banner()  { echo -e "\n${C_BOLD}${C_BLUE}  $*${NC}"; }
 
-SS_BIN="/usr/local/bin/ssserver"
-SCRIPT_INSTALL_PATH="/usr/local/bin/volss.sh"
-CONFIG="/etc/shadowsocks-rust/config.json"
-RUNTIME="/etc/shadowsocks-rust/runtime.json"
-ACL_PATH="/etc/shadowsocks-rust/blocklist.acl"
-LINKS_FILE="/etc/shadowsocks-rust/ss_links.txt"
-TRAFFIC_FILE="/etc/shadowsocks-rust/traffic.json"
-MANUAL_FILE="/etc/shadowsocks-rust/manual.list"
-SERVICE="/etc/systemd/system/shadowsocks-rust.service"
-SHORTCUT="/usr/local/bin/volss"
+# ──────────────────────── 全局路径 ────────────────────────
+VOLSB_VER="1.1.8"
+VOLSB_REPO="https://raw.githubusercontent.com/chnnic/VOLSB/refs/heads/main/volsb.sh"
 
-# ========== 检查 root ==========
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}请使用 root 权限运行此脚本${NC}"
-        exit 1
-    fi
+# ── 环境变量支持 (方便 CI / 自动化部署) ──
+# VOLSB_IP        : 指定连接地址,跳过 IP 检测提示
+# VOLSB_PORT      : 指定入站端口,跳过端口交互
+# VOLSB_SNI       : 指定 Reality SNI,跳过 SNI 交互
+# VOLSB_MODE      : 1=部署机 2=线路机,跳过模式选择
+# VOLSB_PROTO     : 协议序号,如 "1" "1 2" "0"(全部),跳过协议选择
+SB_BIN="/usr/local/bin/sing-box"
+SB_CONF_DIR="/etc/sing-box"
+SB_CONFIG="${SB_CONF_DIR}/config.json"
+SB_CERT_DIR="${SB_CONF_DIR}/certs"
+SB_DATA_DIR="/var/lib/sing-box"
+SB_LOG_DIR="/var/log/sing-box"
+SB_LOG="${SB_LOG_DIR}/sing-box.log"
+SB_INFO="${SB_CONF_DIR}/nodes.info"          # 节点明文信息
+SB_LINKS="${SB_CONF_DIR}/links.txt"          # 所有分享链接
+SB_TRAFFIC="${SB_CONF_DIR}/traffic.json"     # 流量统计缓存
+SB_ENV="${SB_CONF_DIR}/volsb.env"            # 持久化运行参数
+VOLSB_CMD="/usr/local/bin/volsb"             # 快捷命令路径
+# Systemd / OpenRC service
+SB_SYSTEMD="/etc/systemd/system/sing-box.service"
+SB_OPENRC="/etc/init.d/sing-box"
+
+# ──────────────────────── 系统检测 ────────────────────────
+require_root() {
+    [[ $EUID -eq 0 ]] || die "请用 root 用户执行  (提示: sudo -i)"
 }
 
-# ========== 检查是否已安装 ==========
-check_installed() {
-    [ -f "$SS_BIN" ] && [ -f "$CONFIG" ]
-}
+detect_os() {
+    if [[ -f /etc/alpine-release ]]; then
+        OS_ID="alpine"; OS_VER=$(cat /etc/alpine-release)
+        OS_NAME="Alpine Linux $OS_VER"
+        PKG_UPDATE="apk update -q"; PKG_INSTALL="apk add -q"
+        PKGS="curl wget tar jq openssl ca-certificates qrencode coreutils"
+        INIT_SYS="openrc"
+    elif [[ -f /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        source /etc/os-release
+        OS_ID="${ID:-unknown}"
+        OS_ID_LIKE="${ID_LIKE:-}"   # 衍生发行版兜底 (PopOS, Mint, Kali 等)
+        OS_VER="${VERSION_ID:-0}"
+        OS_NAME="${PRETTY_NAME:-$OS_ID}"
 
-# ========== 打印 Banner ==========
-print_banner() {
-    clear
-    echo -e "${BLUE}  =================================================${NC}"
-    echo -e "${BLUE}    Shadowsocks-Rust 管理脚本${NC}"
-    echo -e "${BLUE}    版本: ${VERSION}    快捷命令: volss${NC}"
-    echo -e "${BLUE}  =================================================${NC}"
-    echo ""
-}
-
-# ========== 检查端口是否被占用 ==========
-port_in_use() {
-    local PORT=$1
-    ss -tlun 2>/dev/null | grep -q ":${PORT} " || \
-    ss -tlun 2>/dev/null | grep -q ":${PORT}$"
-}
-
-# =============================================
-#   安装流程
-# =============================================
-
-install_deps() {
-    echo -e "\n${YELLOW}>>> 安装依赖...${NC}"
-    apt-get update -qq
-    apt-get install -y curl wget openssl python3 iproute2 xz-utils iptables-persistent -qq
-    echo -e "${GREEN}✅ 依赖安装完成${NC}"
-}
-
-install_ssrust() {
-    echo -e "\n${YELLOW}>>> 安装 Shadowsocks-Rust...${NC}"
-
-    LATEST=$(curl -s https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest \
-        | grep tag_name | cut -d'"' -f4)
-
-    if [ -z "$LATEST" ]; then
-        echo -e "${RED}❌ 获取版本号失败，请检查网络${NC}"
-        return 1
-    fi
-
-    echo -e "最新版本: ${GREEN}$LATEST${NC}"
-
-    ARCH=$(uname -m)
-    case $ARCH in
-        x86_64)  ARCH_NAME="x86_64-unknown-linux-gnu" ;;
-        aarch64) ARCH_NAME="aarch64-unknown-linux-gnu" ;;
-        *)
-            echo -e "${RED}不支持的架构: $ARCH${NC}"
-            return 1
-            ;;
-    esac
-
-    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${LATEST}/shadowsocks-${LATEST}.${ARCH_NAME}.tar.xz"
-    echo "下载中: $URL"
-    wget -O /tmp/ss-rust.tar.xz "$URL"
-
-    if [ $? -ne 0 ] || [ ! -s /tmp/ss-rust.tar.xz ]; then
-        echo -e "${RED}❌ 下载失败${NC}"
-        return 1
-    fi
-
-    tar -xJf /tmp/ss-rust.tar.xz -C /tmp/
-    mv /tmp/ssserver $SS_BIN
-    chmod +x $SS_BIN
-    mkdir -p /etc/shadowsocks-rust
-
-    echo -e "${GREEN}✅ ss-rust $LATEST 安装完成${NC}"
-}
-
-select_method() {
-    echo -e "\n${YELLOW}>>> 选择加密方式：${NC}"
-    echo "  1) 2022-blake3-aes-128-gcm        (推荐，密钥16字节)"
-    echo "  2) 2022-blake3-aes-256-gcm        (强加密，密钥32字节)"
-    echo "  3) 2022-blake3-chacha20-poly1305   (ARM推荐，密钥32字节)"
-    echo "  4) aes-256-gcm                    (传统，兼容性好)"
-    echo "  5) chacha20-ietf-poly1305         (传统，兼容性好)"
-    read -p "请选择 [1-5，默认1]: " METHOD_CHOICE
-
-    case $METHOD_CHOICE in
-        2) METHOD="2022-blake3-aes-256-gcm";        KEY_LEN=32 ;;
-        3) METHOD="2022-blake3-chacha20-poly1305";  KEY_LEN=32 ;;
-        4) METHOD="aes-256-gcm";                   KEY_LEN=0  ;;
-        5) METHOD="chacha20-ietf-poly1305";        KEY_LEN=0  ;;
-        *) METHOD="2022-blake3-aes-128-gcm";       KEY_LEN=16 ;;
-    esac
-
-    echo -e "已选择: ${GREEN}$METHOD${NC}"
-}
-
-# ========== 端口分配 ==========
-select_ports() {
-    echo -e "\n${YELLOW}>>> 端口分配方式：${NC}"
-    echo "  1) 顺序端口（从指定端口开始，自动跳过占用端口）"
-    echo "  2) 随机端口（在指定范围内随机分配）"
-    read -p "请选择 [1-2，默认1]: " PORT_MODE
-    PORT_MODE=${PORT_MODE:-1}
-
-    read -p "生成用户数量 [默认 10，最多 50]: " USER_COUNT
-    USER_COUNT=${USER_COUNT:-10}
-    [ "$USER_COUNT" -gt 50 ] && USER_COUNT=50
-
-    if [ "$PORT_MODE" = "1" ]; then
-        read -p "起始端口 [默认 30001]: " START_PORT
-        START_PORT=${START_PORT:-30001}
-
-        echo -e "\n${YELLOW}>>> 正在分配端口（跳过已占用）...${NC}"
-        PORT_LIST=()
-        CURRENT=$START_PORT
-        while [ ${#PORT_LIST[@]} -lt $USER_COUNT ]; do
-            if port_in_use $CURRENT; then
-                echo -e "  ${YELLOW}端口 $CURRENT 已占用，跳过${NC}"
-            else
-                PORT_LIST+=($CURRENT)
-                echo -e "  ${GREEN}端口 $CURRENT 可用 ✓${NC}"
-            fi
-            CURRENT=$((CURRENT + 1))
-            if [ $CURRENT -gt 65535 ]; then
-                echo -e "${RED}❌ 端口耗尽，无法分配足够端口${NC}"
-                return 1
-            fi
-        done
-
-    else
-        read -p "端口范围起始 [默认 20000]: " RANGE_START
-        read -p "端口范围结束 [默认 60000]: " RANGE_END
-        RANGE_START=${RANGE_START:-20000}
-        RANGE_END=${RANGE_END:-60000}
-
-        echo -e "\n${YELLOW}>>> 正在随机分配端口（跳过已占用）...${NC}"
-        PORT_LIST=()
-        TRIED=0
-        MAX_TRY=$(( RANGE_END - RANGE_START ))
-
-        while [ ${#PORT_LIST[@]} -lt $USER_COUNT ]; do
-            RAND_PORT=$(( RANGE_START + RANDOM % (RANGE_END - RANGE_START + 1) ))
-            if [[ " ${PORT_LIST[@]} " =~ " $RAND_PORT " ]] || port_in_use $RAND_PORT; then
-                TRIED=$((TRIED + 1))
-                if [ $TRIED -gt $MAX_TRY ]; then
-                    echo -e "${RED}❌ 范围内可用端口不足${NC}"
-                    return 1
-                fi
-                continue
-            fi
-            PORT_LIST+=($RAND_PORT)
-            echo -e "  ${GREEN}端口 $RAND_PORT 已分配 ✓${NC}"
-        done
-    fi
-
-    echo -e "${GREEN}✅ 端口分配完成，共 ${#PORT_LIST[@]} 个${NC}"
-}
-
-basic_config() {
-    echo -e "\n${YELLOW}>>> 服务器信息${NC}"
-    read -p "服务器域名或IP [默认自动检测]: " HOST
-    if [ -z "$HOST" ]; then
-        HOST=$(curl -s4 ifconfig.me 2>/dev/null || curl -s4 ip.sb)
-        echo -e "检测到IP: ${GREEN}$HOST${NC}"
-    fi
-}
-
-config_acl() {
-    echo -e "\n${YELLOW}>>> 是否配置 ACL 黑名单？${NC}"
-    read -p "配置 ACL？[y/N]: " USE_ACL
-
-    if [[ "$USE_ACL" =~ ^[Yy]$ ]]; then
-        echo -e "\n${YELLOW}输入要屏蔽的域名，每行一个，输入空行结束：${NC}"
-        echo -e "${BLUE}示例: ippure.com${NC}"
-
-        cat > $ACL_PATH << 'ACLEOF'
-[outbound_block_list]
-ACLEOF
-
-        while true; do
-            read -p "域名 (空行结束): " DOMAIN
-            [ -z "$DOMAIN" ] && break
-            # 去掉用户可能输入的前缀
-            DOMAIN=$(echo "$DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//')
-            echo "$DOMAIN" >> $MANUAL_FILE
-            echo -e "  ${GREEN}已添加: $DOMAIN（含所有子域名）${NC}"
-        done
-
-        USE_ACL_FLAG=true
-        rebuild_acl
-        echo -e "${GREEN}✅ ACL 配置完成${NC}"
-    else
-        USE_ACL_FLAG=false
-        echo "跳过 ACL 配置"
-    fi
-}
-
-gen_password() {
-    if [ "$KEY_LEN" -gt 0 ]; then
-        openssl rand -base64 $KEY_LEN
-    else
-        openssl rand -base64 32 | tr -d '=' | cut -c1-24
-    fi
-}
-
-generate_config() {
-    echo -e "\n${YELLOW}>>> 生成配置文件和 SS 链接...${NC}"
-
-    # ACL 写在顶层，不写在每个 server 块里
-    if [ "$USE_ACL_FLAG" = true ]; then
-        echo "{\"acl\":\"$ACL_PATH\",\"servers\":[" > $CONFIG
-    else
-        echo '{"servers":[' > $CONFIG
-    fi
-
-    > $LINKS_FILE
-
-    TOTAL=${#PORT_LIST[@]}
-    for i in $(seq 0 $((TOTAL - 1))); do
-        PORT=${PORT_LIST[$i]}
-        PASS=$(gen_password)
-        NUM=$((i + 1))
-
-        if [ $NUM -lt $TOTAL ]; then
-            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\"}," >> $CONFIG
+        # 用 ID 和 ID_LIKE 共同判断发行版系列
+        local os_family="" id_all="${OS_ID} ${OS_ID_LIKE}"
+        if echo "$id_all" | grep -qiE "debian|ubuntu|mint|pop|kali|elementary|zorin"; then
+            os_family="debian"
+        elif echo "$id_all" | grep -qiE "centos|rhel|almalinux|rocky|oracle"; then
+            os_family="redhat"
+        elif echo "$id_all" | grep -qi "fedora"; then
+            os_family="fedora"
+        elif echo "$id_all" | grep -qiE "opensuse|sles"; then
+            os_family="suse"
+        elif echo "$id_all" | grep -qiE "arch|manjaro|endeavour"; then
+            os_family="arch"
         else
-            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\"}" >> $CONFIG
+            os_family="unknown"
         fi
 
-        USERINFO=$(echo -n "$METHOD:$PASS" | base64 -w 0)
-        echo "ss://${USERINFO}@${HOST}:${PORT}#用户${NUM}" >> $LINKS_FILE
-    done
-
-    echo ']}' >> $CONFIG
-    echo -e "${GREEN}✅ 配置生成完成${NC}"
+        case "$os_family" in
+            debian)
+                export DEBIAN_FRONTEND=noninteractive   # 防止 apt 交互提示卡住
+                PKG_UPDATE="apt-get update -y -qq"
+                PKG_INSTALL="apt-get install -y -qq"
+                PKGS="curl wget tar jq openssl ca-certificates qrencode" ;;
+            redhat)
+                local pm="yum"; command -v dnf &>/dev/null && pm="dnf"
+                PKG_UPDATE="$pm makecache -q"; PKG_INSTALL="$pm install -y -q"
+                PKGS="curl wget tar jq openssl ca-certificates qrencode" ;;
+            fedora)
+                PKG_UPDATE="dnf makecache -q"; PKG_INSTALL="dnf install -y -q"
+                PKGS="curl wget tar jq openssl ca-certificates qrencode" ;;
+            suse)
+                PKG_UPDATE="zypper refresh -q"; PKG_INSTALL="zypper install -y -q"
+                PKGS="curl wget tar jq openssl ca-certificates qrencode" ;;
+            arch)
+                PKG_UPDATE="pacman -Sy --noconfirm"
+                PKG_INSTALL="pacman -S --noconfirm --needed"
+                PKGS="curl wget tar jq openssl ca-certificates qrencode" ;;
+            *) die "不支持的发行版: $OS_ID (ID_LIKE: ${OS_ID_LIKE:-无})" ;;
+        esac
+        INIT_SYS="systemd"
+    else
+        die "无法识别操作系统"
+    fi
+    info "系统: $OS_NAME  |  初始化: $INIT_SYS"
 }
 
-apply_config() {
-    python3 << PYEOF
-import json, os
-
-with open('$CONFIG', 'r') as f:
-    config = json.load(f)
-
-# 过滤禁用用户
-servers = [dict(s) for s in config['servers'] if not s.get('disabled', False)]
-for s in servers:
-    s.pop('disabled', None)
-    s.pop('acl', None)  # 移除 server 块里的旧 acl 字段
-
-runtime = {'servers': servers}
-
-# 顶层 ACL 继承
-if 'acl' in config and os.path.exists(config['acl']):
-    runtime['acl'] = config['acl']
-elif os.path.exists('$ACL_PATH'):
-    runtime['acl'] = '$ACL_PATH'
-
-with open('$RUNTIME', 'w') as f:
-    json.dump(runtime, f, indent=2)
-PYEOF
-
-    systemctl daemon-reload 2>/dev/null
-    systemctl restart shadowsocks-rust
+detect_arch() {
+    case "$(uname -m)" in
+        x86_64|amd64)  ARCH="amd64" ;;
+        aarch64|arm64) ARCH="arm64" ;;
+        armv7l)        ARCH="armv7" ;;
+        s390x)         ARCH="s390x" ;;
+        *) die "不支持的 CPU 架构: $(uname -m)" ;;
+    esac
 }
 
-create_service() {
-    echo -e "\n${YELLOW}>>> 创建系统服务...${NC}"
+install_deps() {
+    step "安装依赖"
+    eval "$PKG_UPDATE" 2>/dev/null || warn "包列表更新失败,继续..."
+    # shellcheck disable=SC2086
+    eval "$PKG_INSTALL $PKGS" 2>/dev/null || warn "部分依赖安装失败,继续..."
+}
 
-    cat > $SERVICE << EOF
+# ──────────────────────── sing-box 下载安装 ────────────────────────
+get_latest_version() {
+    local v
+    v=$(curl -fsSL --max-time 10 \
+        "https://api.github.com/repos/SagerNet/sing-box/releases/latest" \
+        | jq -r '.tag_name // empty' 2>/dev/null | sed 's/^v//')
+    [[ -n "$v" ]] || die "获取最新版本失败,请检查网络或 GitHub 访问"
+    echo "$v"
+}
+
+install_binary() {
+    local ver="$1"
+    local tmpdir; tmpdir=$(mktemp -d)
+    local pkg="sing-box-${ver}-linux-${ARCH}.tar.gz"
+    local url="https://github.com/SagerNet/sing-box/releases/download/v${ver}/${pkg}"
+    info "下载 sing-box v${ver} (${ARCH})..."
+    curl -fsSL --max-time 180 -o "${tmpdir}/${pkg}" "$url" \
+        || { rm -rf "$tmpdir"; die "下载失败: $url"; }
+    tar -xzf "${tmpdir}/${pkg}" -C "$tmpdir" 2>/dev/null || die "解压失败"
+    install -m 755 "${tmpdir}/sing-box-${ver}-linux-${ARCH}/sing-box" "$SB_BIN"
+    rm -rf "$tmpdir"
+    info "sing-box 已安装: $("$SB_BIN" version | head -1)"
+}
+
+setup_dirs() {
+    mkdir -p "$SB_CONF_DIR" "$SB_CERT_DIR" "$SB_LOG_DIR" "$SB_DATA_DIR"
+    chmod 700 "$SB_CERT_DIR"
+}
+
+# ──────────────────────── 服务管理 (systemd / OpenRC) ────────────────────────
+install_service() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then
+        cat > "$SB_OPENRC" <<'RC'
+#!/sbin/openrc-run
+name="sing-box"
+description="sing-box proxy server"
+command="/usr/local/bin/sing-box"
+command_args="-D /var/lib/sing-box -C /etc/sing-box run"
+command_background=true
+pidfile="/run/${RC_SVCNAME}.pid"
+output_log="/var/log/sing-box/sing-box.log"
+error_log="/var/log/sing-box/sing-box.log"
+
+depend() { need net; after firewall; }
+
+start_pre() {
+    /usr/local/bin/sing-box check -C /etc/sing-box || return 1
+    mkdir -p /var/lib/sing-box /var/log/sing-box
+}
+RC
+        chmod +x "$SB_OPENRC"
+        rc-update add sing-box default &>/dev/null
+        info "OpenRC 服务已注册 (开机自启)"
+    else
+        cat > "$SB_SYSTEMD" <<'UNIT'
 [Unit]
-Description=Shadowsocks-Rust Service
-After=network.target
+Description=sing-box proxy server
+Documentation=https://sing-box.sagernet.org
+After=network.target network-online.target nss-lookup.target
+Wants=network-online.target
 
 [Service]
-Type=simple
 User=root
-ExecStart=$SS_BIN -c $RUNTIME
-ExecStop=/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'
-Restart=always
-RestartSec=5s
+WorkingDirectory=/var/lib/sing-box
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE CAP_NET_RAW
+ExecStart=/usr/local/bin/sing-box -D /var/lib/sing-box -C /etc/sing-box run
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=1048576
 
 [Install]
 WantedBy=multi-user.target
-EOF
-
-    apply_config
-    systemctl daemon-reload
-    systemctl enable shadowsocks-rust
-    systemctl restart shadowsocks-rust
-    sleep 2
-
-    if systemctl is-active --quiet shadowsocks-rust; then
-        echo -e "${GREEN}✅ 服务启动成功${NC}"
-    else
-        echo -e "${RED}❌ 服务启动失败，查看日志: journalctl -u shadowsocks-rust -n 20${NC}"
+UNIT
+        systemctl daemon-reload
+        systemctl enable sing-box &>/dev/null
+        info "Systemd 服务已注册 (开机自启)"
     fi
 }
 
-init_traffic() {
-    echo -e "\n${YELLOW}>>> 初始化流量统计规则...${NC}"
+svc_start()   {
+    if [[ "$INIT_SYS" == "openrc" ]]; then rc-service sing-box start
+    else systemctl start sing-box; fi
+}
+svc_stop()    {
+    if [[ "$INIT_SYS" == "openrc" ]]; then rc-service sing-box stop
+    else systemctl stop sing-box; fi
+}
+svc_restart() {
+    if [[ "$INIT_SYS" == "openrc" ]]; then rc-service sing-box restart
+    else systemctl restart sing-box; fi
+}
+svc_status()  {
+    if [[ "$INIT_SYS" == "openrc" ]]; then rc-service sing-box status
+    else systemctl status sing-box --no-pager -l | head -30; fi
+}
+svc_active()  {
+    if [[ "$INIT_SYS" == "openrc" ]]; then
+        rc-service sing-box status 2>/dev/null | grep -q "started"
+    else
+        systemctl is-active --quiet sing-box 2>/dev/null
+    fi
+}
 
-    PORTS=$(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-for s in c['servers']:
-    print(s['server_port'])
-")
+# ──────────────────────── 工具函数 ────────────────────────
+get_public_ip() {
+    local ip=""
+    # 依次尝试多个 API，优先 IPv4
+    for api in         "https://api.ipify.org"         "https://ipinfo.io/ip"         "https://ifconfig.me/ip"         "https://icanhazip.com"         "https://ipecho.net/plain"; do
+        ip=$(curl -fsSL --max-time 5 "$api" 2>/dev/null | tr -d '[:space:]')
+        # 校验是否为合法 IPv4 格式
+        if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "$ip"; return 0
+        fi
+    done
+    # IPv6 fallback
+    ip=$(curl -fsSL --max-time 5 "https://api6.ipify.org" 2>/dev/null | tr -d '[:space:]')
+    echo "${ip:-}"
+}
 
-    for PORT in $PORTS; do
-        for PROTO in tcp udp; do
-            # 清理该端口所有旧规则，避免冗余
-            while iptables -D INPUT  -p $PROTO --dport $PORT 2>/dev/null; do :; done
-            while iptables -D OUTPUT -p $PROTO --sport $PORT 2>/dev/null; do :; done
-            # 置顶插入（位置1），确保 ACCEPT 之前匹配
-            iptables -I INPUT  1 -p $PROTO --dport $PORT
-            iptables -I OUTPUT 1 -p $PROTO --sport $PORT
-        done
+random_port() {
+    local p
+    while :; do
+        p=$(( RANDOM % 45000 + 10000 ))
+        ss -tuln 2>/dev/null | grep -q ":${p} " || { echo "$p"; return; }
+    done
+}
+
+gen_uuid()     { "$SB_BIN" generate uuid; }
+gen_rand_str() { openssl rand -base64 48 | tr -d '+/=\n' | head -c "${1:-32}"; }
+gen_rand_hex() { openssl rand -hex "${1:-8}"; }
+
+gen_self_cert() {
+    local cn="${1:-bing.com}"
+    local crt="${SB_CERT_DIR}/${cn}.crt"
+    local key="${SB_CERT_DIR}/${cn}.key"
+    if [[ ! -f "$crt" ]]; then
+        openssl ecparam -genkey -name prime256v1 -out "$key" 2>/dev/null
+        openssl req -new -x509 -days 36500 -key "$key" -out "$crt" \
+            -subj "/CN=${cn}" 2>/dev/null
+        chmod 600 "$key"
+    fi
+    echo "${crt}:${key}"
+}
+
+open_port() {
+    local port="$1" proto="${2:-tcp}"
+    command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "active" && \
+        ufw allow "${port}/${proto}" &>/dev/null || true
+    command -v firewall-cmd &>/dev/null && \
+        systemctl is-active --quiet firewalld 2>/dev/null && {
+            firewall-cmd --permanent --add-port="${port}/${proto}" &>/dev/null || true
+            firewall-cmd --reload &>/dev/null || true
+        }
+    # iptables fallback
+    command -v iptables &>/dev/null && {
+        iptables  -I INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+        ip6tables -I INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+    }
+}
+
+print_qr() {
+    command -v qrencode &>/dev/null || return
+    echo -e "\n${C_DIM}  扫码导入:${NC}"
+    echo "$1" | qrencode -t ANSIUTF8 2>/dev/null || true
+}
+
+save_env() { declare -p "$1" >> "$SB_ENV" 2>/dev/null || true; }
+
+load_env() {
+    # shellcheck disable=SC1090
+    [[ -f "$SB_ENV" ]] && source "$SB_ENV" 2>/dev/null || true
+}
+
+# ──────────────────────── acme.sh Let's Encrypt ────────────────────────
+acme_issue() {
+    local domain="$1"
+    local crt="${SB_CERT_DIR}/${domain}.crt"
+    local key="${SB_CERT_DIR}/${domain}.key"
+    [[ -f "$crt" && -f "$key" ]] && { info "证书已存在,跳过申请"; return; }
+    info "申请 Let's Encrypt 证书 (域名: $domain)..."
+    svc_stop 2>/dev/null || true
+    [[ -f ~/.acme.sh/acme.sh ]] || \
+        curl -fsSL https://get.acme.sh | sh -s "email=acme@${domain}" >/dev/null 2>&1 \
+        || die "acme.sh 安装失败"
+    ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1
+    ~/.acme.sh/acme.sh --issue -d "$domain" --standalone -k ec-256 --httpport 80 \
+        || die "证书申请失败 — 请确认: ① 域名已解析到本机 ② 80端口未被占用"
+    ~/.acme.sh/acme.sh --install-cert -d "$domain" --ecc \
+        --cert-file "$crt" --key-file "$key" \
+        --reloadcmd "$(command -v bash) $(readlink -f "$0") restart"
+    info "证书已安装: $crt"
+}
+
+# ════════════════════════════════════════════════════════════
+#  ██████╗ ███████╗██████╗ ██╗      ██████╗ ██╗   ██╗
+#  ██╔══██╗██╔════╝██╔══██╗██║     ██╔═══██╗╚██╗ ██╔╝
+#  ██║  ██║█████╗  ██████╔╝██║     ██║   ██║ ╚████╔╝
+#  ██║  ██║██╔══╝  ██╔═══╝ ██║     ██║   ██║  ╚██╔╝
+#  ██████╔╝███████╗██║     ███████╗╚██████╔╝   ██║
+#  ╚═════╝ ╚══════╝╚═╝     ╚══════╝ ╚═════╝    ╚═╝
+#           MODE: 部署机 (落地机)
+# ════════════════════════════════════════════════════════════
+
+# 全局:存放当前安装的所有入站 JSON 片段
+declare -a ALL_INBOUNDS=()
+declare -a ALL_LINKS=()
+
+# ────── 公共参数收集:连接IP/域名 ──────
+ask_connect_addr() {
+    # 支持环境变量 VOLSB_IP 跳过交互
+    if [[ -n "${VOLSB_IP:-}" ]]; then
+        CONNECT_ADDR="$VOLSB_IP"
+        info "连接地址 (环境变量): $CONNECT_ADDR"
+        return
+    fi
+
+    local auto_ip; auto_ip=$(get_public_ip)
+    echo ""
+    echo "  节点链接中使用的连接地址:"
+    echo "  ① 自动检测公网IP: ${C_CYAN}${auto_ip:-检测失败}${NC}"
+    echo "  ② 手动输入 IP 或 DDNS 域名"
+    ask "选择 [1/2] 默认1: "; read -r opt
+    if [[ "$opt" == "2" ]]; then
+        ask "输入 IP 或域名: "; read -r CONNECT_ADDR
+        [[ -z "$CONNECT_ADDR" ]] && CONNECT_ADDR="${auto_ip:-127.0.0.1}"
+    else
+        CONNECT_ADDR="${auto_ip:-127.0.0.1}"
+    fi
+    info "连接地址: $CONNECT_ADDR"
+}
+
+# ────── 多用户输入 ──────
+# 结果写入全局变量 USER_COUNT，避免子 shell 吞掉 read
+USER_COUNT=1
+ask_multi_user_count() {
+    ask "生成节点数量 (1-10, 回车默认1): "; read -r _cnt
+    [[ "$_cnt" =~ ^[1-9][0-9]?$ ]] || _cnt=1
+    [[ "$_cnt" -gt 10 ]] && _cnt=10
+    USER_COUNT="$_cnt"
+}
+
+# ────── 协议 1: VLESS + XTLS-Reality ──────
+deploy_vless_reality() {
+    step "配置 VLESS + XTLS-Reality"
+
+    local port sni
+    # 支持环境变量 VOLSB_PORT / VOLSB_SNI
+    if [[ -n "${VOLSB_PORT:-}" ]]; then
+        port="$VOLSB_PORT"; info "端口 (环境变量): $port"
+    else
+        ask "监听端口 (回车随机): "; read -r port
+        [[ -z "$port" ]] && port=$(random_port)
+    fi
+
+    if [[ -n "${VOLSB_SNI:-}" ]]; then
+        sni="$VOLSB_SNI"; info "SNI (环境变量): $sni"
+    else
+        echo ""
+        echo "  SNI 用于伪装 TLS 握手,建议选目标国大型网站:"
+        echo "  推荐: www.cloudflare.com / www.microsoft.com / www.apple.com / dl.google.com"
+        ask "输入 SNI [默认 www.cloudflare.com]: "; read -r sni
+        [[ -z "$sni" ]] && sni="www.cloudflare.com"
+    fi
+
+    # 生成 Reality 密钥对
+    local keypair; keypair=$("$SB_BIN" generate reality-keypair)
+    local priv_key; priv_key=$(echo "$keypair" | awk '/PrivateKey/{print $2}')
+    local pub_key;  pub_key=$(echo  "$keypair" | awk '/PublicKey/{print $2}')
+
+    ask_multi_user_count; local user_count="$USER_COUNT"
+
+    # 先收集所有用户数据，保证 short_id 在 link 和配置里完全一致
+    local users_json="["
+    local short_ids_json="["
+    local idx=0
+
+    for i in $(seq 1 "$user_count"); do
+        local uuid; uuid=$(gen_uuid)
+        local short_id; short_id=$(gen_rand_hex 8)
+
+        [[ $idx -gt 0 ]] && { users_json+=","; short_ids_json+=","; }
+        (( idx++ )) || true
+
+        users_json+=$(printf '{"uuid":"%s","flow":"xtls-rprx-vision"}' "$uuid")
+        short_ids_json+=$(printf '"%s"' "$short_id")
+
+        local link="vless://${uuid}@${CONNECT_ADDR}:${port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${short_id}&type=tcp#VOLSB-Reality-${i}"
+        ALL_LINKS+=("$link")
+
+        cat >> "$SB_INFO" <<INFO
+  [VLESS-Reality #${i}]
+    地址     : ${CONNECT_ADDR}
+    端口     : ${port}
+    UUID     : ${uuid}
+    SNI      : ${sni}
+    PublicKey: ${pub_key}
+    ShortID  : ${short_id}
+    Flow     : xtls-rprx-vision
+    链接     : ${link}
+INFO
+    done
+    users_json+="]"
+    short_ids_json+="]"
+
+    local inbound
+    inbound=$(jq -n \
+        --argjson port      "$port" \
+        --argjson users     "$users_json" \
+        --arg     sni       "$sni" \
+        --arg     priv_key  "$priv_key" \
+        --argjson short_ids "$short_ids_json" \
+        '{type:"vless",tag:"vless-reality-in",listen:"::",listen_port:$port,
+           users:$users,tls:{enabled:true,server_name:$sni,
+           reality:{enabled:true,handshake:{server:$sni,server_port:443},
+           private_key:$priv_key,short_id:$short_ids}}}')
+    ALL_INBOUNDS+=("$inbound")
+
+    open_port "$port" tcp
+    info "✓ VLESS-Reality | 端口:$port | 用户数:$user_count | SNI:$sni"
+}
+
+# ────── 协议 2: Hysteria2 ──────
+deploy_hysteria2() {
+    step "配置 Hysteria2"
+
+    local port; ask "监听端口 (回车随机): "; read -r port
+    [[ -z "$port" ]] && port=$(random_port)
+
+    local masq_domain cert_path key_path insecure="true"
+    echo "  TLS 证书:"
+    echo "   1) 自签证书 (客户端需开 insecure)  2) Let's Encrypt 正式证书"
+    ask "选择 [1/2] 默认1: "; read -r cc; [[ -z "$cc" ]] && cc="1"
+    if [[ "$cc" == "2" ]]; then
+        ask "域名: "; read -r masq_domain; [[ -z "$masq_domain" ]] && die "域名不能为空"
+        acme_issue "$masq_domain"
+        cert_path="${SB_CERT_DIR}/${masq_domain}.crt"
+        key_path="${SB_CERT_DIR}/${masq_domain}.key"
+        insecure="false"
+    else
+        masq_domain="bing.com"
+        local pair; pair=$(gen_self_cert "$masq_domain")
+        cert_path="${pair%%:*}"; key_path="${pair##*:}"
+    fi
+
+    ask_multi_user_count; local user_count="$USER_COUNT"
+    local users_json="["; local idx=0
+    for i in $(seq 1 "$user_count"); do
+        local pwd; pwd=$(gen_rand_str 24)
+        [[ $idx -gt 0 ]] && users_json+=","
+        (( idx++ )) || true
+        users_json+="{\"password\":\"${pwd}\"}"
+        local ins_param=""; [[ "$insecure" == "true" ]] && ins_param="&insecure=1"
+        local link="hysteria2://${pwd}@${CONNECT_ADDR}:${port}/?sni=${masq_domain}${ins_param}#VOLSB-HY2-${i}"
+        ALL_LINKS+=("$link")
+        cat >> "$SB_INFO" <<INFO
+  [Hysteria2 #${i}]
+    地址     : ${CONNECT_ADDR}
+    端口     : ${port} (UDP)
+    密码     : ${pwd}
+    SNI      : ${masq_domain}
+    跳过验证 : ${insecure}
+    链接     : ${link}
+INFO
+    done
+    users_json+="]"
+
+    local inbound
+    inbound=$(jq -n \
+        --argjson port  "$port" \
+        --argjson users "$users_json" \
+        --arg     cert  "$cert_path" \
+        --arg     key   "$key_path" \
+        '{type:"hysteria2",tag:"hysteria2-in",listen:"::",listen_port:$port,
+           users:$users,tls:{enabled:true,alpn:["h3"],
+           certificate_path:$cert,key_path:$key}}')
+    ALL_INBOUNDS+=("$inbound")
+
+    open_port "$port" udp
+    info "✓ Hysteria2 | 端口:$port (UDP) | 用户数:$user_count"
+}
+
+# ────── 协议 3: VMess + WebSocket ──────
+deploy_vmess_ws() {
+    step "配置 VMess + WebSocket"
+    local port ws_path
+    ask "监听端口 (回车随机, 建议80): "; read -r port; [[ -z "$port" ]] && port=$(random_port)
+    ask "WebSocket 路径 (回车随机): "; read -r ws_path
+    [[ -z "$ws_path" ]] && ws_path="/$(gen_rand_hex 6)"
+    [[ "${ws_path:0:1}" != "/" ]] && ws_path="/${ws_path}"
+
+    ask_multi_user_count; local user_count="$USER_COUNT"
+    local users_json="["; local idx=0
+    for i in $(seq 1 "$user_count"); do
+        local uuid; uuid=$(gen_uuid)
+        [[ $idx -gt 0 ]] && users_json+=","
+        (( idx++ )) || true
+        users_json+="{\"uuid\":\"${uuid}\",\"alterId\":0}"
+        local vmjson="{\"v\":\"2\",\"ps\":\"VOLSB-VMess-${i}\",\"add\":\"${CONNECT_ADDR}\",\"port\":\"${port}\",\"id\":\"${uuid}\",\"aid\":\"0\",\"scy\":\"auto\",\"net\":\"ws\",\"type\":\"none\",\"host\":\"\",\"path\":\"${ws_path}\",\"tls\":\"\"}"
+        local b64; b64=$(echo -n "$vmjson" | base64 -w0)
+        local link="vmess://${b64}"
+        ALL_LINKS+=("$link")
+        cat >> "$SB_INFO" <<INFO
+  [VMess-WS #${i}]
+    地址     : ${CONNECT_ADDR}
+    端口     : ${port}
+    UUID     : ${uuid}
+    路径     : ${ws_path}
+    链接     : ${link}
+INFO
+    done
+    users_json+="]"
+
+    local inbound
+    inbound=$(jq -n \
+        --argjson port  "$port" \
+        --argjson users "$users_json" \
+        --arg     path  "$ws_path" \
+        '{type:"vmess",tag:"vmess-ws-in",listen:"::",listen_port:$port,
+           users:$users,transport:{type:"ws",path:$path}}')
+    ALL_INBOUNDS+=("$inbound")
+
+    open_port "$port" tcp
+    info "✓ VMess-WS | 端口:$port | 路径:$ws_path | 用户数:$user_count"
+}
+
+# ────── 协议 4: Trojan + TLS ──────
+deploy_trojan() {
+    step "配置 Trojan + TLS"
+    local port; ask "监听端口 (回车默认443): "; read -r port; [[ -z "$port" ]] && port=443
+    local masq_domain cert_path key_path insecure="true"
+    echo "  TLS 证书:  1) 自签  2) Let's Encrypt"
+    ask "选择 [1/2] 默认1: "; read -r cc; [[ -z "$cc" ]] && cc="1"
+    if [[ "$cc" == "2" ]]; then
+        ask "域名: "; read -r masq_domain; [[ -z "$masq_domain" ]] && die "域名不能为空"
+        acme_issue "$masq_domain"
+        cert_path="${SB_CERT_DIR}/${masq_domain}.crt"
+        key_path="${SB_CERT_DIR}/${masq_domain}.key"
+        insecure="false"
+    else
+        masq_domain="bing.com"
+        local pair; pair=$(gen_self_cert "$masq_domain")
+        cert_path="${pair%%:*}"; key_path="${pair##*:}"
+    fi
+
+    ask_multi_user_count; local user_count="$USER_COUNT"
+    local users_json="["; local idx=0
+    for i in $(seq 1 "$user_count"); do
+        local pwd; pwd=$(gen_rand_str 24)
+        [[ $idx -gt 0 ]] && users_json+=","
+        (( idx++ )) || true
+        users_json+="{\"password\":\"${pwd}\"}"
+        local ins_param=""; [[ "$insecure" == "true" ]] && ins_param="&allowInsecure=1"
+        local link="trojan://${pwd}@${CONNECT_ADDR}:${port}?sni=${masq_domain}${ins_param}#VOLSB-Trojan-${i}"
+        ALL_LINKS+=("$link")
+        cat >> "$SB_INFO" <<INFO
+  [Trojan #${i}]
+    地址     : ${CONNECT_ADDR}
+    端口     : ${port}
+    密码     : ${pwd}
+    SNI      : ${masq_domain}
+    跳过验证 : ${insecure}
+    链接     : ${link}
+INFO
+    done
+    users_json+="]"
+
+    local inbound
+    inbound=$(jq -n \
+        --argjson port  "$port" \
+        --argjson users "$users_json" \
+        --arg     cert  "$cert_path" \
+        --arg     key   "$key_path" \
+        '{type:"trojan",tag:"trojan-in",listen:"::",listen_port:$port,
+           users:$users,tls:{enabled:true,certificate_path:$cert,key_path:$key}}')
+    ALL_INBOUNDS+=("$inbound")
+
+    open_port "$port" tcp
+    info "✓ Trojan | 端口:$port | 用户数:$user_count"
+}
+
+# ────── 协议 5: ShadowTLS v3 + Shadowsocks ──────
+deploy_shadowtls() {
+    step "配置 ShadowTLS v3 + Shadowsocks"
+    local stls_port sni
+    ask "ShadowTLS 监听端口 (回车随机): "; read -r stls_port
+    [[ -z "$stls_port" ]] && stls_port=$(random_port)
+    echo "  推荐 SNI: www.bing.com / www.apple.com / gateway.icloud.com"
+    ask "伪装 SNI [默认 www.bing.com]: "; read -r sni; [[ -z "$sni" ]] && sni="www.bing.com"
+
+    local ss_port; ss_port=$(random_port)
+    ask_multi_user_count; local user_count="$USER_COUNT"
+    local stls_users="["; local ss_users="["; local idx=0
+
+    for i in $(seq 1 "$user_count"); do
+        local sp; sp=$(gen_rand_str 32)
+        local ssp; ssp=$(gen_rand_str 32)
+        [[ $idx -gt 0 ]] && { stls_users+=","; ss_users+=","; }
+        (( idx++ )) || true
+        stls_users+="{\"name\":\"user${i}\",\"password\":\"${sp}\"}"
+        ss_users+="{\"name\":\"user${i}\",\"password\":\"${ssp}\"}"
+        cat >> "$SB_INFO" <<INFO
+  [ShadowTLS v3 #${i}]
+    地址         : ${CONNECT_ADDR}
+    ShadowTLS 端口: ${stls_port}
+    ShadowTLS 密码: ${sp}
+    SS 内层密码  : ${ssp}
+    SS 加密      : 2022-blake3-aes-128-gcm
+    伪装 SNI     : ${sni}
+    [客户端配置见: https://sing-box.sagernet.org/configuration/outbound/shadowtls/]
+INFO
+    done
+    stls_users+="]"; ss_users+="]"
+
+    local stls_inbound ss_inbound
+    stls_inbound=$(jq -n \
+        --argjson port  "$stls_port" \
+        --argjson users "$stls_users" \
+        --arg     sni   "$sni" \
+        '{type:"shadowtls",tag:"shadowtls-in",listen:"::",listen_port:$port,
+           version:3,users:$users,handshake:{server:$sni,server_port:443},
+           detour:"ss-backend-in"}')
+    ss_inbound=$(jq -n \
+        --argjson port  "$ss_port" \
+        --argjson users "$ss_users" \
+        '{type:"shadowsocks",tag:"ss-backend-in",listen:"127.0.0.1",
+           listen_port:$port,method:"2022-blake3-aes-128-gcm",users:$users}')
+    ALL_INBOUNDS+=("$stls_inbound")
+    ALL_INBOUNDS+=("$ss_inbound")
+
+    open_port "$stls_port" tcp
+    info "✓ ShadowTLS v3 | 端口:$stls_port | 用户数:$user_count | SNI:$sni"
+}
+
+# ════════════════════════════════════════════════════════════
+#  线路机 (中转机) 模式
+#  原理: VLESS-Reality 入站 → Shadowsocks 出站 → 落地机
+# ════════════════════════════════════════════════════════════
+
+deploy_relay() {
+    step "线路机模式部署"
+    echo ""
+    warn "线路机模式: 本机接收 VLESS-Reality 流量,转发至落地机 Shadowsocks 节点"
+    echo ""
+
+    # ── 落地机信息 ──
+    banner "落地机 (Shadowsocks) 信息"
+    echo ""
+    echo "  输入方式:"
+    echo "   1) 粘贴 SS 链接  (ss://...)"
+    echo "   2) 手动输入"
+    ask "选择 [1/2] 默认1: "; read -r ss_input_mode
+    [[ -z "$ss_input_mode" ]] && ss_input_mode="1"
+
+    if [[ "$ss_input_mode" == "1" ]]; then
+        # ── 解析 SS 链接 ──
+        ask "粘贴 SS 链接: "; read -r ss_link
+        [[ -z "$ss_link" ]] && { err "SS 链接不能为空"; return 1; }
+
+        # 去掉 ss:// 前缀和 #备注 后缀
+        local ss_body; ss_body="${ss_link#ss://}"
+        ss_body="${ss_body%%#*}"
+
+        # 判断格式：SIP002 (method:pwd@host:port) 或 旧格式 (base64@host:port)
+        if echo "$ss_body" | grep -q '@'; then
+            local userinfo hostinfo
+            userinfo="${ss_body%@*}"   # method:pwd 或 base64
+            hostinfo="${ss_body##*@}"  # host:port
+
+            # 提取 host 和 port（支持 IPv6 [::1]:port）
+            if echo "$hostinfo" | grep -q '^\['; then
+                LAND_ADDR="${hostinfo%]*}"; LAND_ADDR="${LAND_ADDR#[}"
+                LAND_PORT="${hostinfo##*]:}"
+            else
+                LAND_ADDR="${hostinfo%:*}"
+                LAND_PORT="${hostinfo##*:}"
+            fi
+
+            # 判断 userinfo 是否是 base64（不含 : 则是 base64）
+            if echo "$userinfo" | grep -q ':'; then
+                # SIP002 明文格式：method:password
+                LAND_METHOD="${userinfo%%:*}"
+                LAND_PASS="${userinfo#*:}"
+            else
+                # 旧格式：base64(method:password)
+                local decoded; decoded=$(echo "$userinfo" | base64 -d 2>/dev/null                     || echo "$userinfo" | base64 -di 2>/dev/null || true)
+                if [[ -n "$decoded" && "$decoded" == *:* ]]; then
+                    LAND_METHOD="${decoded%%:*}"
+                    LAND_PASS="${decoded#*:}"
+                else
+                    err "SS 链接解析失败，请检查格式"; return 1
+                fi
+            fi
+        else
+            err "SS 链接格式不正确，应为 ss://...@host:port"; return 1
+        fi
+
+        # 验证解析结果
+        if [[ -z "$LAND_ADDR" || -z "$LAND_PORT" || -z "$LAND_PASS" || -z "$LAND_METHOD" ]]; then
+            err "SS 链接解析失败: addr=$LAND_ADDR port=$LAND_PORT method=$LAND_METHOD"
+            return 1
+        fi
+        info "解析成功: ${LAND_METHOD} @ ${LAND_ADDR}:${LAND_PORT}"
+
+    else
+        # ── 手动输入 ──
+        ask "落地机 IP 或域名: "; read -r LAND_ADDR
+        [[ -z "$LAND_ADDR" ]] && { err "落地机地址不能为空"; return 1; }
+        ask "落地机 SS 端口: "; read -r LAND_PORT
+        [[ -z "$LAND_PORT" ]] && { err "落地机端口不能为空"; return 1; }
+        ask "落地机 SS 密码: "; read -r LAND_PASS
+        [[ -z "$LAND_PASS" ]] && { err "落地机密码不能为空"; return 1; }
+        echo "  加密方式:  1) 2022-blake3-aes-128-gcm (推荐)  2) aes-256-gcm  3) chacha20-ietf-poly1305"
+        ask "选择 [1-3] 默认1: "; read -r enc_choice
+        case "${enc_choice:-1}" in
+            2) LAND_METHOD="aes-256-gcm" ;;
+            3) LAND_METHOD="chacha20-ietf-poly1305" ;;
+            *)  LAND_METHOD="2022-blake3-aes-128-gcm" ;;
+        esac
+    fi
+
+    # ── 线路机入站 (VLESS-Reality) ──
+    banner "线路机入站配置"
+    ask_connect_addr  # 获取线路机自身公网IP
+
+    local in_port sni
+    ask "入站端口 (回车随机): "; read -r in_port; [[ -z "$in_port" ]] && in_port=$(random_port)
+    echo "  SNI 推荐: www.cloudflare.com / www.microsoft.com"
+    ask "伪装 SNI [默认 www.cloudflare.com]: "; read -r sni; [[ -z "$sni" ]] && sni="www.cloudflare.com"
+
+    local keypair; keypair=$("$SB_BIN" generate reality-keypair)
+    local priv_key; priv_key=$(echo "$keypair" | awk '/PrivateKey/{print $2}')
+    local pub_key;  pub_key=$(echo  "$keypair" | awk '/PublicKey/{print $2}')
+
+    ask_multi_user_count; local user_count="$USER_COUNT"
+    local users_json="["; local short_ids="["; local idx=0
+
+    for i in $(seq 1 "$user_count"); do
+        local uuid; uuid=$(gen_uuid)
+        local sid; sid=$(gen_rand_hex 8)
+        [[ $idx -gt 0 ]] && { users_json+=","; short_ids+=","; }
+        (( idx++ )) || true
+        users_json+="{\"uuid\":\"${uuid}\",\"flow\":\"xtls-rprx-vision\"}"
+        short_ids+="\"${sid}\""
+        local link="vless://${uuid}@${CONNECT_ADDR}:${in_port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${sni}&fp=chrome&pbk=${pub_key}&sid=${sid}&type=tcp#VOLSB-Relay-${i}"
+        ALL_LINKS+=("$link")
+        cat >> "$SB_INFO" <<INFO
+  [线路机 VLESS-Reality #${i}]
+    连接地址  : ${CONNECT_ADDR}
+    端口      : ${in_port}
+    UUID      : ${uuid}
+    PublicKey : ${pub_key}
+    ShortID   : ${sid}
+    落地机    : ${LAND_ADDR}:${LAND_PORT}
+    链接      : ${link}
+INFO
+    done
+    users_json+="]"; short_ids+="]"
+
+    # ── 写入配置 ──
+    mkdir -p "$SB_CONF_DIR"
+    cat > "$SB_CONFIG" <<JSON
+{
+  "log": {"level": "warn", "output": "${SB_LOG}", "timestamp": true},
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-relay-in",
+      "listen": "::",
+      "listen_port": ${in_port},
+      "users": ${users_json},
+      "tls": {
+        "enabled": true,
+        "server_name": "${sni}",
+        "reality": {
+          "enabled": true,
+          "handshake": {"server": "${sni}", "server_port": 443},
+          "private_key": "${priv_key}",
+          "short_id": ${short_ids}
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "ss-land",
+      "server": "${LAND_ADDR}",
+      "server_port": ${LAND_PORT},
+      "method": "${LAND_METHOD}",
+      "password": "${LAND_PASS}"
+    },
+    {"type": "direct", "tag": "direct"},
+    {"type": "block",  "tag": "block"}
+  ],
+  "route": {
+    "rules": [{"inbound": ["vless-relay-in"], "outbound": "ss-land"}],
+    "final": "direct"
+  }
+}
+JSON
+
+    open_port "$in_port" tcp
+    info "✓ 线路机配置完成 | 入站端口:$in_port → 落地:${LAND_ADDR}:${LAND_PORT}"
+
+    # ── 生成回到落地机的一键线路机安装命令 ──
+    banner "一键安装命令 (在其他线路机上执行)"
+    echo ""
+    echo -e "  ${C_YELLOW}以下命令可直接在其他 VPS 上运行,生成相同配置的线路机:${NC}"
+    echo ""
+    local script_url="https://raw.githubusercontent.com/your-repo/volsb/main/volsb.sh"
+    echo -e "  ${C_CYAN}bash <(curl -fsSL ${script_url}) relay \\
+    --land-addr '${LAND_ADDR}' \\
+    --land-port '${LAND_PORT}' \\
+    --land-pass '${LAND_PASS}' \\
+    --land-method '${LAND_METHOD}'${NC}"
+    echo ""
+}
+
+# ════════════════════════════════════════════════════════════
+#  配置组装 & 写入
+# ════════════════════════════════════════════════════════════
+
+select_protocols() {
+    clear
+    echo -e "${C_BOLD}${C_CYAN}"
+    cat <<'BANNER'
+  ┌──────────────────────────────────────────────────────┐
+  │        VOLSB — 部署机协议选择                        │
+  └──────────────────────────────────────────────────────┘
+BANNER
+    echo -e "${NC}"
+    hr
+    printf "  ${C_BOLD}%-5s %-30s %-10s %s${NC}\n" "序号" "协议" "传输" "说明"
+    hr
+    printf "  ${C_BOLD}%-5s${NC} %-30s %-10s %s\n" "1)" "VLESS + XTLS-Reality"     "TCP"   "★ 推荐 | 抗审查首选,无需域名"
+    printf "  ${C_BOLD}%-5s${NC} %-30s %-10s %s\n" "2)" "Hysteria2"                "UDP"   "★ 推荐 | 高速UDP,弱网友好"
+    printf "  ${C_BOLD}%-5s${NC} %-30s %-10s %s\n" "3)" "VMess + WebSocket"        "TCP/WS" "适合套 CDN / Nginx 反代"
+    printf "  ${C_BOLD}%-5s${NC} %-30s %-10s %s\n" "4)" "Trojan + TLS"             "TCP"   "经典方案,广泛兼容"
+    printf "  ${C_BOLD}%-5s${NC} %-30s %-10s %s\n" "5)" "ShadowTLS v3 + SS"        "TCP"   "真实 TLS 握手伪装"
+    printf "  ${C_BOLD}%-5s${NC} %-30s %-10s %s\n" "0)" "全部协议"                 "-"     "同时部署以上所有"
+    hr
+    echo ""
+    echo -e "  支持多选: ${C_CYAN}1 2${NC}  ${C_CYAN}1 2 4${NC}  ${C_CYAN}0${NC}(全部)"
+    echo ""
+    # 支持环境变量 VOLSB_PROTO 跳过交互
+    local raw_input="${VOLSB_PROTO:-}"
+    if [[ -z "$raw_input" ]]; then
+        ask "请选择协议 [0-5]: "; read -r raw_input
+    else
+        info "协议选择 (环境变量): $raw_input"
+    fi
+    [[ -z "$raw_input" ]] && raw_input="1"
+    [[ "$raw_input" == "0" ]] && raw_input="1 2 3 4 5"
+
+    SELECTED_PROTOS=()
+    for n in $raw_input; do
+        case "$n" in
+            1) SELECTED_PROTOS+=("vless_reality") ;;
+            2) SELECTED_PROTOS+=("hysteria2") ;;
+            3) SELECTED_PROTOS+=("vmess_ws") ;;
+            4) SELECTED_PROTOS+=("trojan") ;;
+            5) SELECTED_PROTOS+=("shadowtls") ;;
+            *) warn "忽略无效输入: $n" ;;
+        esac
+    done
+    [[ ${#SELECTED_PROTOS[@]} -eq 0 ]] && die "未选择任何协议"
+}
+
+# ────── 写入配置的公共函数 ──────
+_write_config() {
+    # $1 = inbounds JSON array string
+    local inbounds_json="$1"
+    step "写入配置文件"
+    cat > "$SB_CONFIG" <<JSON
+{
+  "log": {
+    "level": "warn",
+    "output": "${SB_LOG}",
+    "timestamp": true
+  },
+  "inbounds": ${inbounds_json},
+  "outbounds": [
+    {"type": "direct", "tag": "direct"},
+    {"type": "block",  "tag": "block"}
+  ],
+  "route": {
+    "final": "direct"
+  }
+}
+JSON
+    if "$SB_BIN" check -c "$SB_CONFIG" 2>/dev/null; then
+        info "配置写入完成，校验通过"
+    else
+        err "配置校验失败:"; "$SB_BIN" check -c "$SB_CONFIG"; return 1
+    fi
+}
+
+# ────── 初始化节点信息头 ──────
+_init_info_header() {
+    cat > "$SB_INFO" <<INFOHEADER
+==============================================
+  VOLSB — 节点信息
+  更新时间 : $(date '+%Y-%m-%d %H:%M:%S')
+  服务器   : ${CONNECT_ADDR:-$(get_public_ip)}
+==============================================
+INFOHEADER
+    : > "$SB_LINKS"   # 清空链接文件
+}
+
+# ────── 全新安装：覆盖所有入站 ──────
+assemble_and_write_config() {
+    if [[ ! -x "$SB_BIN" ]]; then
+        err "sing-box 未安装，请先执行菜单选项 1 安装"; return 1
+    fi
+    ALL_INBOUNDS=(); ALL_LINKS=()
+    _init_info_header
+
+    for proto in "${SELECTED_PROTOS[@]}"; do
+        case "$proto" in
+            vless_reality) deploy_vless_reality ;;
+            hysteria2)     deploy_hysteria2 ;;
+            vmess_ws)      deploy_vmess_ws ;;
+            trojan)        deploy_trojan ;;
+            shadowtls)     deploy_shadowtls ;;
+        esac
     done
 
-    # 重置内核计数器
-    iptables -Z
-
-    netfilter-persistent save 2>/dev/null
-    echo -e "${GREEN}✅ 流量统计初始化完成${NC}"
+    local joined; joined=$(printf '%s
+' "${ALL_INBOUNDS[@]}" | jq -s '.')
+    _write_config "$joined" || return 1
+    printf '%s
+' "${ALL_LINKS[@]}" > "$SB_LINKS"
 }
 
-install_shortcut() {
-    # 获取当前脚本绝对路径
-    CURRENT_SCRIPT=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+# ────── 追加协议：保留旧入站，合并新入站 ──────
+append_and_write_config() {
+    if [[ ! -x "$SB_BIN" ]]; then
+        err "sing-box 未安装，请先执行菜单选项 1 安装"; return 1
+    fi
 
-    # 将脚本复制到固定路径
-    if [ "$CURRENT_SCRIPT" != "$SCRIPT_INSTALL_PATH" ]; then
-        cp "$CURRENT_SCRIPT" "$SCRIPT_INSTALL_PATH"
-        if [ $? -ne 0 ]; then
-            echo -e "${RED}❌ 脚本复制失败，快捷命令将指向当前路径: $CURRENT_SCRIPT${NC}"
-            SCRIPT_INSTALL_PATH="$CURRENT_SCRIPT"
-        else
-            chmod +x "$SCRIPT_INSTALL_PATH"
-            echo -e "${GREEN}✅ 脚本已安装至: ${YELLOW}$SCRIPT_INSTALL_PATH${NC}"
+    # 读出旧的入站 JSON 数组
+    local old_inbounds_json="[]"
+    if [[ -f "$SB_CONFIG" ]]; then
+        old_inbounds_json=$(jq '.inbounds' "$SB_CONFIG" 2>/dev/null) || old_inbounds_json="[]"
+    fi
+
+    # 询问是否保留旧节点
+    local keep_old=true
+    if [[ "$old_inbounds_json" != "[]" && -n "$old_inbounds_json" ]]; then
+        local old_count; old_count=$(echo "$old_inbounds_json" | jq 'length' 2>/dev/null || echo 0)
+        echo ""
+        echo -e "  ${C_BOLD}检测到已有 ${old_count} 个入站节点:${NC}"
+        echo "$old_inbounds_json" | jq -r             '.[] | "  - \(.type) 端口:\(.listen_port) [\(.tag)]"' 2>/dev/null || true
+        echo ""
+        echo "  选项:"
+        echo "   1) 保留旧节点，追加新节点（推荐）"
+        echo "   2) 清除旧节点，只保留新节点"
+        ask "选择 [1/2] 默认1: "; read -r keep_choice
+        [[ "${keep_choice:-1}" == "2" ]] && keep_old=false
+    fi
+
+    # 生成新入站
+    ALL_INBOUNDS=(); ALL_LINKS=()
+
+    # 若保留旧节点，先把旧入站塞进 ALL_INBOUNDS
+    if $keep_old && [[ "$old_inbounds_json" != "[]" ]]; then
+        # 把旧入站每个元素拆出来加入数组
+        local old_count; old_count=$(echo "$old_inbounds_json" | jq 'length' 2>/dev/null || echo 0)
+        local oi=0
+        while [[ $oi -lt $old_count ]]; do
+            local ib; ib=$(echo "$old_inbounds_json" | jq ".[$oi]" 2>/dev/null)
+            ALL_INBOUNDS+=("$ib")
+            (( oi++ )) || true
+        done
+        # 同时保留旧链接
+        if [[ -f "$SB_LINKS" ]]; then
+            while IFS= read -r lnk; do
+                [[ -n "$lnk" ]] && ALL_LINKS+=("$lnk")
+            done < "$SB_LINKS"
         fi
+        info "已保留 ${old_count} 个旧入站"
     fi
 
-    # 如果已存在且不是 volss 脚本则跳过，避免覆盖其他快捷命令
-    if [ -f "$SHORTCUT" ]; then
-        if ! grep -q "volss" "$SHORTCUT" 2>/dev/null; then
-            echo -e "${YELLOW}⚠ $SHORTCUT 已被其他脚本占用，跳过注册${NC}"
-            return
-        fi
+    # 重置 SB_INFO 头，但追加模式下先把旧 SB_INFO 内容（节点详情）保留
+    local old_info_body=""
+    if $keep_old && [[ -f "$SB_INFO" ]]; then
+        # 跳过头部（前5行），保留节点详情
+        old_info_body=$(tail -n +6 "$SB_INFO" 2>/dev/null || true)
+    fi
+    _init_info_header
+    [[ -n "$old_info_body" ]] && echo "$old_info_body" >> "$SB_INFO"
+
+    # 部署新协议
+    for proto in "${SELECTED_PROTOS[@]}"; do
+        case "$proto" in
+            vless_reality) deploy_vless_reality ;;
+            hysteria2)     deploy_hysteria2 ;;
+            vmess_ws)      deploy_vmess_ws ;;
+            trojan)        deploy_trojan ;;
+            shadowtls)     deploy_shadowtls ;;
+        esac
+    done
+
+    # 检查 tag 重复（同类型入站 tag 要唯一）
+    local all_tags; all_tags=$(printf '%s
+' "${ALL_INBOUNDS[@]}" | jq -r '.tag // ""' 2>/dev/null)
+    local unique_tags; unique_tags=$(echo "$all_tags" | sort -u | wc -l | tr -d ' ')
+    local total_tags; total_tags=$(echo "$all_tags" | wc -l | tr -d ' ')
+    if [[ "$unique_tags" -lt "$total_tags" ]]; then
+        warn "检测到重复的入站 tag，自动重命名..."
+        local fixed_inbounds=()
+        local tag_count=0
+        for ib in "${ALL_INBOUNDS[@]}"; do
+            local t; t=$(echo "$ib" | jq -r '.tag // ""' 2>/dev/null)
+            local new_tag="${t}-$(( ++tag_count ))"
+            ib=$(echo "$ib" | jq --arg nt "$new_tag" '.tag = $nt' 2>/dev/null)
+            fixed_inbounds+=("$ib")
+        done
+        ALL_INBOUNDS=("${fixed_inbounds[@]}")
     fi
 
-    cat > $SHORTCUT << EOF
-#!/bin/bash
-bash $SCRIPT_INSTALL_PATH --menu
-EOF
-    chmod +x $SHORTCUT
+    local joined; joined=$(printf '%s
+' "${ALL_INBOUNDS[@]}" | jq -s '.')
+    _write_config "$joined" || return 1
+    printf '%s
+' "${ALL_LINKS[@]}" > "$SB_LINKS"
+    info "共 ${#ALL_INBOUNDS[@]} 个入站节点"
+}
 
-    # 验证快捷命令是否可用
-    if [ -f "$SCRIPT_INSTALL_PATH" ]; then
-        echo -e "${GREEN}✅ 快捷命令已注册: 输入 ${YELLOW}volss${GREEN} 呼出管理菜单${NC}"
-    else
-        echo -e "${RED}❌ 快捷命令注册失败，请手动运行: bash $CURRENT_SCRIPT${NC}"
+# ════════════════════════════════════════════════════════════
+#  流量统计
+# ════════════════════════════════════════════════════════════
+
+# sing-box 启用 ClashAPI 后可通过 REST 查询连接/流量
+# 这里用 /proc/net 统计全量入出流量作为轻量实现
+
+SB_STAT_API="127.0.0.1:8080"  # sing-box 统计 API 监听地址
+
+traffic_init_api() {
+    # 注入 sing-box v2ray 兼容统计 API（用于按入站/用户统计流量）
+    if ! jq -e '.experimental.v2ray_api' "$SB_CONFIG" &>/dev/null; then
+        local tmp; tmp=$(mktemp)
+        jq '.experimental = (.experimental // {}) + {
+            "v2ray_api": {
+                "listen": "127.0.0.1:8080",
+                "stats": {"enabled": true, "inbounds": true, "outbounds": true, "users": true}
+            }
+        }' "$SB_CONFIG" > "$tmp" && mv "$tmp" "$SB_CONFIG"
+        info "已启用流量统计 API ($SB_STAT_API)"
     fi
 }
 
-# ========== 完整安装流程 ==========
-do_install() {
-    if check_installed; then
-        echo -e "${YELLOW}⚠ 检测到已安装 Shadowsocks-Rust${NC}"
-        read -p "是否重新安装？[y/N]: " CONFIRM
-        if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
-    fi
-
-    install_deps
-    install_ssrust   || { read -p "按回车返回..."; return; }
-    select_method
-    basic_config
-    select_ports     || { read -p "按回车返回..."; return; }
-    config_acl
-    generate_config
-    create_service
-    init_traffic
-    install_shortcut
-
-    echo ""
-    show_links
-    echo ""
-    echo -e "${GREEN}🎉 安装完成！输入 ${YELLOW}volss${GREEN} 随时呼出管理菜单${NC}"
-    read -p "按回车返回主菜单..."
+human_bytes() {
+    # 清除换行/空格，强制转整数，防止 awk/jq 输出带换行导致比较报错
+    local b
+    b=$(echo "${1:-0}" | tr -d '[:space:]')
+    b=$(( b + 0 )) 2>/dev/null || b=0
+    if   [[ $b -ge 1073741824 ]]; then printf "%.2f GB" "$(echo "scale=2; $b/1073741824" | bc)"
+    elif [[ $b -ge 1048576 ]];    then printf "%.2f MB" "$(echo "scale=2; $b/1048576" | bc)"
+    elif [[ $b -ge 1024 ]];       then printf "%.2f KB" "$(echo "scale=2; $b/1024" | bc)"
+    else printf "%d B" "$b"; fi
 }
 
-# ========== 卸载 ==========
-do_uninstall() {
-    echo -e "${RED}⚠ 此操作将完全卸载 Shadowsocks-Rust${NC}"
-    read -p "确认卸载？[y/N]: " CONFIRM
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
-
-    systemctl stop    shadowsocks-rust 2>/dev/null
-    systemctl disable shadowsocks-rust 2>/dev/null
-    rm -f $SS_BIN $SERVICE $SHORTCUT $SCRIPT_INSTALL_PATH ${SCRIPT_INSTALL_PATH}.bak
-    rm -rf /etc/shadowsocks-rust
-    systemctl daemon-reload
-
-    echo -e "${GREEN}✅ 卸载完成${NC}"
-    read -p "按回车继续..."
-}
-
-# =============================================
-#   管理功能
-# =============================================
-
-list_users() {
-    echo -e "\n${BLUE}  =================================================${NC}"
-    echo -e "${BLUE}    当前用户列表${NC}"
-    echo -e "${BLUE}  =================================================${NC}"
-    printf "  ${CYAN}%-4s %-8s %-36s %-6s${NC}\n" "编号" "端口" "加密方式" "状态"
-    echo -e "  ${BLUE}-------------------------------------------------${NC}"
-
-    python3 << PYEOF
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-for i, s in enumerate(c['servers'], 1):
-    status = '暂停' if s.get('disabled') else '正常'
-    color  = '\033[0;31m' if s.get('disabled') else '\033[0;32m'
-    reset  = '\033[0m'
-    print(f"  {i:<4} {s['server_port']:<8} {s['method']:<36} {color}{status}{reset}")
-PYEOF
-
-    echo -e "  ${BLUE}=================================================${NC}"
-}
-
-show_links() {
-    echo -e "\n${BLUE}  =================================================${NC}"
-    echo -e "${BLUE}    SS 链接列表${NC}"
-    echo -e "${BLUE}  =================================================${NC}"
-    cat $LINKS_FILE
-    echo -e "  ${BLUE}=================================================${NC}"
-    echo -e "  链接已保存至: ${YELLOW}$LINKS_FILE${NC}"
-}
-
-# ========== 保存当前 iptables 计数到文件 ==========
-save_traffic() {
-    python3 << PYEOF
-import json, subprocess, os
-
-config_file = '$CONFIG'
-traffic_file = '$TRAFFIC_FILE'
-
-with open(config_file) as f:
-    c = json.load(f)
-
-# 读取已有历史数据
-if os.path.exists(traffic_file):
-    with open(traffic_file) as f:
-        history = json.load(f)
-else:
-    history = {}
-
-def get_bytes(chain, port, direction):
-    try:
-        out = subprocess.check_output(['iptables', '-nvxL', chain], text=True)
-        total = 0
-        for line in out.splitlines():
-            if str(port) in line:
-                parts = line.split()
-                if len(parts) >= 10:
-                    if direction == 'sport' and f'spt:{port}' in line:
-                        total += int(parts[1])
-                    elif direction == 'dport' and f'dpt:{port}' in line:
-                        total += int(parts[1])
-        return total
-    except:
-        return 0
-
-# 读取增量并累加
-for s in c['servers']:
-    port = str(s['server_port'])
-    tx = get_bytes('OUTPUT', s['server_port'], 'sport')
-    rx = get_bytes('INPUT',  s['server_port'], 'dport')
-    if port not in history:
-        history[port] = {'tx': 0, 'rx': 0}
-    history[port]['tx'] += tx
-    history[port]['rx'] += rx
-
-with open(traffic_file, 'w') as f:
-    json.dump(history, f, indent=2)
-
-# 关键：读取后立即清零内核计数器，避免下次重复累加
-subprocess.run(['iptables', '-Z'], check=False)
-PYEOF
-}
+# 清洗数值：去换行空格，转整数，出错返回0
+clean_num() { local v; v=$(echo "${1:-0}" | tr -d '[:space:]'); echo $(( v + 0 )) 2>/dev/null || echo 0; }
 
 show_traffic() {
-    # 先同步当前 iptables 增量到历史文件，并清零计数器
-    save_traffic
+    clear
+    echo -e "${C_BOLD}${C_CYAN}"
+    cat <<'HDR'
+  ╔════════════════════════════════════════════════════╗
+  ║              VOLSB — 流量统计                      ║
+  ╚════════════════════════════════════════════════════╝
+HDR
+    echo -e "${NC}"
 
-    echo -e "\n${BLUE}  =================================================${NC}"
-    echo -e "${BLUE}    流量统计  ${YELLOW}(单向流量，实际带宽消耗约为 x2)${NC}"
-    echo -e "${BLUE}  =================================================${NC}"
-    printf "  ${CYAN}%-4s %-8s %-14s %-14s %-6s${NC}\n" "编号" "端口" "上行(GB)" "下行(GB)" "状态"
-    echo -e "  ${BLUE}-------------------------------------------------${NC}"
-
-    python3 << PYEOF
-import json, os
-from datetime import datetime
-
-with open('$CONFIG') as f:
-    c = json.load(f)
-
-# 读取累计数据（已包含最新增量）
-if os.path.exists('$TRAFFIC_FILE'):
-    with open('$TRAFFIC_FILE') as f:
-        history = json.load(f)
-else:
-    history = {}
-
-for i, s in enumerate(c['servers'], 1):
-    port = s['server_port']
-    key  = str(port)
-
-    total_tx = history.get(key, {}).get('tx', 0) / 1024 / 1024 / 1024
-    total_rx = history.get(key, {}).get('rx', 0) / 1024 / 1024 / 1024
-    last_reset = history.get(key, {}).get('reset_time', '从未重置')
-
-    status = '暂停' if s.get('disabled') else '正常'
-    color  = '\033[0;31m' if s.get('disabled') else '\033[0;32m'
-    reset  = '\033[0m'
-    print(f"  {i:<4} {port:<8} {total_tx:<14.2f} {total_rx:<14.2f} {color}{status}{reset}  重置: {last_reset}")
-PYEOF
-
-    echo -e "  ${BLUE}=================================================${NC}"
-    echo -e "  ${YELLOW}提示: 手动重置前流量数据永久累计，不受重启影响${NC}"
-}
-
-reset_traffic() {
-    list_users
-    read -p "输入要重置的用户编号 (0=全部重置): " NUM
-
-    if [ "$NUM" = "0" ]; then
-        # 清零内核计数器
-        iptables -Z
-        # 写入归零数据并记录重置时间
-        RESET_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-        python3 << PYEOF
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-history = {}
-for s in c['servers']:
-    history[str(s['server_port'])] = {'tx': 0, 'rx': 0, 'reset_time': '$RESET_TIME'}
-with open('$TRAFFIC_FILE', 'w') as f:
-    json.dump(history, f, indent=2)
-PYEOF
-        echo -e "${GREEN}✅ 所有用户流量已重置${NC}"
-        return
+    if svc_active 2>/dev/null; then
+        echo -e "  服务状态: ${C_GREEN}● 运行中${NC}"
+    else
+        echo -e "  服务状态: ${C_RED}● 已停止${NC}"
+        warn "服务未运行，流量数据不可用"
     fi
-
-    PORT=$(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-ports = [s['server_port'] for s in c['servers']]
-idx = $NUM - 1
-if 0 <= idx < len(ports):
-    print(ports[idx])
-")
-    if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
-
-    # 先把当前所有端口的增量保存到文件，再清零该端口
-    save_traffic
-
-    # 单独清零该端口的 iptables 规则计数
-    for CHAIN in INPUT OUTPUT; do
-        for PROTO in tcp udp; do
-            for DIR in "--dport" "--sport"; do
-                LINE=$(iptables -nvL $CHAIN --line-numbers | awk -v p="$PORT" -v pr="$PROTO" '$0~("dpt:"p"$") || $0~("spt:"p"$") {print $1}' | head -5)
-                for L in $LINE; do
-                    iptables -Z $CHAIN $L 2>/dev/null
-                done
-            done
-        done
-    done
-
-    # 写入该端口归零
-    RESET_TIME=$(date '+%Y-%m-%d %H:%M:%S')
-    python3 << PYEOF
-import json, os
-if os.path.exists('$TRAFFIC_FILE'):
-    with open('$TRAFFIC_FILE') as f:
-        history = json.load(f)
-else:
-    history = {}
-history['$PORT'] = {'tx': 0, 'rx': 0, 'reset_time': '$RESET_TIME'}
-with open('$TRAFFIC_FILE', 'w') as f:
-    json.dump(history, f, indent=2)
-PYEOF
-
-    echo -e "${GREEN}✅ 端口 $PORT 流量已重置${NC}"
-}
-
-disable_user() {
-    list_users
-    read -p "输入要暂停的用户编号: " NUM
-
-    PORT=$(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-ports = [s['server_port'] for s in c['servers']]
-idx = $NUM - 1
-if 0 <= idx < len(ports):
-    print(ports[idx])
-")
-    if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
-
-    python3 << PYEOF
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-for s in c['servers']:
-    if s['server_port'] == $PORT:
-        s['disabled'] = True
-        break
-with open('$CONFIG', 'w') as f:
-    json.dump(c, f, indent=2)
-PYEOF
-
-    apply_config
-    echo -e "${YELLOW}⏸ 端口 $PORT 已暂停${NC}"
-}
-
-enable_user() {
-    list_users
-    read -p "输入要恢复的用户编号: " NUM
-
-    PORT=$(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-ports = [s['server_port'] for s in c['servers']]
-idx = $NUM - 1
-if 0 <= idx < len(ports):
-    print(ports[idx])
-")
-    if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
-
-    python3 << PYEOF
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-for s in c['servers']:
-    if s['server_port'] == $PORT:
-        s.pop('disabled', None)
-        break
-with open('$CONFIG', 'w') as f:
-    json.dump(c, f, indent=2)
-PYEOF
-
-    apply_config
-    echo -e "${GREEN}✅ 端口 $PORT 已恢复${NC}"
-}
-
-delete_user() {
-    list_users
-    read -p "输入要删除的用户编号: " NUM
-    read -p "确认删除？[y/N]: " CONFIRM
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
-
-    PORT=$(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-ports = [s['server_port'] for s in c['servers']]
-idx = $NUM - 1
-if 0 <= idx < len(ports):
-    print(ports[idx])
-")
-    if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
-
-    python3 << PYEOF
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-c['servers'] = [s for s in c['servers'] if s['server_port'] != $PORT]
-with open('$CONFIG', 'w') as f:
-    json.dump(c, f, indent=2)
-PYEOF
-
-    grep -v ":${PORT}#" $LINKS_FILE > /tmp/ss_links_tmp.txt
-    mv /tmp/ss_links_tmp.txt $LINKS_FILE
-
-    for CHAIN in INPUT OUTPUT; do
-        for PROTO in tcp udp; do
-            while iptables -D $CHAIN -p $PROTO --dport $PORT 2>/dev/null; do :; done
-            while iptables -D $CHAIN -p $PROTO --sport $PORT 2>/dev/null; do :; done
-        done
-    done
-
-    apply_config
-    echo -e "${RED}🗑 端口 $PORT 已删除${NC}"
-}
-
-regen_users() {
-    echo -e "${YELLOW}>>> 重新生成所有用户（所有密码将变更）${NC}"
-    read -p "确认？[y/N]: " CONFIRM
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
-
-    METHOD=$(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-print(c['servers'][0]['method'])
-")
-    USER_COUNT=$(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-print(len(c['servers']))
-")
-
-    case $METHOD in
-        *aes-128*)  KEY_LEN=16 ;;
-        *aes-256*|*chacha20*) KEY_LEN=32 ;;
-        *) KEY_LEN=0 ;;
-    esac
-
-    basic_config
-    select_ports || return
-    USE_ACL_FLAG=$([ -f "$ACL_PATH" ] && echo true || echo false)
-
-    generate_config
-    apply_config
-    init_traffic
-    show_links
-}
-
-# ========== 更新脚本 ==========
-do_update() {
-    REMOTE_URL="https://raw.githubusercontent.com/chnnic/VOLSS/refs/heads/main/volss.sh"
-    TMP_NEW="/tmp/volss_new.sh"
-
-    echo -e "\n${YELLOW}>>> 检查更新...${NC}"
-    echo -e "远程地址: ${BLUE}$REMOTE_URL${NC}"
-
-    # 下载新版本
-    wget -q -O $TMP_NEW "$REMOTE_URL"
-    if [ $? -ne 0 ] || [ ! -s $TMP_NEW ]; then
-        echo -e "${RED}❌ 下载失败，请检查网络或 GitHub 地址${NC}"
-        return 1
-    fi
-
-    # 获取远程版本号
-    REMOTE_VER=$(grep '^VERSION=' $TMP_NEW | cut -d'"' -f2)
-    LOCAL_VER=$VERSION
-
-    echo -e "本地版本: ${YELLOW}$LOCAL_VER${NC}"
-    echo -e "远程版本: ${GREEN}$REMOTE_VER${NC}"
-
-    if [ "$REMOTE_VER" = "$LOCAL_VER" ]; then
-        echo -e "${GREEN}✅ 已是最新版本，无需更新${NC}"
-        rm -f $TMP_NEW
-        return 0
-    fi
-
-    read -p "发现新版本 $REMOTE_VER，确认更新？[y/N]: " CONFIRM
-    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-        rm -f $TMP_NEW
-        return
-    fi
-
-    # 备份当前脚本
-    cp $SCRIPT_INSTALL_PATH ${SCRIPT_INSTALL_PATH}.bak 2>/dev/null
-    echo -e "已备份当前脚本至: ${YELLOW}${SCRIPT_INSTALL_PATH}.bak${NC}"
-
-    # 替换脚本到固定路径
-    mv $TMP_NEW $SCRIPT_INSTALL_PATH
-    chmod +x $SCRIPT_INSTALL_PATH
-
-    # 更新快捷命令（仅当是 volss 自己的快捷命令时才更新）
-    if [ ! -f "$SHORTCUT" ] || grep -q "volss" "$SHORTCUT" 2>/dev/null; then
-        cat > $SHORTCUT << EOF
-#!/bin/bash
-bash $SCRIPT_INSTALL_PATH --menu
-EOF
-        chmod +x $SHORTCUT
-    fi
-
-    echo -e "${GREEN}✅ 更新完成！已从 $LOCAL_VER 更新到 $REMOTE_VER${NC}"
-
-    # 自动迁移修复（兼容旧版配置）
-    if [ -f "$CONFIG" ]; then
-        echo -e "\n${YELLOW}>>> 自动修复旧版配置...${NC}"
-        python3 << PYEOF
-import json, os
-
-config_file = '$CONFIG'
-runtime_file = '$RUNTIME'
-acl_path = '$ACL_PATH'
-
-with open(config_file) as f:
-    c = json.load(f)
-
-changed = False
-
-# 检查 server 块里是否有 acl 字段（旧版写法），迁移到顶层
-for s in c['servers']:
-    if 'acl' in s:
-        s.pop('acl')
-        changed = True
-
-# 如果 ACL 文件存在但顶层没有配置，自动补上
-if os.path.exists(acl_path) and c.get('acl') != acl_path:
-    c['acl'] = acl_path
-    changed = True
-
-if changed:
-    with open(config_file, 'w') as f:
-        json.dump(c, f, indent=2)
-    print("✅ config.json 已迁移")
-
-# 重新生成 runtime
-servers = [dict(s) for s in c['servers'] if not s.get('disabled', False)]
-for s in servers:
-    s.pop('disabled', None)
-    s.pop('acl', None)
-
-runtime = {'servers': servers}
-if os.path.exists(acl_path):
-    runtime['acl'] = acl_path
-
-with open(runtime_file, 'w') as f:
-    json.dump(runtime, f, indent=2)
-print("✅ runtime.json 已更新")
-PYEOF
-
-        # 修复旧版 ACL 格式（domain-suffix: → ||，移除无效头部）
-        if [ -f "$ACL_PATH" ]; then
-            sed -i 's/^domain-suffix:/||/' $ACL_PATH
-            sed -i '/^\[bypass_list\]$/d' $ACL_PATH
-            sed -i '/^\[accept_all\]$/d' $ACL_PATH
-            sed -i '/^\[proxy_list\]$/d' $ACL_PATH
-            sed -i '/^$/d' $ACL_PATH
-            # 确保文件以 [outbound_block_list] 开头
-            if ! grep -q "^\[outbound_block_list\]" $ACL_PATH; then
-                sed -i '1i [outbound_block_list]' $ACL_PATH
-            fi
-            echo -e "${GREEN}✅ ACL 格式已自动修复${NC}"
-        fi
-        if grep -q "Restart=on-failure" $SERVICE 2>/dev/null; then
-            sed -i 's/Restart=on-failure/Restart=always/' $SERVICE
-            echo -e "${GREEN}✅ 服务文件已修复${NC}"
-        fi
-
-        # 确保 ExecStop 存在
-        if ! grep -q "ExecStop" $SERVICE 2>/dev/null; then
-            sed -i "/ExecStart=.*/a ExecStop=/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'" $SERVICE
-            echo -e "${GREEN}✅ 服务停止钩子已添加${NC}"
-        fi
-
-        systemctl daemon-reload
-        systemctl restart shadowsocks-rust
-        echo -e "${GREEN}✅ 服务已重启${NC}"
-    fi
-
-    echo -e "\n${YELLOW}脚本将重新启动...${NC}"
-    sleep 2
-    exec bash $SCRIPT_INSTALL_PATH --menu
-}
-
-add_acl_domain() {
-    read -p "输入要屏蔽的域名: " NEW_DOMAIN
-    if [ -n "$NEW_DOMAIN" ]; then
-        NEW_DOMAIN=$(echo "$NEW_DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//')
-        # 检查是否已存在
-        if grep -qx "$NEW_DOMAIN" "$MANUAL_FILE" 2>/dev/null; then
-            echo -e "${YELLOW}⚠ $NEW_DOMAIN 已存在${NC}"
-            return
-        fi
-        echo "$NEW_DOMAIN" >> $MANUAL_FILE
-        rebuild_acl
-        echo -e "${GREEN}✅ 已添加: $NEW_DOMAIN（含所有子域名）${NC}"
-    fi
-}
-
-del_acl_domain() {
-    if [ ! -f "$MANUAL_FILE" ] || [ ! -s "$MANUAL_FILE" ]; then
-        echo -e "${YELLOW}没有手动添加的域名${NC}"; return
-    fi
-
-    mapfile -t MANUAL_ARR < "$MANUAL_FILE"
-
-    echo -e "\n${BLUE}  =================================================${NC}"
-    echo -e "${BLUE}    手动添加的域名${NC}"
-    echo -e "${BLUE}  =================================================${NC}"
-    for i in "${!MANUAL_ARR[@]}"; do
-        echo "    $((i+1))) ${MANUAL_ARR[$i]}"
-    done
-    echo -e "  ${BLUE}=================================================${NC}"
-
-    read -p "输入要删除的编号（多个用逗号分隔，如 1,3,5）: " INPUT
-
-    IFS=',' read -ra NUMS <<< "$INPUT"
-    DELETED=0
-    # 收集要删除的域名
-    declare -a TO_DELETE
-    for NUM in "${NUMS[@]}"; do
-        NUM=$(echo "$NUM" | tr -d ' ')
-        [ -z "$NUM" ] && continue
-        IDX=$((NUM-1))
-        if [ $IDX -lt 0 ] || [ $IDX -ge ${#MANUAL_ARR[@]} ]; then
-            echo -e "${RED}编号 $NUM 无效，跳过${NC}"
-            continue
-        fi
-        TO_DELETE+=("${MANUAL_ARR[$IDX]}")
-        echo -e "${GREEN}✅ 已删除: ${MANUAL_ARR[$IDX]}${NC}"
-        DELETED=$((DELETED+1))
-    done
-
-    if [ "$DELETED" -gt 0 ]; then
-        # 从 manual.list 删除对应行
-        for DOMAIN in "${TO_DELETE[@]}"; do
-            grep -vx "$DOMAIN" "$MANUAL_FILE" > /tmp/manual_tmp.txt
-            mv /tmp/manual_tmp.txt "$MANUAL_FILE"
-        done
-        rebuild_acl
-        echo -e "${GREEN}✅ 共删除 $DELETED 条，服务已重启${NC}"
-    fi
-}
-
-# ========== ACL 规则集管理 ==========
-ACL_RULESET_DIR="/etc/shadowsocks-rust/rulesets"
-
-# 规则集定义：名称|描述|来源URL
-declare -A RULESET_URLS
-RULESET_URLS=(
-    ["ads"]="广告拦截|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Ads"
-    ["adult"]="色情网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Adult"
-    ["gambling"]="赌博网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Gambling"
-    ["malware"]="恶意软件|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Malware"
-    ["scam"]="诈骗欺诈|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Scam"
-    ["tracking"]="追踪统计|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Tracking"
-    ["crypto"]="挖矿劫持|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Crypto"
-    ["dating"]="交友网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Dating"
-    ["bt"]="BT下载|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Torrents"
-    ["finance"]="金融理财|https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/gambling.txt"
-)
-
-# GitHub 镜像列表，下载失败时自动切换
-GITHUB_MIRRORS=(
-    "https://raw.githubusercontent.com"
-    "https://raw.gitmirror.com"
-    "https://raw.fastgit.org"
-    "https://gh.api.99988866.xyz/https://raw.githubusercontent.com"
-)
-
-# 初始化规则集目录
-init_ruleset_dir() {
-    mkdir -p $ACL_RULESET_DIR
-    [ ! -f "$ACL_RULESET_DIR/installed.txt" ] && touch "$ACL_RULESET_DIR/installed.txt"
-}
-
-# 将 URL 替换为镜像地址
-mirror_url() {
-    local URL=$1
-    local MIRROR=$2
-    echo "$URL" | sed "s|https://raw.githubusercontent.com|$MIRROR|"
-}
-
-# 下载并转换规则集为 ss-rust ACL 格式
-download_ruleset() {
-    local NAME=$1
-    local URL=$2
-    local TMP="/tmp/ruleset_${NAME}.tmp"
-    local OUT="$ACL_RULESET_DIR/${NAME}.acl"
-
-    echo -e "  ${YELLOW}下载中: $NAME ...${NC}"
-
-    # 依次尝试各镜像
-    local SUCCESS=0
-    for MIRROR in "${GITHUB_MIRRORS[@]}"; do
-        local TRY_URL=$(mirror_url "$URL" "$MIRROR")
-        wget -q --timeout=15 -O "$TMP" "$TRY_URL" 2>/dev/null
-        if [ $? -eq 0 ] && [ -s "$TMP" ]; then
-            SUCCESS=1
-            break
-        fi
-        rm -f "$TMP"
-    done
-
-    if [ $SUCCESS -eq 0 ]; then
-        echo -e "  ${RED}❌ 下载失败: $NAME（所有镜像均不可用）${NC}"
-        return 1
-    fi
-
-    # 转换格式：过滤注释和空行，每行加 || 前缀
-    grep -v "^#" "$TMP" | grep -v "^$" | grep -v "^\*\." | sed 's/^/||/' > "$OUT"
-    COUNT=$(wc -l < "$OUT")
-    rm -f "$TMP"
-    echo -e "  ${GREEN}✅ $NAME 已下载，共 $COUNT 条规则${NC}"
-    return 0
-}
-
-# 重新合并所有规则集到 ACL 文件
-rebuild_acl() {
-    init_ruleset_dir
-
-    # 重建 ACL 文件，从 [outbound_block_list] 开始
-    echo "[outbound_block_list]" > $ACL_PATH
-
-    # 写入手动域名（从 manual.list 读取，纯净格式无标记）
-    if [ -f "$MANUAL_FILE" ] && [ -s "$MANUAL_FILE" ]; then
-        while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            echo "||$line" >> $ACL_PATH
-        done < "$MANUAL_FILE"
-    fi
-
-    # 写入各规则集
-    for RULESET_FILE in $ACL_RULESET_DIR/*.acl; do
-        [ -f "$RULESET_FILE" ] || continue
-        cat "$RULESET_FILE" >> $ACL_PATH
-    done
-
-    systemctl restart shadowsocks-rust
-}
-
-# 显示规则集菜单
-manage_rulesets() {
-    init_ruleset_dir
-
-    while true; do
-        echo -e "\n${BLUE}  =================================================${NC}"
-        echo -e "${BLUE}    ACL 规则集管理${NC}"
-        echo -e "${BLUE}  =================================================${NC}"
-
-        # 显示所有可用规则集和安装状态
-        local i=1
-        local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt" "finance")
-        for KEY in "${KEYS[@]}"; do
-            IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
-            if [ -f "$ACL_RULESET_DIR/${KEY}.acl" ]; then
-                COUNT=$(wc -l < "$ACL_RULESET_DIR/${KEY}.acl")
-                STATUS="${GREEN}● 已安装 ($COUNT 条)${NC}"
-            else
-                STATUS="${RED}○ 未安装${NC}"
-            fi
-            # 中文字符占2列宽，手动补空格对齐
-            DESC_LEN=${#DESC}
-            # 每个中文字符多占1列，计算需要补的空格数
-            CN_CHARS=$(echo "$DESC" | grep -oP '[\x{4e00}-\x{9fff}]' | wc -l)
-            PAD=$((10 - DESC_LEN - CN_CHARS))
-            SPACES=$(printf '%*s' "$PAD" '')
-            printf "  \033[0;32m%2d)\033[0m %-12s %s%s %b\n" "$i" "$KEY" "$DESC" "$SPACES" "$STATUS"
-            i=$((i+1))
-        done
-
-        echo -e "  ${BLUE}-------------------------------------------------${NC}"
-        echo -e "  ${GREEN}11)${NC} 安装全部规则集"
-        echo -e "  ${GREEN}12)${NC} 卸载某个规则集"
-        echo -e "  ${GREEN}13)${NC} 更新已安装规则集"
-        echo -e "  ${GREEN}14)${NC} 添加自定义规则集 URL"
-        echo -e "  ${GREEN}15)${NC} 查看当前生效规则数量"
-        echo -e "  ${RED} 0)${NC} 返回主菜单"
-        echo -e "${BLUE}  =================================================${NC}"
-        read -p "  请选择: " CHOICE
-
-        case $CHOICE in
-            [1-9]|10)
-                local IDX=$((CHOICE-1))
-                local KEY="${KEYS[$IDX]}"
-                IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
-                if [ -f "$ACL_RULESET_DIR/${KEY}.acl" ]; then
-                    echo -e "${YELLOW}$DESC 已安装，重新下载更新？[y/N]${NC}"
-                    read -p "" CONFIRM
-                    [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && continue
-                fi
-                download_ruleset "$KEY" "$URL" && rebuild_acl
-                ;;
-            11)
-                echo -e "${YELLOW}>>> 安装全部规则集...${NC}"
-                local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt" "finance")
-                for KEY in "${KEYS[@]}"; do
-                    IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
-                    download_ruleset "$KEY" "$URL"
-                done
-                rebuild_acl
-                echo -e "${GREEN}✅ 全部规则集安装完成${NC}"
-                ;;
-            12)
-                echo -e "\n已安装的规则集："
-                ls $ACL_RULESET_DIR/*.acl 2>/dev/null | xargs -I{} basename {} .acl | nl -ba
-                read -p "输入要卸载的编号: " DEL_IDX
-                DEL_NAME=$(ls $ACL_RULESET_DIR/*.acl 2>/dev/null | xargs -I{} basename {} .acl | sed -n "${DEL_IDX}p")
-                if [ -n "$DEL_NAME" ]; then
-                    rm -f "$ACL_RULESET_DIR/${DEL_NAME}.acl"
-                    rebuild_acl
-                    echo -e "${GREEN}✅ 已卸载: $DEL_NAME${NC}"
-                else
-                    echo -e "${RED}无效编号${NC}"
-                fi
-                ;;
-            13)
-                echo -e "${YELLOW}>>> 更新已安装规则集...${NC}"
-                for RULESET_FILE in $ACL_RULESET_DIR/*.acl; do
-                    [ -f "$RULESET_FILE" ] || continue
-                    KEY=$(basename "$RULESET_FILE" .acl)
-                    if [ -n "${RULESET_URLS[$KEY]}" ]; then
-                        IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
-                        download_ruleset "$KEY" "$URL"
-                    fi
-                done
-                rebuild_acl
-                echo -e "${GREEN}✅ 更新完成${NC}"
-                ;;
-            14)
-                read -p "规则集名称 (英文，如 mylist): " CUSTOM_NAME
-                read -p "规则集 URL: " CUSTOM_URL
-                if [ -n "$CUSTOM_NAME" ] && [ -n "$CUSTOM_URL" ]; then
-                    RULESET_URLS["$CUSTOM_NAME"]="自定义|$CUSTOM_URL"
-                    download_ruleset "$CUSTOM_NAME" "$CUSTOM_URL" && rebuild_acl
-                fi
-                ;;
-            15)
-                echo -e "\n${BLUE}  =================================================${NC}"
-                echo -e "${BLUE}    当前生效规则统计${NC}"
-                echo -e "${BLUE}  =================================================${NC}"
-                if [ -f "$ACL_PATH" ]; then
-                    TOTAL=$(grep "^||" "$ACL_PATH" | wc -l)
-                    echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}"
-                    echo ""
-                    for RULESET_FILE in $ACL_RULESET_DIR/*.acl; do
-                        [ -f "$RULESET_FILE" ] || continue
-                        NAME=$(basename "$RULESET_FILE" .acl)
-                        COUNT=$(wc -l < "$RULESET_FILE")
-                        printf "  %-15s %s 条\n" "$NAME" "$COUNT"
-                    done
-                    MANUAL=$(grep "^||.*#manual" "$ACL_PATH" 2>/dev/null | wc -l)
-                    [ "$MANUAL" -gt 0 ] && printf "  %-15s %s 条\n" "手动添加" "$MANUAL"
-                else
-                    echo -e "  未配置 ACL"
-                fi
-                echo -e "${BLUE}  =================================================${NC}"
-                ;;
-            0) return ;;
-            *) echo -e "${RED}无效选项${NC}" ;;
-        esac
-        read -p "按回车继续..."
-    done
-}
-
-
-# =============================================
-#   主菜单
-# =============================================
-
-show_main_menu() {
-    while true; do
-        print_banner
-
-        # 状态检测
-        if check_installed; then
-            SS_STATUS="${GREEN}● 已安装${NC}"
-            if pgrep -x ssserver > /dev/null 2>&1; then
-                SVC_LABEL="${GREEN}● 运行中${NC}"
-            else
-                SVC_LABEL="${RED}● 已停止${NC}"
-            fi
-        else
-            SS_STATUS="${RED}● 未安装${NC}"
-            SVC_LABEL="${RED}● 未运行${NC}"
-        fi
-
-        echo -e "  ${BLUE}=================================================${NC}"
-        echo -e "    Shadowsocks-Rust 管理脚本    ${VERSION}    快捷命令: volss"
-        echo -e "  ${BLUE}=================================================${NC}"
-        printf "    安装: %-20b 服务: %-20b\n" "$SS_STATUS" "$SVC_LABEL"
-        echo -e "  ${BLUE}-------------------------------------------------${NC}"
-        echo -e "  ${CYAN}  -- 安装管理 --${NC}"
-        echo -e "      1)  安装 Shadowsocks-Rust"
-        echo -e "      2)  卸载 Shadowsocks-Rust"
-        echo -e "      3)  更新脚本"
-        echo -e "  ${CYAN}  -- 用户管理 --${NC}"
-        echo -e "      4)  查看用户列表"
-        echo -e "      5)  查看所有 SS 链接"
-        echo -e "      6)  暂停某个用户"
-        echo -e "      7)  恢复某个用户"
-        echo -e "      8)  删除某个用户"
-        echo -e "      9)  重新生成所有用户"
-        echo -e "  ${CYAN}  -- 流量统计 --${NC}"
-        echo -e "     10)  查看流量统计"
-        echo -e "     11)  重置流量统计"
-        echo -e "  ${CYAN}  -- ACL 黑名单 --${NC}"
-        echo -e "     12)  手动添加屏蔽域名"
-        echo -e "     13)  手动删除屏蔽域名"
-        echo -e "     14)  查看黑名单列表"
-        echo -e "     15)  规则集管理（广告/色情/赌博/BT等）"
-        echo -e "  ${CYAN}  -- 服务管理 --${NC}"
-        echo -e "     16)  查看服务状态"
-        echo -e "     17)  启动服务"
-        echo -e "     18)  停止服务"
-        echo -e "     19)  重启服务"
-        echo -e "     20)  查看实时日志"
-        echo -e "  ${BLUE}-------------------------------------------------${NC}"
-        echo -e "   ${RED}  0)  退出${NC}"
-        echo -e "  ${BLUE}=================================================${NC}"
-        read -p "  请选择 [0-20]: " CHOICE
-
-        # 未安装时拦截管理功能
-        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|20)$ ]]; then
-            echo -e "${RED}⚠ 请先安装 Shadowsocks-Rust（选项 1）${NC}"
-            sleep 2
-            continue
-        fi
-
-        case $CHOICE in
-            1)  do_install ;;
-            2)  do_uninstall ;;
-            3)  do_update ;;
-            4)  list_users;    read -p "按回车继续..." ;;
-            5)  show_links;    read -p "按回车继续..." ;;
-            6)  disable_user;  read -p "按回车继续..." ;;
-            7)  enable_user;   read -p "按回车继续..." ;;
-            8)  delete_user;   read -p "按回车继续..." ;;
-            9)  regen_users;   read -p "按回车继续..." ;;
-            10) show_traffic;  read -p "按回车继续..." ;;
-            11) reset_traffic; read -p "按回车继续..." ;;
-            12) add_acl_domain; read -p "按回车继续..." ;;
-            13) del_acl_domain; read -p "按回车继续..." ;;
-            14)
-                echo -e "\n${BLUE}  =================================================${NC}"
-                echo -e "${BLUE}    ACL 黑名单${NC}"
-                echo -e "${BLUE}  =================================================${NC}"
-                if [ -f "$ACL_PATH" ]; then
-                    TOTAL=$(grep "^||" "$ACL_PATH" | wc -l)
-                    MANUAL_COUNT=0
-                    [ -f "$MANUAL_FILE" ] && MANUAL_COUNT=$(grep -c "." "$MANUAL_FILE" 2>/dev/null || echo 0)
-                    RULESET_COUNT=$((TOTAL - MANUAL_COUNT))
-                    echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}（手动: $MANUAL_COUNT 条，规则集: $RULESET_COUNT 条）"
-
-                    echo -e "\n  ${CYAN}── 手动添加 ($MANUAL_COUNT 条) ──${NC}"
-                    if [ -f "$MANUAL_FILE" ] && [ -s "$MANUAL_FILE" ]; then
-                        i=1
-                        while IFS= read -r line; do
-                            [ -z "$line" ] && continue
-                            echo "    $i) $line"
-                            i=$((i+1))
-                        done < "$MANUAL_FILE"
+    echo ""
+
+    [[ ! -f "$SB_CONFIG" ]] && { warn "配置文件不存在"; return; }
+
+    # ── 方法1: sing-box v2ray_api 按入站统计（最准确）──
+    local api_ok=false
+    if jq -e '.experimental.v2ray_api' "$SB_CONFIG" &>/dev/null; then
+        local api_addr
+        api_addr=$(jq -r '.experimental.v2ray_api.listen // "127.0.0.1:8080"' "$SB_CONFIG")
+
+        # 调用 grpc 统计（sing-box 1.8+ 支持 HTTP query stats）
+        local stat_url="http://${api_addr}/stats/query?reset=false&pattern="
+        local stat_raw
+        stat_raw=$(curl -fsSL --max-time 3 "$stat_url" 2>/dev/null) || stat_raw=""
+
+        if [[ -n "$stat_raw" ]] && echo "$stat_raw" | jq -e '.stat' &>/dev/null; then
+            api_ok=true
+            echo -e "  ${C_BOLD}按入站/出站流量统计 (sing-box API):${NC}"
+            hr
+            printf "  ${C_BOLD}%-35s %-16s %-16s${NC}\n" "统计项" "上行" "下行"
+            hr
+
+            echo "$stat_raw" | jq -r '.stat[] | "\(.name)|\(.value)"' 2>/dev/null \
+            | while IFS='|' read -r name value; do
+                value=$(( ${value:-0} + 0 )) 2>/dev/null || value=0
+                # 只显示入站（inbound）和用户（user）统计
+                if [[ "$name" == *"inbound>>>"* || "$name" == *"user>>>"* ]]; then
+                    local dir label
+                    if [[ "$name" == *">>>uplink" ]]; then
+                        dir="up"; label="${name/>>>uplink/}"
                     else
-                        echo "  （无）"
+                        dir="down"; label="${name/>>>downlink/}"
                     fi
-
-                    echo -e "\n  ${CYAN}── 已安装规则集 ──${NC}"
-                    FOUND=0
-                    if [ -d "$ACL_RULESET_DIR" ]; then
-                        for f in $ACL_RULESET_DIR/*.acl; do
-                            [ -f "$f" ] || continue
-                            NAME=$(basename "$f" .acl)
-                            COUNT=$(wc -l < "$f")
-                            echo -e "  ${GREEN}●${NC} $NAME ($COUNT 条)  ${YELLOW}[查看详情请进入选项 15]${NC}"
-                            FOUND=1
-                        done
-                    fi
-                    [ "$FOUND" -eq 0 ] && echo "  （未安装任何规则集，请选择选项 15 安装）"
-                else
-                    echo "  未配置 ACL"
+                    printf "  %-35s" "$label"
+                    [[ "$dir" == "up"   ]] && printf " ${C_YELLOW}%-16s${NC}" "$(human_bytes $value)" || true
+                    [[ "$dir" == "down" ]] && printf " ${C_GREEN}%-16s${NC}\n" "$(human_bytes $value)" || true
                 fi
-                read -p "按回车继续..."
-                ;;
-            15) manage_rulesets ;;
-            16) systemctl status shadowsocks-rust --no-pager; read -p "按回车继续..." ;;
-            17) systemctl start   shadowsocks-rust && echo -e "${GREEN}✅ 服务已启动${NC}"; read -p "按回车继续..." ;;
-            18) systemctl stop    shadowsocks-rust && echo -e "${YELLOW}⏹ 服务已停止${NC}"; read -p "按回车继续..." ;;
-            19) systemctl restart shadowsocks-rust && echo -e "${GREEN}🔄 服务已重启${NC}"; read -p "按回车继续..." ;;
-            20)
-                echo -e "${YELLOW}按 Ctrl+C 退出日志${NC}"
-                journalctl -u shadowsocks-rust -f
-                ;;
-            0)
-                echo -e "${GREEN}再见！${NC}"
-                exit 0
-                ;;
-            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
+            done
+            hr
+        fi
+    fi
+
+    # ── 方法2: 按端口当前连接数（/proc/net/tcp + udp）──
+    echo ""
+    echo -e "  ${C_BOLD}当前活跃连接数 (per 端口):${NC}"
+    hr
+    printf "  ${C_BOLD}%-10s %-22s %-12s %-12s %s${NC}\n" \
+        "端口" "类型" "TCP" "UDP" "合计"
+    hr
+
+    local inbounds_raw
+    inbounds_raw=$(jq -r         '.inbounds[] | [(.listen_port|if . then tostring else "" end), (.type//"unknown"), (.listen//"")] | join("|")'         "$SB_CONFIG" 2>/dev/null) || inbounds_raw=""
+
+    local any_conn=false
+    while IFS='|' read -r port type listen; do
+        [[ -z "$port" || "$port" == "0" || "$listen" == "127.0.0.1" ]] && continue
+
+        local hex_port tcp_c udp_c
+        hex_port=$(printf "%04X" "$port" 2>/dev/null) || continue
+
+        tcp_c=$(awk -v p=":$hex_port" \
+            'NR>1 && $2~p && $4=="01" {c++} END{print c+0}' \
+            /proc/net/tcp /proc/net/tcp6 2>/dev/null | tr -d '[:space:]')
+        tcp_c=$(( ${tcp_c:-0} + 0 )) 2>/dev/null || tcp_c=0
+
+        udp_c=$(awk -v p=":$hex_port" \
+            'NR>1 && $2~p {c++} END{print c+0}' \
+            /proc/net/udp /proc/net/udp6 2>/dev/null | tr -d '[:space:]')
+        udp_c=$(( ${udp_c:-0} + 0 )) 2>/dev/null || udp_c=0
+
+        local total=$(( tcp_c + udp_c ))
+        printf "  ${C_CYAN}%-10s${NC} %-22s " "$port" "$type"
+        if [[ $total -gt 0 ]]; then
+            printf "${C_GREEN}%-12s %-12s %s${NC}\n" "$tcp_c" "$udp_c" "${total} 个"
+            any_conn=true
+        else
+            printf "${C_DIM}%-12s %-12s %s${NC}\n" "0" "0" "无"
+        fi
+    done <<< "$inbounds_raw"
+    hr
+
+    # ── 方法3: 网卡总量 + 实时速率 ──
+    echo ""
+    echo -e "  ${C_BOLD}网卡流量:${NC}"
+    local iface
+    iface=$(ip route 2>/dev/null | awk '/default/{print $5; exit}')
+    if [[ -n "${iface:-}" ]] && [[ -f /proc/net/dev ]]; then
+        local rx tx
+        rx=$(awk -v i="${iface}:" '$1==i{print $2}'  /proc/net/dev 2>/dev/null | tr -d '[:space:]'); rx=$(( ${rx:-0}+0 ))
+        tx=$(awk -v i="${iface}:" '$1==i{print $10}' /proc/net/dev 2>/dev/null | tr -d '[:space:]'); tx=$(( ${tx:-0}+0 ))
+        printf "  接口 ${C_CYAN}%s${NC} | 累计 ↓ ${C_GREEN}%s${NC}  ↑ ${C_YELLOW}%s${NC}\n" \
+            "$iface" "$(human_bytes $rx)" "$(human_bytes $tx)"
+
+        # 实时速率（1秒采样）
+        local r1 t1 r2 t2
+        r1=$(awk -v i="${iface}:" '$1==i{print $2}'  /proc/net/dev 2>/dev/null | tr -d '[:space:]'); r1=$(( ${r1:-0}+0 ))
+        t1=$(awk -v i="${iface}:" '$1==i{print $10}' /proc/net/dev 2>/dev/null | tr -d '[:space:]'); t1=$(( ${t1:-0}+0 ))
+        sleep 1
+        r2=$(awk -v i="${iface}:" '$1==i{print $2}'  /proc/net/dev 2>/dev/null | tr -d '[:space:]'); r2=$(( ${r2:-0}+0 ))
+        t2=$(awk -v i="${iface}:" '$1==i{print $10}' /proc/net/dev 2>/dev/null | tr -d '[:space:]'); t2=$(( ${t2:-0}+0 ))
+        printf "  实时速率 | ↓ ${C_GREEN}%s/s${NC}  ↑ ${C_YELLOW}%s/s${NC}\n" \
+            "$(human_bytes $(( r2 - r1 )))" "$(human_bytes $(( t2 - t1 )))"
+    fi
+
+    if ! $api_ok; then
+        echo ""
+        warn "按入站流量统计不可用。重新安装或执行以下命令后重启服务可启用:"
+        echo -e "  ${C_DIM}volsb restart${NC}"
+    fi
+
+    echo ""; hr
+}
+
+
+reset_traffic_log() {
+    ask "确认清空流量日志? [y/N]: "; read -r ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { info "已取消"; return; }
+    : > "$SB_LOG" 2>/dev/null && info "日志已清空"
+    echo "{}" > "$SB_TRAFFIC"
+}
+
+# ════════════════════════════════════════════════════════════
+#  快捷命令安装
+# ════════════════════════════════════════════════════════════
+
+install_shortcut() {
+    local self; self=$(readlink -f "$0")
+    cat > "$VOLSB_CMD" <<SHORTCUT
+#!/usr/bin/env bash
+exec bash "${self}" "\$@"
+SHORTCUT
+    chmod +x "$VOLSB_CMD"
+    info "快捷命令已安装,现在可以输入 ${C_BOLD}volsb${NC} 进入管理界面"
+}
+
+# ════════════════════════════════════════════════════════════
+#  节点信息展示
+# ════════════════════════════════════════════════════════════
+
+show_nodes() {
+    clear
+    echo -e "${C_BOLD}${C_CYAN}"
+    cat <<'HDR'
+  ╔════════════════════════════════════════════════════╗
+  ║              VOLSB — 节点信息总览                  ║
+  ╚════════════════════════════════════════════════════╝
+HDR
+    echo -e "${NC}"
+
+    # ── 从 config.json 实时读取入站端口和类型（一次性读取）──
+    if [[ -f "$SB_CONFIG" ]]; then
+        echo -e "  ${C_BOLD}当前运行入站:${NC}"
+        hr
+        local n=0
+        while IFS='|' read -r ib_type ib_port ib_tag ib_listen; do
+            [[ "$ib_listen" == "127.0.0.1" ]] && continue
+            (( n++ )) || true
+            printf "  ${C_BOLD}%-4s${NC} ${C_GREEN}%-20s${NC} 端口: ${C_CYAN}%-8s${NC} 标签: %s\n" \
+                "${n})" "$ib_type" "$ib_port" "$ib_tag"
+        done < <(jq -r '.inbounds[] | [(.type//"unknown"), (.listen_port//""|tostring), (.tag//""), (.listen//"")]  | join("|")' \
+            "$SB_CONFIG" 2>/dev/null)
+        [[ $n -eq 0 ]] && warn "未读取到入站配置"
+        hr
+    else
+        warn "配置文件不存在，请先安装"
+    fi
+    # ── 展示节点详情（与当前 config.json 比对，提示陈旧数据）──
+    if [[ -f "$SB_INFO" ]]; then
+        echo ""
+        echo -e "  ${C_BOLD}节点详情:${NC}"
+        # 检查 SB_INFO 里的端口是否和 config.json 一致
+        local config_ports info_ports stale=false
+        config_ports=$(jq -r '.inbounds[].listen_port | tostring' "$SB_CONFIG" 2>/dev/null | tr '\n' ' ')
+        info_ports=$(grep -oP '端口\s*:\s*\K[0-9]+' "$SB_INFO" 2>/dev/null | sort -u | tr '\n' ' ')
+        # 若 SB_INFO 里有 config.json 里不存在的端口，说明有旧数据
+        for p in $info_ports; do
+            if ! echo "$config_ports" | grep -qw "$p"; then
+                stale=true; break
+            fi
+        done
+        if $stale; then
+            warn "节点信息含旧数据（端口 $info_ports 与当前配置 $config_ports 不完全匹配）"
+            warn "建议重新安装以同步节点信息: 菜单选 1"
+            echo ""
+        fi
+        cat "$SB_INFO"
+    fi
+
+    # ── 展示所有分享链接（带编号和二维码）──
+    if [[ -f "$SB_LINKS" ]] && [[ -s "$SB_LINKS" ]]; then
+        hr
+        echo -e "
+  ${C_BOLD}分享链接:${NC}
+"
+        local i=0
+        while IFS= read -r link; do
+            [[ -z "$link" ]] && continue
+            (( i++ )) || true
+            # 从链接提取协议和名称
+            local proto name
+            proto=$(echo "$link" | cut -d: -f1 | tr '[:lower:]' '[:upper:]')
+            name=$(echo "$link" | grep -oP '(?<=#)[^#]*$' || echo "节点$i")
+            echo -e "  ${C_BOLD}${C_YELLOW}[$i] ${proto} — ${name}${NC}"
+            echo -e "  ${C_DIM}${link}${NC}"
+            echo ""
+            print_qr "$link"
+        done < "$SB_LINKS"
+        echo -e "  共 ${C_BOLD}${i}${NC} 条链接，已保存: ${C_DIM}$SB_LINKS${NC}"
+    else
+        echo ""
+        warn "暂无分享链接，请先完成安装配置"
+    fi
+    echo ""
+}
+
+# ════════════════════════════════════════════════════════════
+#  端口 & 密码重置
+# ════════════════════════════════════════════════════════════
+
+reset_ports() {
+    require_root
+    [[ -f "$SB_CONFIG" ]] || { warn "未找到配置文件"; return; }
+
+    echo ""
+    echo -e "  ${C_BOLD}重置选项:${NC}"
+    echo "   1) 仅重置端口"
+    echo "   2) 仅重置密码/UUID"
+    echo "   3) 同时重置端口和密码/UUID"
+    ask "选择 [1-3] 默认3: "; read -r reset_opt
+    [[ -z "$reset_opt" ]] && reset_opt="3"
+
+    local backup; backup=$(mktemp)
+    cp "$SB_CONFIG" "$backup"   # 备份原配置,失败时回滚
+
+    local updated; updated=$(cat "$SB_CONFIG")
+
+    # ── 重置端口 ──
+    if [[ "$reset_opt" == "1" || "$reset_opt" == "3" ]]; then
+        step "重置入站端口"
+        local ports_old; ports_old=$(jq -r '.inbounds[].listen_port // empty' "$SB_CONFIG")
+        for old_p in $ports_old; do
+            local new_p; new_p=$(random_port)
+            updated=$(echo "$updated" | sed "s/\"listen_port\": ${old_p}/\"listen_port\": ${new_p}/g")
+            info "端口 $old_p → $new_p"
+            open_port "$new_p" tcp; open_port "$new_p" udp
+        done
+    fi
+
+    # ── 重置密码/UUID ──
+    if [[ "$reset_opt" == "2" || "$reset_opt" == "3" ]]; then
+        step "重置密码 / UUID"
+        # 替换所有 password 字段
+        local pwd_list; pwd_list=$(echo "$updated" | jq -r '.. | objects | .password? // empty' 2>/dev/null | sort -u)
+        for old_pwd in $pwd_list; do
+            local new_pwd; new_pwd=$(gen_rand_str 24)
+            updated=$(echo "$updated" | sed "s|\"password\": \"${old_pwd}\"|\"password\": \"${new_pwd}\"|g")
+            info "密码已更新 (${old_pwd:0:6}… → ${new_pwd:0:6}…)"
+        done
+        # 替换所有 uuid 字段
+        local uuid_list; uuid_list=$(echo "$updated" | jq -r '.. | objects | .uuid? // empty' 2>/dev/null | sort -u)
+        for old_uuid in $uuid_list; do
+            local new_uuid; new_uuid=$(gen_uuid)
+            updated=$(echo "$updated" | sed "s/${old_uuid}/${new_uuid}/g")
+            info "UUID 已更新 (${old_uuid:0:8}… → ${new_uuid:0:8}…)"
+        done
+    fi
+
+    echo "$updated" > "$SB_CONFIG"
+
+    if "$SB_BIN" check -c "$SB_CONFIG" &>/dev/null; then
+        svc_restart && info "重置完成,服务已重启"
+        # 刷新节点信息文件提示
+        warn "节点信息已变更,请执行菜单 9 重新查看最新链接"
+    else
+        err "配置校验失败,回滚至备份"
+        cp "$backup" "$SB_CONFIG"
+    fi
+    rm -f "$backup"
+}
+
+# ════════════════════════════════════════════════════════════
+#  主安装流程
+# ════════════════════════════════════════════════════════════
+
+# 结果写入全局变量 DEPLOY_MODE，避免子 shell 吞掉 read
+DEPLOY_MODE="1"
+select_deploy_mode() {
+    clear
+    echo -e "${C_BOLD}${C_CYAN}"
+    cat <<'LOGO'
+  ██╗   ██╗ ██████╗ ██╗     ███████╗██████╗
+  ██║   ██║██╔═══██╗██║     ██╔════╝██╔══██╗
+  ██║   ██║██║   ██║██║     ███████╗██████╔╝
+  ╚██╗ ██╔╝██║   ██║██║     ╚════██║██╔══██╗
+   ╚████╔╝ ╚██████╔╝███████╗███████║██████╔╝
+    ╚═══╝   ╚═════╝ ╚══════╝╚══════╝╚═════╝
+LOGO
+    echo -e "  ${C_DIM}sing-box 服务端一键部署管理脚本  v${VOLSB_VER}${NC}"
+    echo -e "${NC}"
+    hr
+    echo ""
+    echo -e "  ${C_BOLD}选择部署模式:${NC}"
+    echo ""
+    printf "  ${C_BOLD}%-5s${NC} ${C_GREEN}%-20s${NC} %s\n" "1)" "部署机 (落地机)" "直接接收客户端流量,出口上网"
+    printf "  ${C_BOLD}%-5s${NC} ${C_YELLOW}%-20s${NC} %s\n" "2)" "线路机 (中转机)" "接收客户端流量后转发至落地机"
+    echo ""
+    hr
+    # 支持环境变量 VOLSB_MODE 跳过交互
+    if [[ -n "${VOLSB_MODE:-}" ]]; then
+        DEPLOY_MODE="$VOLSB_MODE"; return
+    fi
+    ask "选择模式 [1/2] 默认1: "; read -r _mode
+    [[ -z "$_mode" ]] && _mode="1"
+    DEPLOY_MODE="$_mode"
+}
+
+do_install() {
+    require_root
+    detect_os
+    detect_arch
+    install_deps
+    setup_dirs
+
+    step "获取 sing-box 最新版本"
+    local ver; ver=$(get_latest_version)
+    if [[ -x "$SB_BIN" ]]; then
+        local cur; cur=$("$SB_BIN" version 2>/dev/null | awk '{print $3}' | head -1)
+        if [[ "$cur" == "$ver" ]]; then
+            warn "sing-box 已是最新版本 v${ver}，跳过下载，继续配置"
+        else
+            info "当前 v${cur} → 最新 v${ver}，升级中..."
+            install_binary "$ver"
+        fi
+    else
+        install_binary "$ver"
+    fi
+
+    # 验证安装成功
+    if [[ ! -x "$SB_BIN" ]]; then
+        err "sing-box 安装失败，请检查网络后重试"
+        return 1
+    fi
+    info "sing-box 就绪: $("$SB_BIN" version 2>/dev/null | head -1)"
+
+    install_service
+    install_shortcut
+
+    # 节点信息文件由 assemble_and_write_config 统一写入，此处无需初始化
+
+    select_deploy_mode
+
+    if [[ "$DEPLOY_MODE" == "2" ]]; then
+        # 线路机模式
+        deploy_relay
+        assemble_relay_check
+    else
+        # 部署机模式
+        ask_connect_addr
+        select_protocols
+        assemble_and_write_config
+        traffic_init_api
+    fi
+
+    step "启动 sing-box 服务"
+    svc_start
+    # 等待进程就绪后二次确认状态
+    local retry=0
+    while ! svc_active 2>/dev/null && [[ $retry -lt 5 ]]; do
+        sleep 1; (( retry++ )) || true
+    done
+
+    if svc_active; then
+        info "sing-box 运行中 ✔  (用时 ${retry}s)"
+    else
+        err "启动失败! 查看日志:"
+        [[ -f "$SB_LOG" ]] && tail -20 "$SB_LOG" || true
+        exit 1
+    fi
+
+    show_nodes
+    echo ""
+    info "安装完成!  输入 ${C_BOLD}volsb${NC} 进入管理界面"
+}
+
+# 线路机配置独立写入,不走 assemble_and_write_config
+assemble_relay_check() {
+    "$SB_BIN" check -c "$SB_CONFIG" &>/dev/null || {
+        err "线路机配置校验失败:"
+        "$SB_BIN" check -c "$SB_CONFIG"
+        exit 1
+    }
+    info "线路机配置校验通过"
+}
+
+do_uninstall() {
+    require_root
+    ask "确认完全卸载 VOLSB / sing-box? [y/N]: "; read -r ans
+    [[ "$ans" =~ ^[Yy]$ ]] || { info "已取消"; return; }
+    svc_stop 2>/dev/null || true
+    if [[ "$INIT_SYS" == "openrc" ]]; then
+        rc-update del sing-box default &>/dev/null || true
+        rm -f "$SB_OPENRC"
+    else
+        systemctl disable sing-box &>/dev/null || true
+        rm -f "$SB_SYSTEMD"
+        systemctl daemon-reload
+    fi
+    rm -f "$SB_BIN" "$VOLSB_CMD"
+    rm -rf "$SB_CONF_DIR" "$SB_LOG_DIR" "$SB_DATA_DIR"
+    info "卸载完成"
+}
+
+# ────── 升级 sing-box 核心 ──────
+do_update_singbox() {
+    require_root
+    [[ -x "$SB_BIN" ]] || die "sing-box 未安装"
+    detect_arch
+    local cur new
+    cur=$("$SB_BIN" version | awk '{print $3}' | head -1)
+    new=$(get_latest_version)
+    if [[ "$cur" == "$new" ]]; then
+        info "sing-box 已是最新版本 v${cur}"; return
+    fi
+    info "升级 sing-box: v${cur} → v${new}"
+    install_binary "$new"
+    svc_restart && info "sing-box 升级完成 ✔"
+}
+
+# ────── 升级 VOLSB 脚本自身 ──────
+do_update_script() {
+    require_root
+    step "更新 VOLSB 脚本"
+
+    # 获取远端版本号 — 用 || true 防止 pipefail 误触发 set -e
+    local remote_ver=""
+    info "检查远端版本 ..."
+    local raw_remote
+    raw_remote=$(curl -fsSL --max-time 15 "$VOLSB_REPO" 2>/dev/null) || true
+
+    if [[ -n "$raw_remote" ]]; then
+        remote_ver=$(echo "$raw_remote" | grep -m1 'VOLSB_VER='             | sed 's/.*VOLSB_VER="\([^"]*\)".*/\1/' 2>/dev/null) || true
+    fi
+
+    if [[ -z "$remote_ver" ]]; then
+        err "无法获取远端版本信息"
+        err "请检查网络或仓库地址: $VOLSB_REPO"
+        return 1
+    fi
+
+    info "本地版本: v${VOLSB_VER}  |  远端版本: v${remote_ver}"
+
+    if [[ "$remote_ver" == "$VOLSB_VER" ]]; then
+        info "VOLSB 已是最新版本 v${VOLSB_VER}"; return 0
+    fi
+
+    info "发现新版本: v${VOLSB_VER} → v${remote_ver}"
+    ask "确认更新? [Y/n]: "; read -r _ans
+    [[ "$_ans" =~ ^[Nn]$ ]] && { info "已取消"; return 0; }
+
+    # 确定脚本真实路径:
+    # $0 可能是 /usr/local/bin/volsb (wrapper)，需要找到实际脚本
+    local self
+    # 优先用 BASH_SOURCE[0]，它始终指向实际脚本文件
+    self=$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null) || self=$(readlink -f "$0")
+    info "脚本路径: $self"
+
+    local tmpfile; tmpfile=$(mktemp /tmp/volsb_update.XXXXXX)
+
+    step "下载新版脚本"
+    if ! curl -fsSL --max-time 60 -o "$tmpfile" "$VOLSB_REPO"; then
+        rm -f "$tmpfile"
+        err "下载失败: $VOLSB_REPO"; return 1
+    fi
+
+    # 完整性校验：必须含 VOLSB_VER= 且第一行是 bash shebang
+    local first_line; first_line=$(head -1 "$tmpfile" 2>/dev/null)
+    if ! grep -q "VOLSB_VER=" "$tmpfile" 2>/dev/null         || [[ "$first_line" != *"bash"* ]]; then
+        rm -f "$tmpfile"
+        err "下载内容校验失败,中止更新"; return 1
+    fi
+
+    # 备份当前版本
+    local backup="${self}.bak.${VOLSB_VER}"
+    cp "$self" "$backup" && info "已备份至: $backup"
+
+    # 原子替换：先写临时文件再 mv，避免写到一半进程读取
+    chmod +x "$tmpfile"
+    mv "$tmpfile" "$self"
+    info "脚本已替换: $self"
+
+    # 同步更新 /usr/local/bin/volsb wrapper（重写指向 self）
+    if [[ -f "$VOLSB_CMD" && "$VOLSB_CMD" != "$self" ]]; then
+        cat > "$VOLSB_CMD" <<SHORTCUT
+#!/usr/bin/env bash
+exec bash "${self}" "\$@"
+SHORTCUT
+        chmod +x "$VOLSB_CMD"
+        info "快捷命令已同步: $VOLSB_CMD"
+    fi
+
+    echo ""
+    info "VOLSB 更新完成: v${VOLSB_VER} → v${remote_ver} ✔"
+    warn "请重新运行: ${C_BOLD}volsb${NC}"
+}
+
+# ────── 统一更新入口(菜单调用) ──────
+do_update_menu() {
+    echo ""
+    echo -e "  ${C_BOLD}选择更新内容:${NC}"
+    hr
+    printf "  ${C_BOLD}%-5s${NC} %s\n" "1)" "更新 VOLSB 脚本  (当前 v${VOLSB_VER})"
+    printf "  ${C_BOLD}%-5s${NC} %s\n" "2)" "升级 sing-box 核心版本"
+    printf "  ${C_BOLD}%-5s${NC} %s\n" "3)" "全部更新"
+    printf "  ${C_BOLD}%-5s${NC} %s\n" "0)" "取消"
+    hr
+    ask "选择 [0-3]: "; read -r uc
+    case "$uc" in
+        1) do_update_script ;;
+        2) do_update_singbox ;;
+        3) do_update_script; do_update_singbox ;;
+        *) info "已取消" ;;
+    esac
+}
+
+# ════════════════════════════════════════════════════════════
+#  管理界面 (volsb 命令入口)
+# ════════════════════════════════════════════════════════════
+
+main_menu() {
+    # 检测 INIT_SYS(管理界面直接调用时需要)
+    if [[ -z "${INIT_SYS:-}" ]]; then
+        [[ -f /etc/alpine-release ]] && INIT_SYS="openrc" || INIT_SYS="systemd"
+    fi
+
+    while true; do
+        clear
+        echo -e "${C_BOLD}${C_CYAN}"
+        cat <<'LOGO'
+  ██╗   ██╗ ██████╗ ██╗     ███████╗██████╗
+  ██║   ██║██╔═══██╗██║     ██╔════╝██╔══██╗
+  ██║   ██║██║   ██║██║     ███████╗██████╔╝
+  ╚██╗ ██╔╝██║   ██║██║     ╚════██║██╔══██╗
+   ╚████╔╝ ╚██████╔╝███████╗███████║██████╔╝
+    ╚═══╝   ╚═════╝ ╚══════╝╚══════╝╚═════╝
+LOGO
+        echo -e "  ${C_DIM}v${VOLSB_VER}  |  $(date '+%Y-%m-%d %H:%M:%S')  |  ${VOLSB_REPO##*/}${NC}"
+        echo -e "${NC}"
+
+        # 状态栏
+        if svc_active 2>/dev/null; then
+            echo -e "  状态: ${C_GREEN}${C_BOLD}● 运行中${NC}"
+        elif [[ -f "$SB_SYSTEMD" || -f "$SB_OPENRC" ]]; then
+            echo -e "  状态: ${C_RED}${C_BOLD}● 已停止${NC}"
+        else
+            echo -e "  状态: ${C_YELLOW}${C_BOLD}● 未安装${NC}"
+        fi
+        [[ -x "$SB_BIN" ]] && \
+            echo -e "  版本: ${C_DIM}$("$SB_BIN" version 2>/dev/null | awk '{print $3}' | head -1)${NC}"
+        [[ -f "$SB_LINKS" ]] && \
+            echo -e "  节点: ${C_DIM}$(wc -l < "$SB_LINKS") 条链接${NC}"
+
+        echo ""; hr
+        echo -e "  ${C_BOLD}📦 安装管理${NC}"
+        echo "   1) 全新安装 / 重新部署"
+        echo "   2) 追加新协议"
+        echo "   3) 更新 (脚本/sing-box)"
+        echo "   4) 卸载"
+        echo ""
+        echo -e "  ${C_BOLD}⚙️  服务控制${NC}"
+        echo "   5) 启动    6) 停止    7) 重启    8) 查看状态"
+        echo ""
+        echo -e "  ${C_BOLD}📋 节点与配置${NC}"
+        echo "   9) 查看节点信息 & 分享链接"
+        echo "  10) 重置端口 / 密码 / UUID"
+        echo "  11) 编辑配置文件"
+        echo ""
+        echo -e "  ${C_BOLD}📊 流量管理${NC}"
+        echo "  12) 查看流量统计"
+        echo "  13) 清空流量日志"
+        echo "  14) 实时日志"
+        hr
+        echo "   0) 退出"
+        echo ""
+        ask "请选择 [0-14]: "; read -r opt
+
+        case "$opt" in
+            1)  do_install || true ;;
+            2)  require_root; ask_connect_addr; select_protocols
+                append_and_write_config || true
+                svc_restart && info "配置已更新" || true ;;
+            3)  do_update_menu || true ;;
+            4)  do_uninstall || true ;;
+            5)  require_root; svc_start  && info "已启动" || true ;;
+            6)  require_root; svc_stop   && info "已停止" || true ;;
+            7)  require_root; svc_restart && info "已重启" || true ;;
+            8)  svc_status || true ;;
+            9)  show_nodes || true ;;
+            10) reset_ports || true ;;
+            11) require_root; ${EDITOR:-vi} "$SB_CONFIG"
+                "$SB_BIN" check -c "$SB_CONFIG" &>/dev/null && {
+                    svc_restart && info "配置已保存并重启"
+                } || { err "配置有误,未重启"; "$SB_BIN" check -c "$SB_CONFIG" || true; } ;;
+            12) show_traffic || true ;;
+            13) reset_traffic_log || true ;;
+            14) [[ -f "$SB_LOG" ]] && tail -f "$SB_LOG" || journalctl -u sing-box -f || true ;;
+            0)  exit 0 ;;
+            *)  warn "无效选项: $opt" ;;
+        esac
+
+        echo ""; ask "按回车继续..."; read -r
+    done
+}
+
+# ════════════════════════════════════════════════════════════
+#  命令行入口
+# ════════════════════════════════════════════════════════════
+
+print_help() {
+    cat <<HELP
+VOLSB — sing-box 服务端部署管理脚本 v${VOLSB_VER}
+项目地址: https://github.com/chnnic/VOLSB
+
+用法:
+  volsb [命令]
+
+命令:
+  (无参数)         进入交互式管理界面
+  install          全新安装
+  relay            以线路机模式安装
+  add              追加协议到现有配置
+  update           升级 sing-box 核心版本
+  self-update      更新 VOLSB 脚本自身
+  uninstall        完全卸载
+  start            启动服务
+  stop             停止服务
+  restart          重启服务
+  status           查看运行状态
+  info             查看节点信息和分享链接
+  traffic          查看流量统计
+  log              实时日志
+  -h, --help       显示帮助
+
+HELP
+}
+
+# relay 模式命令行参数解析
+parse_relay_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --land-addr)   LAND_ADDR="$2";   shift 2 ;;
+            --land-port)   LAND_PORT="$2";   shift 2 ;;
+            --land-pass)   LAND_PASS="$2";   shift 2 ;;
+            --land-method) LAND_METHOD="$2"; shift 2 ;;
+            *) shift ;;
         esac
     done
 }
 
-# =============================================
-#   主入口
-# =============================================
-check_root
+main() {
+    local cmd="${1:-menu}"; [[ $# -gt 0 ]] && shift || true
 
-# 自检：快捷命令不存在或指向错误时自动修复
-if [ "$1" != "--save-traffic" ]; then
-    if [ ! -f "$SHORTCUT" ] || ! grep -q "volss" "$SHORTCUT" 2>/dev/null; then
-        CURRENT_SCRIPT=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-        if [ "$CURRENT_SCRIPT" != "$SCRIPT_INSTALL_PATH" ] && [ -f "$CURRENT_SCRIPT" ]; then
-            cp "$CURRENT_SCRIPT" "$SCRIPT_INSTALL_PATH" && chmod +x "$SCRIPT_INSTALL_PATH"
-        fi
-        if [ -f "$SCRIPT_INSTALL_PATH" ]; then
-            cat > $SHORTCUT << EOF
-#!/bin/bash
-bash $SCRIPT_INSTALL_PATH --menu
-EOF
-            chmod +x $SHORTCUT
-            echo -e "${GREEN}✅ 快捷命令已自动修复，输入 ${YELLOW}volss${GREEN} 呼出管理菜单${NC}"
-        fi
-    fi
+    case "$cmd" in
+        install|i)        do_install ;;
+        relay)
+            require_root; detect_os; detect_arch; install_deps; setup_dirs
+            local ver; ver=$(get_latest_version)
+            install_binary "$ver"; install_service; install_shortcut
+            cat > "$SB_INFO" <<HDR
+==============================================
+  VOLSB 线路机 — 节点信息
+  安装时间 : $(date '+%Y-%m-%d %H:%M:%S')
+==============================================
+HDR
+            parse_relay_args "$@"
+            ask_connect_addr
+            deploy_relay; assemble_relay_check
+            svc_start; sleep 2
+            svc_active && info "线路机运行中 ✔" || { err "启动失败"; exit 1; }
+            show_nodes
+            ;;
+        add)
+            require_root
+            [[ -f "$SB_CONFIG" ]] || die "请先安装"
+            ask_connect_addr; select_protocols; append_and_write_config
+            svc_restart && info "已更新并重启" ;;
+        update|upgrade)   do_update_singbox ;;
+        self-update)      do_update_script ;;
+        uninstall|remove) detect_os; do_uninstall ;;
+        start)            require_root
+                          [[ -f /etc/alpine-release ]] && INIT_SYS="openrc" || INIT_SYS="systemd"
+                          svc_start ;;
+        stop)             require_root
+                          [[ -f /etc/alpine-release ]] && INIT_SYS="openrc" || INIT_SYS="systemd"
+                          svc_stop ;;
+        restart|r)        require_root
+                          [[ -f /etc/alpine-release ]] && INIT_SYS="openrc" || INIT_SYS="systemd"
+                          svc_restart ;;
+        status|s)         [[ -f /etc/alpine-release ]] && INIT_SYS="openrc" || INIT_SYS="systemd"
+                          svc_status ;;
+        info|node)        show_nodes ;;
+        traffic|stats)    show_traffic ;;
+        log|logs)         [[ -f "$SB_LOG" ]] && tail -f "$SB_LOG" \
+                              || journalctl -u sing-box -f ;;
+        menu|"")          main_menu ;;
+        -h|--help|help)   print_help ;;
+        *)                err "未知命令: $cmd"; print_help; exit 1 ;;
+    esac
+}
 
-    # 自检：ACL 格式修复（移除无效头部，确保 outbound_block_list 存在）
-    if [ -f "$ACL_PATH" ]; then
-        NEED_FIX=0
-        grep -q "^\[accept_all\]" "$ACL_PATH" && NEED_FIX=1
-        grep -q "^\[bypass_list\]" "$ACL_PATH" && NEED_FIX=1
-        grep -q "^domain-suffix:" "$ACL_PATH" && NEED_FIX=1
-        if [ "$NEED_FIX" -eq 1 ]; then
-            sed -i 's/^domain-suffix:/||/' $ACL_PATH
-            sed -i '/^\[bypass_list\]$/d' $ACL_PATH
-            sed -i '/^\[accept_all\]$/d' $ACL_PATH
-            sed -i '/^\[proxy_list\]$/d' $ACL_PATH
-            sed -i '/^$/d' $ACL_PATH
-            if ! grep -q "^\[outbound_block_list\]" $ACL_PATH; then
-                sed -i '1i [outbound_block_list]' $ACL_PATH
-            fi
-            systemctl restart shadowsocks-rust 2>/dev/null
-            echo -e "${GREEN}✅ ACL 格式已自动修复并重启服务${NC}"
-        fi
-    fi
-fi
-
-case "$1" in
-    --menu)         show_main_menu ;;
-    --save-traffic) save_traffic ;;
-    --version)      echo -e "Shadowsocks-Rust 管理脚本 ${GREEN}$VERSION${NC}" ;;
-    *)              show_main_menu ;;
-esac
+main "$@"
