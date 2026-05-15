@@ -2,11 +2,12 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.3.9
+#   版本: V1.4.0
 #   快捷命令: volss
+#   支持: Debian / Ubuntu / Alpine
 # ========================================
 
-VERSION="V1.3.9"
+VERSION="V1.4.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -15,7 +16,24 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-SS_BIN="/usr/local/bin/ssserver"
+# ========== 系统检测 ==========
+detect_system() {
+    if [ -f /etc/alpine-release ]; then
+        SYSTEM="alpine"
+        SS_BIN="/usr/bin/ssserver"
+        SERVICE="/etc/init.d/shadowsocks-rust"
+    elif [ -f /etc/debian_version ] || grep -qi "ubuntu\|debian" /etc/os-release 2>/dev/null; then
+        SYSTEM="debian"
+        SS_BIN="/usr/local/bin/ssserver"
+        SERVICE="/etc/systemd/system/shadowsocks-rust.service"
+    else
+        echo -e "${RED}不支持的系统，仅支持 Debian/Ubuntu/Alpine${NC}"
+        exit 1
+    fi
+}
+
+detect_system
+
 SCRIPT_INSTALL_PATH="/usr/local/bin/volss.sh"
 CONFIG="/etc/shadowsocks-rust/config.json"
 RUNTIME="/etc/shadowsocks-rust/runtime.json"
@@ -23,12 +41,42 @@ ACL_PATH="/etc/shadowsocks-rust/blocklist.acl"
 LINKS_FILE="/etc/shadowsocks-rust/ss_links.txt"
 TRAFFIC_FILE="/etc/shadowsocks-rust/traffic.json"
 MANUAL_FILE="/etc/shadowsocks-rust/manual.list"
-SERVICE="/etc/systemd/system/shadowsocks-rust.service"
 SHORTCUT="/usr/local/bin/volss"
+ACL_RULESET_DIR="/etc/shadowsocks-rust/rulesets"
+
+# ========== 服务管理抽象 ==========
+svc_start()   { [ "$SYSTEM" = "alpine" ] && rc-service shadowsocks-rust start   || systemctl start   shadowsocks-rust; }
+svc_stop()    { [ "$SYSTEM" = "alpine" ] && rc-service shadowsocks-rust stop    || systemctl stop    shadowsocks-rust; }
+svc_restart() { [ "$SYSTEM" = "alpine" ] && rc-service shadowsocks-rust restart || systemctl restart shadowsocks-rust; }
+svc_status()  { [ "$SYSTEM" = "alpine" ] && rc-service shadowsocks-rust status  || systemctl status  shadowsocks-rust --no-pager; }
+svc_enable() {
+    if [ "$SYSTEM" = "alpine" ]; then
+        rc-update add shadowsocks-rust default 2>/dev/null
+    else
+        systemctl enable shadowsocks-rust 2>/dev/null
+    fi
+}
+svc_disable() {
+    if [ "$SYSTEM" = "alpine" ]; then
+        rc-update del shadowsocks-rust default 2>/dev/null
+    else
+        svc_disable
+    fi
+}
+svc_reload() {
+    [ "$SYSTEM" = "alpine" ] || systemctl daemon-reload 2>/dev/null
+}
+svc_log() {
+    if [ "$SYSTEM" = "alpine" ]; then
+        tail -f /var/log/shadowsocks-rust.log
+    else
+        journalctl -u shadowsocks-rust -f
+    fi
+}
 
 # ========== 检查 root ==========
 check_root() {
-    if [ "$EUID" -ne 0 ]; then
+    if [ "$(id -u)" -ne 0 ]; then
         echo -e "${RED}请使用 root 权限运行此脚本${NC}"
         exit 1
     fi
@@ -62,8 +110,13 @@ port_in_use() {
 
 install_deps() {
     echo -e "\n${YELLOW}>>> 安装依赖...${NC}"
-    apt-get update -qq
-    apt-get install -y curl wget openssl python3 iproute2 xz-utils iptables-persistent -qq
+    if [ "$SYSTEM" = "alpine" ]; then
+        apk update -q
+        apk add --no-cache curl wget openssl python3 iproute2 xz iptables net-tools bash coreutils
+    else
+        apt-get update -qq
+        apt-get install -y curl wget openssl python3 iproute2 xz-utils iptables-persistent -qq
+    fi
     echo -e "${GREEN}✅ 依赖安装完成${NC}"
 }
 
@@ -81,14 +134,27 @@ install_ssrust() {
     echo -e "最新版本: ${GREEN}$LATEST${NC}"
 
     ARCH=$(uname -m)
-    case $ARCH in
-        x86_64)  ARCH_NAME="x86_64-unknown-linux-gnu" ;;
-        aarch64) ARCH_NAME="aarch64-unknown-linux-gnu" ;;
-        *)
-            echo -e "${RED}不支持的架构: $ARCH${NC}"
-            return 1
-            ;;
-    esac
+    if [ "$SYSTEM" = "alpine" ]; then
+        # Alpine 使用 musl 版本
+        case $ARCH in
+            x86_64)  ARCH_NAME="x86_64-unknown-linux-musl" ;;
+            aarch64) ARCH_NAME="aarch64-unknown-linux-musl" ;;
+            armv7l)  ARCH_NAME="armv7-unknown-linux-musleabihf" ;;
+            *)
+                echo -e "${RED}不支持的架构: $ARCH${NC}"
+                return 1
+                ;;
+        esac
+    else
+        case $ARCH in
+            x86_64)  ARCH_NAME="x86_64-unknown-linux-gnu" ;;
+            aarch64) ARCH_NAME="aarch64-unknown-linux-gnu" ;;
+            *)
+                echo -e "${RED}不支持的架构: $ARCH${NC}"
+                return 1
+                ;;
+        esac
+    fi
 
     URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${LATEST}/shadowsocks-${LATEST}.${ARCH_NAME}.tar.xz"
     echo "下载中: $URL"
@@ -293,14 +359,43 @@ with open('$RUNTIME', 'w') as f:
     json.dump(runtime, f, indent=2)
 PYEOF
 
-    systemctl daemon-reload 2>/dev/null
-    systemctl restart shadowsocks-rust
+    svc_reload
+    svc_restart
 }
 
 create_service() {
     echo -e "\n${YELLOW}>>> 创建系统服务...${NC}"
 
-    cat > $SERVICE << EOF
+    if [ "$SYSTEM" = "alpine" ]; then
+        cat > $SERVICE << EOF
+#!/sbin/openrc-run
+
+name="shadowsocks-rust"
+description="Shadowsocks-Rust Server"
+command="$SS_BIN"
+command_args="-c $RUNTIME"
+command_background=true
+pidfile="/run/\${RC_SVCNAME}.pid"
+output_log="/var/log/shadowsocks-rust.log"
+error_log="/var/log/shadowsocks-rust.log"
+
+depend() {
+    need net
+    after firewall
+}
+
+start_pre() {
+    [ -x $SS_BIN ] || return 1
+    [ -f $RUNTIME ] || return 1
+}
+
+stop_pre() {
+    [ -f $SCRIPT_INSTALL_PATH ] && bash $SCRIPT_INSTALL_PATH --save-traffic 2>/dev/null || true
+}
+EOF
+        chmod +x $SERVICE
+    else
+        cat > $SERVICE << EOF
 [Unit]
 Description=Shadowsocks-Rust Service
 After=network.target
@@ -316,17 +411,23 @@ RestartSec=5s
 [Install]
 WantedBy=multi-user.target
 EOF
+    fi
 
     apply_config
-    systemctl daemon-reload
-    systemctl enable shadowsocks-rust
-    systemctl restart shadowsocks-rust
+    svc_reload
+    svc_enable
+    svc_restart
     sleep 2
 
-    if systemctl is-active --quiet shadowsocks-rust; then
+    if pgrep -x ssserver >/dev/null 2>&1; then
         echo -e "${GREEN}✅ 服务启动成功${NC}"
     else
-        echo -e "${RED}❌ 服务启动失败，查看日志: journalctl -u shadowsocks-rust -n 20${NC}"
+        echo -e "${RED}❌ 服务启动失败${NC}"
+        if [ "$SYSTEM" = "alpine" ]; then
+            echo "日志: tail -20 /var/log/shadowsocks-rust.log"
+        else
+            echo "日志: journalctl -u shadowsocks-rust -n 20"
+        fi
     fi
 }
 
@@ -355,7 +456,14 @@ for s in c['servers']:
     # 重置内核计数器
     iptables -Z
 
-    netfilter-persistent save 2>/dev/null
+    # 持久化 iptables 规则
+    if [ "$SYSTEM" = "alpine" ]; then
+        /etc/init.d/iptables save 2>/dev/null || iptables-save > /etc/iptables/rules-save 2>/dev/null
+        rc-update add iptables default 2>/dev/null
+    else
+        netfilter-persistent save 2>/dev/null
+    fi
+
     echo -e "${GREEN}✅ 流量统计初始化完成${NC}"
 }
 
@@ -429,11 +537,11 @@ do_uninstall() {
     read -p "确认卸载？[y/N]: " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
 
-    systemctl stop    shadowsocks-rust 2>/dev/null
-    systemctl disable shadowsocks-rust 2>/dev/null
+    svc_stop 2>/dev/null
+    svc_disable
     rm -f $SS_BIN $SERVICE $SHORTCUT $SCRIPT_INSTALL_PATH ${SCRIPT_INSTALL_PATH}.bak
     rm -rf /etc/shadowsocks-rust
-    systemctl daemon-reload
+    svc_reload
 
     echo -e "${GREEN}✅ 卸载完成${NC}"
     read -p "按回车继续..."
@@ -892,8 +1000,8 @@ PYEOF
             echo -e "${GREEN}✅ 服务停止钩子已添加${NC}"
         fi
 
-        systemctl daemon-reload
-        systemctl restart shadowsocks-rust
+        svc_reload
+        svc_restart
         echo -e "${GREEN}✅ 服务已重启${NC}"
     fi
 
@@ -1056,7 +1164,7 @@ rebuild_acl() {
         cat "$RULESET_FILE" >> $ACL_PATH
     done
 
-    systemctl restart shadowsocks-rust
+    svc_restart
 }
 
 # 显示规则集菜单
@@ -1302,13 +1410,13 @@ show_main_menu() {
                 read -p "按回车继续..."
                 ;;
             15) manage_rulesets ;;
-            16) systemctl status shadowsocks-rust --no-pager; read -p "按回车继续..." ;;
-            17) systemctl start   shadowsocks-rust && echo -e "${GREEN}✅ 服务已启动${NC}"; read -p "按回车继续..." ;;
-            18) systemctl stop    shadowsocks-rust && echo -e "${YELLOW}⏹ 服务已停止${NC}"; read -p "按回车继续..." ;;
-            19) systemctl restart shadowsocks-rust && echo -e "${GREEN}🔄 服务已重启${NC}"; read -p "按回车继续..." ;;
+            16) svc_status; read -p "按回车继续..." ;;
+            17) svc_start   && echo -e "${GREEN}✅ 服务已启动${NC}"; read -p "按回车继续..." ;;
+            18) svc_stop    && echo -e "${YELLOW}⏹ 服务已停止${NC}"; read -p "按回车继续..." ;;
+            19) svc_restart && echo -e "${GREEN}🔄 服务已重启${NC}"; read -p "按回车继续..." ;;
             20)
                 echo -e "${YELLOW}按 Ctrl+C 退出日志${NC}"
-                journalctl -u shadowsocks-rust -f
+                svc_log
                 ;;
             0)
                 echo -e "${GREEN}再见！${NC}"
@@ -1356,7 +1464,7 @@ EOF
             if ! grep -q "^\[outbound_block_list\]" $ACL_PATH; then
                 sed -i '1i [outbound_block_list]' $ACL_PATH
             fi
-            systemctl restart shadowsocks-rust 2>/dev/null
+            svc_restart 2>/dev/null
             echo -e "${GREEN}✅ ACL 格式已自动修复并重启服务${NC}"
         fi
     fi
