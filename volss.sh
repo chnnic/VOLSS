@@ -104,6 +104,115 @@ port_in_use() {
     ss -tlun 2>/dev/null | grep -q ":${PORT}$"
 }
 
+# ========== 时间同步相关 ==========
+
+# 获取标准时间（从 HTTP HEAD 或 NTP 获取）
+get_standard_time() {
+    # 优先尝试 Cloudflare（响应快）
+    local TS=$(curl -sI --max-time 3 https://cloudflare.com 2>/dev/null | grep -i "^date:" | sed 's/^[Dd]ate: //; s/\r$//')
+    if [ -z "$TS" ]; then
+        TS=$(curl -sI --max-time 3 https://www.google.com 2>/dev/null | grep -i "^date:" | sed 's/^[Dd]ate: //; s/\r$//')
+    fi
+    if [ -z "$TS" ]; then
+        TS=$(curl -sI --max-time 3 https://www.baidu.com 2>/dev/null | grep -i "^date:" | sed 's/^[Dd]ate: //; s/\r$//')
+    fi
+    echo "$TS"
+}
+
+# 计算本地时间和标准时间的差值（秒）
+get_time_diff() {
+    local STD_TIME=$(get_standard_time)
+    if [ -z "$STD_TIME" ]; then
+        echo "N/A"
+        return
+    fi
+    local STD_EPOCH=$(date -d "$STD_TIME" +%s 2>/dev/null)
+    local LOCAL_EPOCH=$(date +%s)
+    if [ -z "$STD_EPOCH" ]; then
+        echo "N/A"
+        return
+    fi
+    local DIFF=$((LOCAL_EPOCH - STD_EPOCH))
+    echo "$DIFF"
+}
+
+# 格式化时间差显示
+format_time_diff() {
+    local DIFF=$1
+    if [ "$DIFF" = "N/A" ]; then
+        echo "${YELLOW}未知${NC}"
+        return
+    fi
+    local ABS=$(echo "$DIFF" | sed 's/-//')
+    if [ "$ABS" -le 2 ]; then
+        echo "${GREEN}已同步 (±${ABS}s)${NC}"
+    elif [ "$ABS" -le 10 ]; then
+        if [ "$DIFF" -gt 0 ]; then
+            echo "${YELLOW}本地快 ${ABS}s${NC}"
+        else
+            echo "${YELLOW}本地慢 ${ABS}s${NC}"
+        fi
+    else
+        if [ "$DIFF" -gt 0 ]; then
+            echo "${RED}本地快 ${ABS}s${NC}"
+        else
+            echo "${RED}本地慢 ${ABS}s${NC}"
+        fi
+    fi
+}
+
+# 执行时间同步
+do_time_sync() {
+    echo -e "\n${YELLOW}>>> 时间同步${NC}"
+    echo -e "当前本地时间: ${CYAN}$(date '+%Y-%m-%d %H:%M:%S %Z')${NC}"
+    STD_TIME=$(get_standard_time)
+    if [ -n "$STD_TIME" ]; then
+        echo -e "标准时间:     ${CYAN}$STD_TIME${NC}"
+    fi
+
+    DIFF=$(get_time_diff)
+    echo -e "时间差:       $(format_time_diff $DIFF)"
+    echo ""
+
+    read -p "确认同步系统时间？[y/N]: " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
+
+    echo -e "\n${YELLOW}>>> 安装并执行时间同步...${NC}"
+
+    if [ "$SYSTEM" = "alpine" ]; then
+        # Alpine 使用 chrony 或 busybox ntpd
+        apk add --no-cache chrony 2>/dev/null
+        if command -v chronyd >/dev/null 2>&1; then
+            rc-service chronyd stop 2>/dev/null
+            chronyd -q 'server pool.ntp.org iburst' 2>&1 | head -5
+            rc-service chronyd start
+            rc-update add chronyd default 2>/dev/null
+        else
+            # 回退到 busybox ntpd
+            ntpd -nqp pool.ntp.org 2>&1 | head -5
+        fi
+    else
+        # Debian/Ubuntu 使用 chrony 或 systemd-timesyncd
+        if command -v timedatectl >/dev/null 2>&1; then
+            timedatectl set-ntp true
+            apt-get install -y chrony -qq 2>/dev/null
+            systemctl restart chrony 2>/dev/null || systemctl restart systemd-timesyncd 2>/dev/null
+            sleep 2
+            chronyc -a makestep 2>/dev/null || true
+        else
+            apt-get install -y ntpdate -qq
+            ntpdate -u pool.ntp.org
+        fi
+    fi
+
+    sleep 2
+    echo ""
+    echo -e "${GREEN}✅ 同步完成${NC}"
+    echo -e "当前本地时间: ${CYAN}$(date '+%Y-%m-%d %H:%M:%S %Z')${NC}"
+    DIFF=$(get_time_diff)
+    echo -e "时间差:       $(format_time_diff $DIFF)"
+}
+
 # =============================================
 #   安装流程
 # =============================================
@@ -1313,10 +1422,18 @@ show_main_menu() {
             SVC_LABEL="${RED}● 未运行${NC}"
         fi
 
+        # 获取时间差（缓存 60 秒避免每次刷新都请求网络）
+        if [ -z "$LAST_TIME_CHECK" ] || [ $(($(date +%s) - LAST_TIME_CHECK)) -gt 60 ]; then
+            TIME_DIFF=$(get_time_diff)
+            LAST_TIME_CHECK=$(date +%s)
+        fi
+        TIME_STATUS=$(format_time_diff $TIME_DIFF)
+
         echo -e "  ${BLUE}=================================================${NC}"
         echo -e "    Shadowsocks-Rust 管理脚本    ${VERSION}    快捷命令: volss"
         echo -e "  ${BLUE}=================================================${NC}"
         printf "    安装: %-20b 服务: %-20b\n" "$SS_STATUS" "$SVC_LABEL"
+        printf "    时间: %b\n" "$TIME_STATUS"
         echo -e "  ${BLUE}-------------------------------------------------${NC}"
         echo -e "  ${CYAN}  -- 安装管理 --${NC}"
         echo -e "      1)  安装 Shadowsocks-Rust"
@@ -1343,10 +1460,11 @@ show_main_menu() {
         echo -e "     18)  停止服务"
         echo -e "     19)  重启服务"
         echo -e "     20)  查看实时日志"
+        echo -e "     21)  时间同步"
         echo -e "  ${BLUE}-------------------------------------------------${NC}"
         echo -e "   ${RED}  0)  退出${NC}"
         echo -e "  ${BLUE}=================================================${NC}"
-        read -p "  请选择 [0-20]: " CHOICE
+        read -p "  请选择 [0-21]: " CHOICE
 
         # 未安装时拦截管理功能
         if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|20)$ ]]; then
@@ -1417,6 +1535,13 @@ show_main_menu() {
             20)
                 echo -e "${YELLOW}按 Ctrl+C 退出日志${NC}"
                 svc_log
+                ;;
+            21)
+                do_time_sync
+                # 刷新时间差缓存
+                TIME_DIFF=$(get_time_diff)
+                LAST_TIME_CHECK=$(date +%s)
+                read -p "按回车继续..."
                 ;;
             0)
                 echo -e "${GREEN}再见！${NC}"
