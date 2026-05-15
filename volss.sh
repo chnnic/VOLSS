@@ -44,6 +44,15 @@ MANUAL_FILE="/etc/shadowsocks-rust/manual.list"
 SHORTCUT="/usr/local/bin/volss"
 ACL_RULESET_DIR="/etc/shadowsocks-rust/rulesets"
 
+# ========== 服务运行状态检测 ==========
+# ========== 服务运行状态检测 ==========
+check_svc_running() {
+    pgrep -x ssserver >/dev/null 2>&1 && return 0
+    pgrep -f "ssserver" >/dev/null 2>&1 && return 0
+    [ "$SYSTEM" = "alpine" ] && rc-service shadowsocks-rust status 2>/dev/null | grep -q "started" && return 0
+    return 1
+}
+
 # ========== 服务管理抽象 ==========
 svc_start()   { [ "$SYSTEM" = "alpine" ] && rc-service shadowsocks-rust start   || systemctl start   shadowsocks-rust; }
 svc_stop()    { [ "$SYSTEM" = "alpine" ] && rc-service shadowsocks-rust stop    || systemctl stop    shadowsocks-rust; }
@@ -528,7 +537,7 @@ EOF
     svc_restart
     sleep 2
 
-    if pgrep -x ssserver >/dev/null 2>&1; then
+    if check_svc_running; then
         echo -e "${GREEN}✅ 服务启动成功${NC}"
     else
         echo -e "${RED}❌ 服务启动失败${NC}"
@@ -1412,7 +1421,7 @@ show_main_menu() {
         # 状态检测
         if check_installed; then
             SS_STATUS="${GREEN}● 已安装${NC}"
-            if pgrep -x ssserver > /dev/null 2>&1; then
+            if check_svc_running; then
                 SVC_LABEL="${GREEN}● 运行中${NC}"
             else
                 SVC_LABEL="${RED}● 已停止${NC}"
