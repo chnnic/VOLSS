@@ -2,12 +2,12 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.4.0
+#   版本: V1.4.1
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
 
-VERSION="V1.4.0"
+VERSION="V1.4.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1107,6 +1107,11 @@ PYEOF
             fi
             echo -e "${GREEN}✅ ACL 格式已自动修复${NC}"
         fi
+
+        # 强制重新生成 runtime.json 确保 ACL 字段正确写入
+        apply_config
+        echo -e "${GREEN}✅ runtime.json 已同步${NC}"
+
         if grep -q "Restart=on-failure" $SERVICE 2>/dev/null; then
             sed -i 's/Restart=on-failure/Restart=always/' $SERVICE
             echo -e "${GREEN}✅ 服务文件已修复${NC}"
@@ -1600,6 +1605,18 @@ EOF
             fi
             svc_restart 2>/dev/null
             echo -e "${GREEN}✅ ACL 格式已自动修复并重启服务${NC}"
+        fi
+
+        # 确保 runtime.json 有 acl 字段
+        if [ -f "$ACL_PATH" ] && [ -f "$RUNTIME" ]; then
+            python3 -c "
+import json,os
+with open('$RUNTIME') as f: r=json.load(f)
+if 'acl' not in r or not os.path.exists(r.get('acl','')):
+    r['acl']='$ACL_PATH'
+    with open('$RUNTIME','w') as f: json.dump(r,f,indent=2)
+    print('✅ runtime.json acl 字段已补全')
+" && svc_restart
         fi
     fi
 fi
