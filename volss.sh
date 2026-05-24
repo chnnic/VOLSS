@@ -2,12 +2,12 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.4.2
+#   版本: V1.4.3
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
 
-VERSION="V1.4.2"
+VERSION="V1.4.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1637,6 +1637,38 @@ if 'acl' not in r or not os.path.exists(r.get('acl','')):
     with open('$RUNTIME','w') as f: json.dump(r,f,indent=2)
     print('✅ runtime.json acl 字段已补全')
 " && svc_restart
+        fi
+
+        # 确保所有 server 有 mode=tcp_and_udp
+        if [ -f "$CONFIG" ] && [ -f "$RUNTIME" ]; then
+            python3 << PYEOF
+import json
+fixed = False
+for path in ['$CONFIG', '$RUNTIME']:
+    try:
+        with open(path) as f:
+            c = json.load(f)
+        for s in c.get('servers', []):
+            if s.get('mode') != 'tcp_and_udp':
+                s['mode'] = 'tcp_and_udp'
+                fixed = True
+        with open(path, 'w') as f:
+            json.dump(c, f, indent=2)
+    except:
+        pass
+if fixed:
+    print('✅ UDP 模式已自动开启')
+PYEOF
+            # 如果有修复则重启
+            if python3 -c "
+import json
+c=json.load(open('$RUNTIME'))
+exit(0 if all(s.get('mode')=='tcp_and_udp' for s in c.get('servers',[])) else 1)
+" 2>/dev/null; then
+                : # 已经正确，不需要重启
+            else
+                svc_restart
+            fi
         fi
     fi
 fi
