@@ -2,12 +2,12 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.4.1
+#   版本: V1.4.2
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
 
-VERSION="V1.4.1"
+VERSION="V1.4.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -439,9 +439,9 @@ generate_config() {
         NUM=$((i + 1))
 
         if [ $NUM -lt $TOTAL ]; then
-            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\"}," >> $CONFIG
+            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}," >> $CONFIG
         else
-            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\"}" >> $CONFIG
+            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}" >> $CONFIG
         fi
 
         USERINFO=$(echo -n "$METHOD:$PASS" | base64 -w 0)
@@ -1111,6 +1111,26 @@ PYEOF
         # 强制重新生成 runtime.json 确保 ACL 字段正确写入
         apply_config
         echo -e "${GREEN}✅ runtime.json 已同步${NC}"
+
+        # 补全旧配置缺失的 mode 字段
+        python3 << PYEOF
+import json
+changed = False
+for f in ['$CONFIG', '$RUNTIME']:
+    try:
+        with open(f) as fp:
+            c = json.load(fp)
+        for s in c.get('servers', []):
+            if 'mode' not in s:
+                s['mode'] = 'tcp_and_udp'
+                changed = True
+        with open(f, 'w') as fp:
+            json.dump(c, fp, indent=2)
+    except:
+        pass
+if changed:
+    print("✅ mode 字段已补全（TCP+UDP）")
+PYEOF
 
         if grep -q "Restart=on-failure" $SERVICE 2>/dev/null; then
             sed -i 's/Restart=on-failure/Restart=always/' $SERVICE
