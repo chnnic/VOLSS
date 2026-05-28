@@ -2,12 +2,12 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.4.3
+#   版本: V1.4.4
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
 
-VERSION="V1.4.3"
+VERSION="V1.4.4"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -44,7 +44,6 @@ MANUAL_FILE="/etc/shadowsocks-rust/manual.list"
 SHORTCUT="/usr/local/bin/volss"
 ACL_RULESET_DIR="/etc/shadowsocks-rust/rulesets"
 
-# ========== 服务运行状态检测 ==========
 # ========== 服务运行状态检测 ==========
 check_svc_running() {
     pgrep -x ssserver >/dev/null 2>&1 && return 0
@@ -357,7 +356,12 @@ select_ports() {
 
         while [ ${#PORT_LIST[@]} -lt $USER_COUNT ]; do
             RAND_PORT=$(( RANGE_START + RANDOM % (RANGE_END - RANGE_START + 1) ))
-            if [[ " ${PORT_LIST[@]} " =~ " $RAND_PORT " ]] || port_in_use $RAND_PORT; then
+            # 检查是否已在列表中
+            DUP=0
+            for P in "${PORT_LIST[@]}"; do
+                [ "$P" = "$RAND_PORT" ] && DUP=1 && break
+            done
+            if [ "$DUP" = "1" ] || port_in_use $RAND_PORT; then
                 TRIED=$((TRIED + 1))
                 if [ $TRIED -gt $MAX_TRY ]; then
                     echo -e "${RED}❌ 范围内可用端口不足${NC}"
@@ -365,7 +369,7 @@ select_ports() {
                 fi
                 continue
             fi
-            PORT_LIST+=($RAND_PORT)
+            PORT_LIST+=("$RAND_PORT")
             echo -e "  ${GREEN}端口 $RAND_PORT 已分配 ✓${NC}"
         done
     fi
@@ -377,7 +381,10 @@ basic_config() {
     echo -e "\n${YELLOW}>>> 服务器信息${NC}"
     read -p "服务器域名或IP [默认自动检测]: " HOST
     if [ -z "$HOST" ]; then
-        HOST=$(curl -s4 ifconfig.me 2>/dev/null || curl -s4 ip.sb)
+        HOST=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null \
+            || curl -s4 --max-time 5 ip.sb 2>/dev/null \
+            || curl -s4 --max-time 5 api.ipify.org 2>/dev/null \
+            || curl -s4 --max-time 5 ifconfig.co 2>/dev/null)
         echo -e "检测到IP: ${GREEN}$HOST${NC}"
     fi
 }
@@ -430,7 +437,7 @@ generate_config() {
         echo '{"servers":[' > $CONFIG
     fi
 
-    > $LINKS_FILE
+    : > $LINKS_FILE
 
     TOTAL=${#PORT_LIST[@]}
     for i in $(seq 0 $((TOTAL - 1))); do
@@ -444,7 +451,7 @@ generate_config() {
             echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}" >> $CONFIG
         fi
 
-        USERINFO=$(echo -n "$METHOD:$PASS" | base64 -w 0)
+        USERINFO=$(echo -n "$METHOD:$PASS" | base64 | tr -d '\n')
         echo "ss://${USERINFO}@${HOST}:${PORT}#用户${NUM}" >> $LINKS_FILE
     done
 
@@ -655,6 +662,31 @@ do_uninstall() {
     read -p "确认卸载？[y/N]: " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
 
+    # 清理 iptables 流量统计规则
+    if [ -f "$CONFIG" ]; then
+        PORTS=$(python3 -c "
+import json
+try:
+    with open('$CONFIG') as f:
+        c = json.load(f)
+    for s in c['servers']:
+        print(s['server_port'])
+except: pass
+" 2>/dev/null)
+        for PORT in $PORTS; do
+            for PROTO in tcp udp; do
+                while iptables -D INPUT  -p $PROTO --dport $PORT 2>/dev/null; do :; done
+                while iptables -D OUTPUT -p $PROTO --sport $PORT 2>/dev/null; do :; done
+            done
+        done
+        # 持久化
+        if [ "$SYSTEM" = "alpine" ]; then
+            /etc/init.d/iptables save 2>/dev/null
+        else
+            netfilter-persistent save 2>/dev/null
+        fi
+    fi
+
     svc_stop 2>/dev/null
     svc_disable
     rm -f $SS_BIN $SERVICE $SHORTCUT $SCRIPT_INSTALL_PATH ${SCRIPT_INSTALL_PATH}.bak
@@ -830,15 +862,11 @@ if 0 <= idx < len(ports):
     # 先把当前所有端口的增量保存到文件，再清零该端口
     save_traffic
 
-    # 单独清零该端口的 iptables 规则计数
+    # 单独清零该端口的 iptables 规则计数（按行号清零，倒序避免行号变化）
     for CHAIN in INPUT OUTPUT; do
-        for PROTO in tcp udp; do
-            for DIR in "--dport" "--sport"; do
-                LINE=$(iptables -nvL $CHAIN --line-numbers | awk -v p="$PORT" -v pr="$PROTO" '$0~("dpt:"p"$") || $0~("spt:"p"$") {print $1}' | head -5)
-                for L in $LINE; do
-                    iptables -Z $CHAIN $L 2>/dev/null
-                done
-            done
+        LINES=$(iptables -nvL $CHAIN --line-numbers | awk -v p="$PORT" '$0 ~ ("dpt:"p"$") || $0 ~ ("spt:"p"$") {print $1}' | sort -rn)
+        for L in $LINES; do
+            iptables -Z $CHAIN $L 2>/dev/null
         done
     done
 
@@ -962,8 +990,8 @@ PYEOF
 }
 
 regen_users() {
-    echo -e "${YELLOW}>>> 重新生成所有用户（所有密码将变更）${NC}"
-    read -p "确认？[y/N]: " CONFIRM
+    echo -e "${YELLOW}>>> 重新生成所有用户密码（端口保持不变）${NC}"
+    read -p "确认？所有密码将变更，旧链接失效 [y/N]: " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
 
     METHOD=$(python3 -c "
@@ -972,12 +1000,6 @@ with open('$CONFIG') as f:
     c = json.load(f)
 print(c['servers'][0]['method'])
 ")
-    USER_COUNT=$(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-print(len(c['servers']))
-")
 
     case $METHOD in
         *aes-128*)  KEY_LEN=16 ;;
@@ -985,8 +1007,21 @@ print(len(c['servers']))
         *) KEY_LEN=0 ;;
     esac
 
-    basic_config
-    select_ports || return
+    # 保留原有端口列表（读入 bash 数组）
+    PORT_STR=$(python3 -c "
+import json
+with open('$CONFIG') as f:
+    c = json.load(f)
+print(' '.join(str(s['server_port']) for s in c['servers']))
+")
+    PORT_LIST=($PORT_STR)
+
+    # 获取服务器地址（从现有链接提取，避免重新检测）
+    if [ -f "$LINKS_FILE" ] && [ -s "$LINKS_FILE" ]; then
+        HOST=$(head -1 "$LINKS_FILE" | sed 's/.*@//; s/:.*//')
+    fi
+    [ -z "$HOST" ] && basic_config
+
     USE_ACL_FLAG=$([ -f "$ACL_PATH" ] && echo true || echo false)
 
     generate_config
@@ -1374,15 +1409,27 @@ manage_rulesets() {
                 ;;
             12)
                 echo -e "\n已安装的规则集："
-                ls $ACL_RULESET_DIR/*.acl 2>/dev/null | xargs -I{} basename {} .acl | nl -ba
-                read -p "输入要卸载的编号: " DEL_IDX
-                DEL_NAME=$(ls $ACL_RULESET_DIR/*.acl 2>/dev/null | xargs -I{} basename {} .acl | sed -n "${DEL_IDX}p")
-                if [ -n "$DEL_NAME" ]; then
-                    rm -f "$ACL_RULESET_DIR/${DEL_NAME}.acl"
-                    rebuild_acl
-                    echo -e "${GREEN}✅ 已卸载: $DEL_NAME${NC}"
+                INSTALLED_ARR=()
+                for f in "$ACL_RULESET_DIR"/*.acl; do
+                    [ -f "$f" ] || continue
+                    INSTALLED_ARR+=("$(basename "$f" .acl)")
+                done
+                if [ ${#INSTALLED_ARR[@]} -eq 0 ]; then
+                    echo -e "${YELLOW}没有已安装的规则集${NC}"
                 else
-                    echo -e "${RED}无效编号${NC}"
+                    for i in "${!INSTALLED_ARR[@]}"; do
+                        echo "  $((i+1))) ${INSTALLED_ARR[$i]}"
+                    done
+                    read -p "输入要卸载的编号: " DEL_IDX
+                    IDX=$((DEL_IDX - 1))
+                    if [ $IDX -ge 0 ] && [ $IDX -lt ${#INSTALLED_ARR[@]} ]; then
+                        DEL_NAME="${INSTALLED_ARR[$IDX]}"
+                        rm -f "$ACL_RULESET_DIR/${DEL_NAME}.acl"
+                        rebuild_acl
+                        echo -e "${GREEN}✅ 已卸载: $DEL_NAME${NC}"
+                    else
+                        echo -e "${RED}无效编号${NC}"
+                    fi
                 fi
                 ;;
             13)
@@ -1627,46 +1674,39 @@ EOF
             echo -e "${GREEN}✅ ACL 格式已自动修复并重启服务${NC}"
         fi
 
-        # 确保 runtime.json 有 acl 字段
+        # 确保 runtime.json 有 acl 字段（grep 快速判断）
         if [ -f "$ACL_PATH" ] && [ -f "$RUNTIME" ]; then
-            python3 -c "
-import json,os
+            if ! grep -q '"acl"' "$RUNTIME" 2>/dev/null; then
+                python3 -c "
+import json
 with open('$RUNTIME') as f: r=json.load(f)
-if 'acl' not in r or not os.path.exists(r.get('acl','')):
-    r['acl']='$ACL_PATH'
-    with open('$RUNTIME','w') as f: json.dump(r,f,indent=2)
-    print('✅ runtime.json acl 字段已补全')
-" && svc_restart
+r['acl']='$ACL_PATH'
+with open('$RUNTIME','w') as f: json.dump(r,f,indent=2)
+print('✅ runtime.json acl 字段已补全')
+"
+                svc_restart
+            fi
         fi
 
-        # 确保所有 server 有 mode=tcp_and_udp
-        if [ -f "$CONFIG" ] && [ -f "$RUNTIME" ]; then
-            python3 << PYEOF
+        # 确保所有 server 有 mode=tcp_and_udp（先用 grep 快速判断）
+        if [ -f "$RUNTIME" ]; then
+            SERVER_NUM=$(grep -c "server_port" "$RUNTIME" 2>/dev/null || echo 0)
+            MODE_NUM=$(grep -c "tcp_and_udp" "$RUNTIME" 2>/dev/null || echo 0)
+            if [ "$SERVER_NUM" != "$MODE_NUM" ]; then
+                python3 << PYEOF
 import json
-fixed = False
 for path in ['$CONFIG', '$RUNTIME']:
     try:
         with open(path) as f:
             c = json.load(f)
         for s in c.get('servers', []):
-            if s.get('mode') != 'tcp_and_udp':
-                s['mode'] = 'tcp_and_udp'
-                fixed = True
+            s['mode'] = 'tcp_and_udp'
         with open(path, 'w') as f:
             json.dump(c, f, indent=2)
     except:
         pass
-if fixed:
-    print('✅ UDP 模式已自动开启')
+print('✅ UDP 模式已自动开启')
 PYEOF
-            # 如果有修复则重启
-            if python3 -c "
-import json
-c=json.load(open('$RUNTIME'))
-exit(0 if all(s.get('mode')=='tcp_and_udp' for s in c.get('servers',[])) else 1)
-" 2>/dev/null; then
-                : # 已经正确，不需要重启
-            else
                 svc_restart
             fi
         fi
