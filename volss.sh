@@ -1,13 +1,35 @@
-#!/bin/bash
+#!/bin/sh
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.4.4
+#   版本: V1.4.5
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
 
-VERSION="V1.4.4"
+# ---- bash 自举（兼容 Alpine ash）----
+# 本脚本依赖 bash 特性，若当前不是 bash 则尝试切换
+if [ -z "$BASH_VERSION" ]; then
+    if command -v bash >/dev/null 2>&1; then
+        exec bash "$0" "$@"
+    else
+        # Alpine 等系统可能没有 bash，先安装
+        echo "正在安装 bash..."
+        if command -v apk >/dev/null 2>&1; then
+            apk add --no-cache bash >/dev/null 2>&1
+        elif command -v apt-get >/dev/null 2>&1; then
+            apt-get install -y bash >/dev/null 2>&1
+        fi
+        if command -v bash >/dev/null 2>&1; then
+            exec bash "$0" "$@"
+        else
+            echo "错误: 无法安装 bash，请手动安装后重试"
+            exit 1
+        fi
+    fi
+fi
+
+VERSION="V1.4.5"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -134,7 +156,18 @@ get_time_diff() {
         echo "N/A"
         return
     fi
+    # 优先用 GNU date -d，失败则回退到 python（兼容 busybox）
     local STD_EPOCH=$(date -d "$STD_TIME" +%s 2>/dev/null)
+    if [ -z "$STD_EPOCH" ]; then
+        STD_EPOCH=$(python3 -c "
+import sys
+from email.utils import parsedate_to_datetime
+try:
+    print(int(parsedate_to_datetime('$STD_TIME').timestamp()))
+except:
+    pass
+" 2>/dev/null)
+    fi
     local LOCAL_EPOCH=$(date +%s)
     if [ -z "$STD_EPOCH" ]; then
         echo "N/A"
@@ -274,18 +307,38 @@ install_ssrust() {
     fi
 
     URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${LATEST}/shadowsocks-${LATEST}.${ARCH_NAME}.tar.xz"
-    echo "下载中: $URL"
-    wget -O /tmp/ss-rust.tar.xz "$URL"
 
-    if [ $? -ne 0 ] || [ ! -s /tmp/ss-rust.tar.xz ]; then
-        echo -e "${RED}❌ 下载失败${NC}"
+    # 多镜像尝试下载
+    DOWNLOADED=0
+    for PREFIX in "" "https://gh.api.99988866.xyz/" "https://ghproxy.net/" "https://mirror.ghproxy.com/"; do
+        TRY_URL="${PREFIX}${URL}"
+        echo "下载中: $TRY_URL"
+        wget --timeout=30 -O /tmp/ss-rust.tar.xz "$TRY_URL" 2>/dev/null
+        if [ $? -eq 0 ] && [ -s /tmp/ss-rust.tar.xz ]; then
+            DOWNLOADED=1
+            break
+        fi
+    done
+
+    if [ "$DOWNLOADED" -ne 1 ]; then
+        echo -e "${RED}❌ 下载失败（所有镜像均不可用）${NC}"
         return 1
     fi
 
-    tar -xJf /tmp/ss-rust.tar.xz -C /tmp/
+    if ! tar -xJf /tmp/ss-rust.tar.xz -C /tmp/ 2>/dev/null; then
+        echo -e "${RED}❌ 解压失败，请确认已安装 xz${NC}"
+        return 1
+    fi
+
+    if [ ! -f /tmp/ssserver ]; then
+        echo -e "${RED}❌ 解压后未找到 ssserver${NC}"
+        return 1
+    fi
+
     mv /tmp/ssserver $SS_BIN
     chmod +x $SS_BIN
     mkdir -p /etc/shadowsocks-rust
+    rm -f /tmp/ss-rust.tar.xz /tmp/sslocal /tmp/ssmanager /tmp/ssservice /tmp/ssurl 2>/dev/null
 
     echo -e "${GREEN}✅ ss-rust $LATEST 安装完成${NC}"
 }
@@ -583,8 +636,13 @@ for s in c['servers']:
 
     # 持久化 iptables 规则
     if [ "$SYSTEM" = "alpine" ]; then
-        /etc/init.d/iptables save 2>/dev/null || iptables-save > /etc/iptables/rules-save 2>/dev/null
+        # 确保 iptables 服务已安装
+        if [ ! -f /etc/init.d/iptables ]; then
+            apk add --no-cache iptables >/dev/null 2>&1
+        fi
+        mkdir -p /etc/iptables
         rc-update add iptables default 2>/dev/null
+        /etc/init.d/iptables save 2>/dev/null || iptables-save > /etc/iptables/rules-save 2>/dev/null
     else
         netfilter-persistent save 2>/dev/null
     fi
