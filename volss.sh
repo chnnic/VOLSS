@@ -2,7 +2,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.4.6
+#   版本: V1.5.0
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -29,7 +29,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.4.6"
+VERSION="V1.5.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -94,7 +94,7 @@ svc_disable() {
     if [ "$SYSTEM" = "alpine" ]; then
         rc-update del shadowsocks-rust default 2>/dev/null
     else
-        systemctl disable shadowsocks-rust 2>/dev/null
+        svc_disable
     fi
 }
 svc_reload() {
@@ -147,9 +147,10 @@ valid_port() {
     is_uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
 }
 
+# 只清零指定端口的 iptables 计数器（精确匹配，不影响其他统计）
 zero_traffic_counters_for_ports() {
     local PORTS="$1"
-    local CHAIN L PORT
+    local CHAIN L PORT LINES
     for CHAIN in INPUT OUTPUT; do
         for PORT in $PORTS; do
             LINES=$(iptables -nvL "$CHAIN" --line-numbers 2>/dev/null | awk -v p="$PORT" '$0 ~ ("dpt:"p"( |$)") || $0 ~ ("spt:"p"( |$)") {print $1}' | sort -rn)
@@ -362,8 +363,8 @@ install_ssrust() {
         return 1
     fi
 
-    mv /tmp/ssserver "$SS_BIN"
-    chmod +x "$SS_BIN"
+    mv /tmp/ssserver $SS_BIN
+    chmod +x $SS_BIN
     mkdir -p /etc/shadowsocks-rust
     rm -f /tmp/ss-rust.tar.xz /tmp/sslocal /tmp/ssmanager /tmp/ssservice /tmp/ssurl 2>/dev/null
 
@@ -397,26 +398,14 @@ select_ports() {
     echo "  2) 随机端口（在指定范围内随机分配）"
     read -p "请选择 [1-2，默认1]: " PORT_MODE
     PORT_MODE=${PORT_MODE:-1}
-    if [ "$PORT_MODE" != "1" ] && [ "$PORT_MODE" != "2" ]; then
-        echo -e "${YELLOW}⚠ 输入无效，已使用默认顺序端口模式${NC}"
-        PORT_MODE=1
-    fi
 
     read -p "生成用户数量 [默认 10，最多 50]: " USER_COUNT
     USER_COUNT=${USER_COUNT:-10}
-    if ! is_uint "$USER_COUNT" || [ "$USER_COUNT" -lt 1 ]; then
-        echo -e "${RED}❌ 用户数量必须是 1-50 的整数${NC}"
-        return 1
-    fi
     [ "$USER_COUNT" -gt 50 ] && USER_COUNT=50
 
     if [ "$PORT_MODE" = "1" ]; then
         read -p "起始端口 [默认 30001]: " START_PORT
         START_PORT=${START_PORT:-30001}
-        if ! valid_port "$START_PORT"; then
-            echo -e "${RED}❌ 起始端口必须是 1-65535 的整数${NC}"
-            return 1
-        fi
 
         echo -e "\n${YELLOW}>>> 正在分配端口（跳过已占用）...${NC}"
         PORT_LIST=()
@@ -440,20 +429,11 @@ select_ports() {
         read -p "端口范围结束 [默认 60000]: " RANGE_END
         RANGE_START=${RANGE_START:-20000}
         RANGE_END=${RANGE_END:-60000}
-        if ! valid_port "$RANGE_START" || ! valid_port "$RANGE_END" || [ "$RANGE_START" -gt "$RANGE_END" ]; then
-            echo -e "${RED}❌ 端口范围必须是 1-65535，且起始端口不能大于结束端口${NC}"
-            return 1
-        fi
-        RANGE_SIZE=$(( RANGE_END - RANGE_START + 1 ))
-        if [ "$USER_COUNT" -gt "$RANGE_SIZE" ]; then
-            echo -e "${RED}❌ 用户数量超过端口范围大小${NC}"
-            return 1
-        fi
 
         echo -e "\n${YELLOW}>>> 正在随机分配端口（跳过已占用）...${NC}"
         PORT_LIST=()
         TRIED=0
-        MAX_TRY=$(( RANGE_SIZE * 3 + USER_COUNT * 10 ))
+        MAX_TRY=$(( RANGE_END - RANGE_START ))
 
         while [ ${#PORT_LIST[@]} -lt $USER_COUNT ]; do
             RAND_PORT=$(( RANGE_START + RANDOM % (RANGE_END - RANGE_START + 1) ))
@@ -795,7 +775,7 @@ except: pass
 
     svc_stop 2>/dev/null
     svc_disable
-    rm -f "$SS_BIN" "$SERVICE" "$SHORTCUT" "$SCRIPT_INSTALL_PATH" "${SCRIPT_INSTALL_PATH}.bak"
+    rm -f $SS_BIN $SERVICE $SHORTCUT $SCRIPT_INSTALL_PATH ${SCRIPT_INSTALL_PATH}.bak
     rm -rf /etc/shadowsocks-rust
     svc_reload
 
@@ -832,7 +812,7 @@ show_links() {
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    SS 链接列表${NC}"
     echo -e "${BLUE}  =================================================${NC}"
-    cat "$LINKS_FILE"
+    cat $LINKS_FILE
     echo -e "  ${BLUE}=================================================${NC}"
     echo -e "  链接已保存至: ${YELLOW}$LINKS_FILE${NC}"
 }
@@ -856,17 +836,20 @@ else:
     history = {}
 
 def get_bytes(chain, port, direction):
+    import re
     try:
         out = subprocess.check_output(['iptables', '-nvxL', chain], text=True)
         total = 0
+        # 精确匹配 spt:PORT / dpt:PORT 后接非数字或行尾，避免 3000 误匹配 30001
+        pat = re.compile(r'\b%s:%d(?:\D|$)' % ('spt' if direction == 'sport' else 'dpt', port))
         for line in out.splitlines():
-            if str(port) in line:
+            if pat.search(line):
                 parts = line.split()
-                if len(parts) >= 10:
-                    if direction == 'sport' and f'spt:{port}' in line:
+                if len(parts) >= 2:
+                    try:
                         total += int(parts[1])
-                    elif direction == 'dport' and f'dpt:{port}' in line:
-                        total += int(parts[1])
+                    except ValueError:
+                        pass
         return total
     except:
         return 0
@@ -885,14 +868,16 @@ with open(traffic_file, 'w') as f:
     json.dump(history, f, indent=2)
 
 # 关键：读取后只清零本脚本管理端口的计数器，避免影响其他 iptables 统计
+import re
 for s in c['servers']:
-    port = str(s['server_port'])
+    port = s['server_port']
     for chain in ('INPUT', 'OUTPUT'):
         try:
             out = subprocess.check_output(['iptables', '-nvL', chain, '--line-numbers'], text=True)
+            pat = re.compile(r'\b[sd]pt:%d(?:\D|$)' % port)
             lines = []
             for line in out.splitlines():
-                if f'dpt:{port}' in line or f'spt:{port}' in line:
+                if pat.search(line):
                     parts = line.split()
                     if parts and parts[0].isdigit():
                         lines.append(int(parts[0]))
@@ -989,7 +974,7 @@ if 0 <= idx < len(ports):
     # 先把当前所有端口的增量保存到文件，再清零该端口
     save_traffic
 
-    # 单独清零该端口的 iptables 规则计数
+    # 单独清零该端口的 iptables 规则计数（精确匹配）
     zero_traffic_counters_for_ports "$PORT"
 
     # 写入该端口归零
@@ -1152,18 +1137,192 @@ print(' '.join(str(s['server_port']) for s in c['servers']))
     show_links
 }
 
+# ========== 添加新用户 ==========
+rebuild_links() {
+    # 根据 config.json 重建所有 SS 链接（保持端口顺序，序号重排）
+    METHOD=$(python3 -c "
+import json
+with open('$CONFIG') as f:
+    c = json.load(f)
+print(c['servers'][0]['method'] if c['servers'] else '')
+")
+    # 获取服务器地址
+    if [ -f "$LINKS_FILE" ] && [ -s "$LINKS_FILE" ]; then
+        HOST=$(head -1 "$LINKS_FILE" | sed 's/.*@//; s/:.*//; s/#.*//')
+    fi
+    [ -z "$HOST" ] && basic_config
+
+    : > $LINKS_FILE
+    python3 << PYEOF
+import json, base64
+with open('$CONFIG') as f:
+    c = json.load(f)
+lines = []
+for i, s in enumerate(c['servers'], 1):
+    userinfo = base64.b64encode(f"{s['method']}:{s['password']}".encode()).decode()
+    lines.append(f"ss://{userinfo}@{'$HOST'}:{s['server_port']}#用户{i}")
+with open('$LINKS_FILE', 'w') as f:
+    f.write('\n'.join(lines) + '\n')
+PYEOF
+}
+
+add_user() {
+    if ! check_installed; then
+        echo -e "${RED}请先安装 Shadowsocks-Rust${NC}"; return
+    fi
+
+    # 沿用现有加密方式
+    METHOD=$(python3 -c "
+import json
+with open('$CONFIG') as f:
+    c = json.load(f)
+print(c['servers'][0]['method'] if c['servers'] else '2022-blake3-aes-128-gcm')
+")
+    case $METHOD in
+        *aes-128*)  KEY_LEN=16 ;;
+        *aes-256*|*chacha20*) KEY_LEN=32 ;;
+        *) KEY_LEN=0 ;;
+    esac
+    echo -e "${YELLOW}>>> 添加新用户（加密方式: ${GREEN}$METHOD${YELLOW}）${NC}"
+
+    read -p "新增用户数量 [默认 1]: " ADD_COUNT
+    ADD_COUNT=${ADD_COUNT:-1}
+    if ! is_uint "$ADD_COUNT" || [ "$ADD_COUNT" -lt 1 ]; then
+        echo -e "${RED}❌ 数量必须是正整数${NC}"; return
+    fi
+
+    echo -e "\n  1) 自动分配端口（从现有最大端口+1 顺延，跳过占用）"
+    echo -e "  2) 手动指定端口"
+    read -p "请选择 [1-2，默认1]: " ADD_MODE
+    ADD_MODE=${ADD_MODE:-1}
+
+    # 现有端口列表（用于查重）
+    EXIST_PORTS=$(python3 -c "
+import json
+with open('$CONFIG') as f:
+    c = json.load(f)
+print(' '.join(str(s['server_port']) for s in c['servers']))
+")
+
+    NEW_PORTS=()
+    if [ "$ADD_MODE" = "2" ]; then
+        # 手动指定
+        COUNT=0
+        while [ $COUNT -lt $ADD_COUNT ]; do
+            read -p "输入第 $((COUNT+1)) 个端口: " P
+            if ! valid_port "$P"; then
+                echo -e "${RED}  端口无效${NC}"; continue
+            fi
+            if echo "$EXIST_PORTS ${NEW_PORTS[*]}" | grep -qw "$P"; then
+                echo -e "${YELLOW}  端口 $P 已存在${NC}"; continue
+            fi
+            if port_in_use "$P"; then
+                echo -e "${YELLOW}  端口 $P 已被占用${NC}"; continue
+            fi
+            NEW_PORTS+=("$P")
+            COUNT=$((COUNT+1))
+        done
+    else
+        # 自动顺延
+        MAX_PORT=$(echo "$EXIST_PORTS" | tr ' ' '\n' | sort -n | tail -1)
+        [ -z "$MAX_PORT" ] && MAX_PORT=30000
+        CURRENT=$((MAX_PORT + 1))
+        while [ ${#NEW_PORTS[@]} -lt $ADD_COUNT ]; do
+            if echo "$EXIST_PORTS ${NEW_PORTS[*]}" | grep -qw "$CURRENT"; then
+                CURRENT=$((CURRENT+1)); continue
+            fi
+            if port_in_use "$CURRENT"; then
+                echo -e "  ${YELLOW}端口 $CURRENT 已占用，跳过${NC}"
+            else
+                NEW_PORTS+=("$CURRENT")
+                echo -e "  ${GREEN}端口 $CURRENT 可用 ✓${NC}"
+            fi
+            CURRENT=$((CURRENT+1))
+            if [ $CURRENT -gt 65535 ]; then
+                echo -e "${RED}❌ 端口耗尽${NC}"; return
+            fi
+        done
+    fi
+
+    # 追加到 config.json
+    NEW_PORTS_STR="${NEW_PORTS[*]}"
+    python3 << PYEOF
+import json, os, base64, subprocess
+
+with open('$CONFIG') as f:
+    c = json.load(f)
+
+method = '$METHOD'
+key_len = $KEY_LEN
+new_ports = "$NEW_PORTS_STR".split()
+
+def gen_pass():
+    raw = subprocess.check_output(['openssl', 'rand', '-base64', str(key_len if key_len > 0 else 32)], text=True).strip()
+    if key_len > 0:
+        return raw
+    return raw.replace('=', '')[:24]
+
+for p in new_ports:
+    c['servers'].append({
+        'server': '::',
+        'server_port': int(p),
+        'password': gen_pass(),
+        'method': method,
+        'mode': 'tcp_and_udp'
+    })
+
+with open('$CONFIG', 'w') as f:
+    json.dump(c, f, indent=2)
+print(f"✅ 已添加 {len(new_ports)} 个新用户")
+PYEOF
+
+    # 为新端口添加 iptables 统计规则
+    for PORT in "${NEW_PORTS[@]}"; do
+        for PROTO in tcp udp; do
+            while iptables -D INPUT  -p $PROTO --dport $PORT 2>/dev/null; do :; done
+            while iptables -D OUTPUT -p $PROTO --sport $PORT 2>/dev/null; do :; done
+            iptables -I INPUT  1 -p $PROTO --dport $PORT
+            iptables -I OUTPUT 1 -p $PROTO --sport $PORT
+        done
+    done
+    zero_traffic_counters_for_ports "$NEW_PORTS_STR"
+
+    # 持久化 iptables
+    if [ "$SYSTEM" = "alpine" ]; then
+        /etc/init.d/iptables save 2>/dev/null || iptables-save > /etc/iptables/rules-save 2>/dev/null
+    else
+        netfilter-persistent save 2>/dev/null
+    fi
+
+    rebuild_links
+    apply_config
+    show_links
+    echo -e "${GREEN}✅ 新用户添加完成${NC}"
+}
+
 # ========== 更新脚本 ==========
 do_update() {
-    REMOTE_URL="https://raw.githubusercontent.com/chnnic/VOLSS/refs/heads/main/volss.sh"
+    REMOTE_PATH="chnnic/VOLSS/refs/heads/main/volss.sh"
+    REMOTE_URL="https://raw.githubusercontent.com/$REMOTE_PATH"
     TMP_NEW="/tmp/volss_new.sh"
 
     echo -e "\n${YELLOW}>>> 检查更新...${NC}"
-    echo -e "远程地址: ${BLUE}$REMOTE_URL${NC}"
 
-    # 下载新版本
-    wget -q -O $TMP_NEW "$REMOTE_URL"
-    if [ $? -ne 0 ] || [ ! -s $TMP_NEW ]; then
+    # 下载新版本（多镜像尝试）
+    DL_OK=0
+    for BASE in "https://raw.githubusercontent.com" \
+                "https://raw.gitmirror.com" \
+                "https://gh.api.99988866.xyz/https://raw.githubusercontent.com"; do
+        wget -q --timeout=20 -O $TMP_NEW "$BASE/$REMOTE_PATH" 2>/dev/null
+        if [ $? -eq 0 ] && [ -s $TMP_NEW ] && head -1 $TMP_NEW | grep -q '#!/'; then
+            DL_OK=1
+            break
+        fi
+    done
+
+    if [ "$DL_OK" -ne 1 ]; then
         echo -e "${RED}❌ 下载失败，请检查网络或 GitHub 地址${NC}"
+        rm -f $TMP_NEW
         return 1
     fi
 
@@ -1253,14 +1412,14 @@ PYEOF
 
         # 修复旧版 ACL 格式（domain-suffix: → ||，移除无效头部）
         if [ -f "$ACL_PATH" ]; then
-            sed -i 's/^domain-suffix:/||/' "$ACL_PATH"
-            sed -i '/^\[bypass_list\]$/d' "$ACL_PATH"
-            sed -i '/^\[accept_all\]$/d' "$ACL_PATH"
-            sed -i '/^\[proxy_list\]$/d' "$ACL_PATH"
-            sed -i '/^$/d' "$ACL_PATH"
+            sed -i 's/^domain-suffix:/||/' $ACL_PATH
+            sed -i '/^\[bypass_list\]$/d' $ACL_PATH
+            sed -i '/^\[accept_all\]$/d' $ACL_PATH
+            sed -i '/^\[proxy_list\]$/d' $ACL_PATH
+            sed -i '/^$/d' $ACL_PATH
             # 确保文件以 [outbound_block_list] 开头
-            if ! grep -q "^\[outbound_block_list\]" "$ACL_PATH"; then
-                sed -i '1i [outbound_block_list]' "$ACL_PATH"
+            if ! grep -q "^\[outbound_block_list\]" $ACL_PATH; then
+                sed -i '1i [outbound_block_list]' $ACL_PATH
             fi
             echo -e "${GREEN}✅ ACL 格式已自动修复${NC}"
         fi
@@ -1488,10 +1647,12 @@ manage_rulesets() {
                 STATUS="${RED}○ 未安装${NC}"
             fi
             # 中文字符占2列宽，手动补空格对齐
+            # 用字节数和字符数的差值计算中文字符数（UTF-8 中文占3字节，差值/2=中文数）
             DESC_LEN=${#DESC}
-            # 每个中文字符多占1列，计算需要补的空格数
-            CN_CHARS=$(echo "$DESC" | grep -oP '[\x{4e00}-\x{9fff}]' | wc -l)
+            DESC_BYTES=$(printf '%s' "$DESC" | wc -c)
+            CN_CHARS=$(( (DESC_BYTES - DESC_LEN) / 2 ))
             PAD=$((10 - DESC_LEN - CN_CHARS))
+            [ "$PAD" -lt 0 ] && PAD=0
             SPACES=$(printf '%*s' "$PAD" '')
             printf "  \033[0;32m%2d)\033[0m %-12s %s%s %b\n" "$i" "$KEY" "$DESC" "$SPACES" "$STATUS"
             i=$((i+1))
@@ -1589,8 +1750,7 @@ manage_rulesets() {
                         COUNT=$(wc -l < "$RULESET_FILE")
                         printf "  %-15s %s 条\n" "$NAME" "$COUNT"
                     done
-                    MANUAL=0
-                    [ -f "$MANUAL_FILE" ] && MANUAL=$(grep -c "." "$MANUAL_FILE" 2>/dev/null || echo 0)
+                    MANUAL=$(grep "^||.*#manual" "$ACL_PATH" 2>/dev/null | wc -l)
                     [ "$MANUAL" -gt 0 ] && printf "  %-15s %s 条\n" "手动添加" "$MANUAL"
                 else
                     echo -e "  未配置 ACL"
@@ -1646,32 +1806,33 @@ show_main_menu() {
         echo -e "  ${CYAN}  -- 用户管理 --${NC}"
         echo -e "      4)  查看用户列表"
         echo -e "      5)  查看所有 SS 链接"
-        echo -e "      6)  暂停某个用户"
-        echo -e "      7)  恢复某个用户"
-        echo -e "      8)  删除某个用户"
-        echo -e "      9)  重新生成所有用户"
+        echo -e "      6)  添加新用户"
+        echo -e "      7)  暂停某个用户"
+        echo -e "      8)  恢复某个用户"
+        echo -e "      9)  删除某个用户"
+        echo -e "     10)  重新生成所有用户"
         echo -e "  ${CYAN}  -- 流量统计 --${NC}"
-        echo -e "     10)  查看流量统计"
-        echo -e "     11)  重置流量统计"
+        echo -e "     11)  查看流量统计"
+        echo -e "     12)  重置流量统计"
         echo -e "  ${CYAN}  -- ACL 黑名单 --${NC}"
-        echo -e "     12)  手动添加屏蔽域名"
-        echo -e "     13)  手动删除屏蔽域名"
-        echo -e "     14)  查看黑名单列表"
-        echo -e "     15)  规则集管理（广告/色情/赌博/BT等）"
+        echo -e "     13)  手动添加屏蔽域名"
+        echo -e "     14)  手动删除屏蔽域名"
+        echo -e "     15)  查看黑名单列表"
+        echo -e "     16)  规则集管理（广告/色情/赌博/BT等）"
         echo -e "  ${CYAN}  -- 服务管理 --${NC}"
-        echo -e "     16)  查看服务状态"
-        echo -e "     17)  启动服务"
-        echo -e "     18)  停止服务"
-        echo -e "     19)  重启服务"
-        echo -e "     20)  查看实时日志"
-        echo -e "     21)  时间同步"
+        echo -e "     17)  查看服务状态"
+        echo -e "     18)  启动服务"
+        echo -e "     19)  停止服务"
+        echo -e "     20)  重启服务"
+        echo -e "     21)  查看实时日志"
+        echo -e "     22)  时间同步"
         echo -e "  ${BLUE}-------------------------------------------------${NC}"
         echo -e "   ${RED}  0)  退出${NC}"
         echo -e "  ${BLUE}=================================================${NC}"
-        read -p "  请选择 [0-21]: " CHOICE
+        read -p "  请选择 [0-22]: " CHOICE
 
         # 未安装时拦截管理功能
-        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|20)$ ]]; then
+        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|2[0-2])$ ]]; then
             echo -e "${RED}⚠ 请先安装 Shadowsocks-Rust（选项 1）${NC}"
             sleep 2
             continue
@@ -1683,15 +1844,16 @@ show_main_menu() {
             3)  do_update ;;
             4)  list_users;    read -p "按回车继续..." ;;
             5)  show_links;    read -p "按回车继续..." ;;
-            6)  disable_user;  read -p "按回车继续..." ;;
-            7)  enable_user;   read -p "按回车继续..." ;;
-            8)  delete_user;   read -p "按回车继续..." ;;
-            9)  regen_users;   read -p "按回车继续..." ;;
-            10) show_traffic;  read -p "按回车继续..." ;;
-            11) reset_traffic; read -p "按回车继续..." ;;
-            12) add_acl_domain; read -p "按回车继续..." ;;
-            13) del_acl_domain; read -p "按回车继续..." ;;
-            14)
+            6)  add_user;      read -p "按回车继续..." ;;
+            7)  disable_user;  read -p "按回车继续..." ;;
+            8)  enable_user;   read -p "按回车继续..." ;;
+            9)  delete_user;   read -p "按回车继续..." ;;
+            10) regen_users;   read -p "按回车继续..." ;;
+            11) show_traffic;  read -p "按回车继续..." ;;
+            12) reset_traffic; read -p "按回车继续..." ;;
+            13) add_acl_domain; read -p "按回车继续..." ;;
+            14) del_acl_domain; read -p "按回车继续..." ;;
+            15)
                 echo -e "\n${BLUE}  =================================================${NC}"
                 echo -e "${BLUE}    ACL 黑名单${NC}"
                 echo -e "${BLUE}  =================================================${NC}"
@@ -1721,26 +1883,26 @@ show_main_menu() {
                             [ -f "$f" ] || continue
                             NAME=$(basename "$f" .acl)
                             COUNT=$(wc -l < "$f")
-                            echo -e "  ${GREEN}●${NC} $NAME ($COUNT 条)  ${YELLOW}[查看详情请进入选项 15]${NC}"
+                            echo -e "  ${GREEN}●${NC} $NAME ($COUNT 条)  ${YELLOW}[查看详情请进入选项 16]${NC}"
                             FOUND=1
                         done
                     fi
-                    [ "$FOUND" -eq 0 ] && echo "  （未安装任何规则集，请选择选项 15 安装）"
+                    [ "$FOUND" -eq 0 ] && echo "  （未安装任何规则集，请选择选项 16 安装）"
                 else
                     echo "  未配置 ACL"
                 fi
                 read -p "按回车继续..."
                 ;;
-            15) manage_rulesets ;;
-            16) svc_status; read -p "按回车继续..." ;;
-            17) svc_start   && echo -e "${GREEN}✅ 服务已启动${NC}"; read -p "按回车继续..." ;;
-            18) svc_stop    && echo -e "${YELLOW}⏹ 服务已停止${NC}"; read -p "按回车继续..." ;;
-            19) svc_restart && echo -e "${GREEN}🔄 服务已重启${NC}"; read -p "按回车继续..." ;;
-            20)
+            16) manage_rulesets ;;
+            17) svc_status; read -p "按回车继续..." ;;
+            18) svc_start   && echo -e "${GREEN}✅ 服务已启动${NC}"; read -p "按回车继续..." ;;
+            19) svc_stop    && echo -e "${YELLOW}⏹ 服务已停止${NC}"; read -p "按回车继续..." ;;
+            20) svc_restart && echo -e "${GREEN}🔄 服务已重启${NC}"; read -p "按回车继续..." ;;
+            21)
                 echo -e "${YELLOW}按 Ctrl+C 退出日志${NC}"
                 svc_log
                 ;;
-            21)
+            22)
                 do_time_sync
                 # 刷新时间差缓存
                 TIME_DIFF=$(get_time_diff)
@@ -1785,13 +1947,13 @@ EOF
         grep -q "^\[bypass_list\]" "$ACL_PATH" && NEED_FIX=1
         grep -q "^domain-suffix:" "$ACL_PATH" && NEED_FIX=1
         if [ "$NEED_FIX" -eq 1 ]; then
-            sed -i 's/^domain-suffix:/||/' "$ACL_PATH"
-            sed -i '/^\[bypass_list\]$/d' "$ACL_PATH"
-            sed -i '/^\[accept_all\]$/d' "$ACL_PATH"
-            sed -i '/^\[proxy_list\]$/d' "$ACL_PATH"
-            sed -i '/^$/d' "$ACL_PATH"
-            if ! grep -q "^\[outbound_block_list\]" "$ACL_PATH"; then
-                sed -i '1i [outbound_block_list]' "$ACL_PATH"
+            sed -i 's/^domain-suffix:/||/' $ACL_PATH
+            sed -i '/^\[bypass_list\]$/d' $ACL_PATH
+            sed -i '/^\[accept_all\]$/d' $ACL_PATH
+            sed -i '/^\[proxy_list\]$/d' $ACL_PATH
+            sed -i '/^$/d' $ACL_PATH
+            if ! grep -q "^\[outbound_block_list\]" $ACL_PATH; then
+                sed -i '1i [outbound_block_list]' $ACL_PATH
             fi
             svc_restart 2>/dev/null
             echo -e "${GREEN}✅ ACL 格式已自动修复并重启服务${NC}"
