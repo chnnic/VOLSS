@@ -2,7 +2,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.5.0
+#   版本: V1.5.1
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -29,7 +29,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.5.0"
+VERSION="V1.5.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -94,7 +94,7 @@ svc_disable() {
     if [ "$SYSTEM" = "alpine" ]; then
         rc-update del shadowsocks-rust default 2>/dev/null
     else
-        svc_disable
+        systemctl disable shadowsocks-rust 2>/dev/null
     fi
 }
 svc_reload() {
@@ -145,6 +145,14 @@ is_uint() {
 
 valid_port() {
     is_uint "$1" && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
+}
+
+valid_ruleset_name() {
+    [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+third_party_mirrors_enabled() {
+    [ "${VOLSS_ALLOW_THIRD_PARTY_MIRRORS:-0}" = "1" ]
 }
 
 # 只清零指定端口的 iptables 计数器（精确匹配，不影响其他统计）
@@ -335,38 +343,50 @@ install_ssrust() {
     fi
 
     URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${LATEST}/shadowsocks-${LATEST}.${ARCH_NAME}.tar.xz"
+    TMP_DIR=$(mktemp -d /tmp/volss.XXXXXX) || {
+        echo -e "${RED}❌ 创建临时目录失败${NC}"
+        return 1
+    }
+    TMP_TAR="$TMP_DIR/ss-rust.tar.xz"
 
-    # 多镜像尝试下载
+    # 默认只使用官方源；如确需第三方镜像，可显式设置 VOLSS_ALLOW_THIRD_PARTY_MIRRORS=1
+    DOWNLOAD_PREFIXES=("")
+    if third_party_mirrors_enabled; then
+        DOWNLOAD_PREFIXES+=("https://gh.api.99988866.xyz/" "https://ghproxy.net/" "https://mirror.ghproxy.com/")
+    fi
     DOWNLOADED=0
-    for PREFIX in "" "https://gh.api.99988866.xyz/" "https://ghproxy.net/" "https://mirror.ghproxy.com/"; do
+    for PREFIX in "${DOWNLOAD_PREFIXES[@]}"; do
         TRY_URL="${PREFIX}${URL}"
         echo "下载中: $TRY_URL"
-        wget --timeout=30 -O /tmp/ss-rust.tar.xz "$TRY_URL" 2>/dev/null
-        if [ $? -eq 0 ] && [ -s /tmp/ss-rust.tar.xz ]; then
+        wget --timeout=30 -O "$TMP_TAR" "$TRY_URL" 2>/dev/null
+        if [ $? -eq 0 ] && [ -s "$TMP_TAR" ]; then
             DOWNLOADED=1
             break
         fi
     done
 
     if [ "$DOWNLOADED" -ne 1 ]; then
-        echo -e "${RED}❌ 下载失败（所有镜像均不可用）${NC}"
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ 下载失败${NC}"
         return 1
     fi
 
-    if ! tar -xJf /tmp/ss-rust.tar.xz -C /tmp/ 2>/dev/null; then
+    if ! tar -xJf "$TMP_TAR" -C "$TMP_DIR" 2>/dev/null; then
+        rm -rf "$TMP_DIR"
         echo -e "${RED}❌ 解压失败，请确认已安装 xz${NC}"
         return 1
     fi
 
-    if [ ! -f /tmp/ssserver ]; then
+    if [ ! -f "$TMP_DIR/ssserver" ]; then
+        rm -rf "$TMP_DIR"
         echo -e "${RED}❌ 解压后未找到 ssserver${NC}"
         return 1
     fi
 
-    mv /tmp/ssserver $SS_BIN
+    mv "$TMP_DIR/ssserver" "$SS_BIN"
     chmod +x $SS_BIN
     mkdir -p /etc/shadowsocks-rust
-    rm -f /tmp/ss-rust.tar.xz /tmp/sslocal /tmp/ssmanager /tmp/ssservice /tmp/ssurl 2>/dev/null
+    rm -rf "$TMP_DIR"
 
     echo -e "${GREEN}✅ ss-rust $LATEST 安装完成${NC}"
 }
@@ -401,11 +421,19 @@ select_ports() {
 
     read -p "生成用户数量 [默认 10，最多 50]: " USER_COUNT
     USER_COUNT=${USER_COUNT:-10}
+    if ! is_uint "$USER_COUNT" || [ "$USER_COUNT" -lt 1 ]; then
+        echo -e "${RED}❌ 用户数量必须是正整数${NC}"
+        return 1
+    fi
     [ "$USER_COUNT" -gt 50 ] && USER_COUNT=50
 
     if [ "$PORT_MODE" = "1" ]; then
         read -p "起始端口 [默认 30001]: " START_PORT
         START_PORT=${START_PORT:-30001}
+        if ! valid_port "$START_PORT"; then
+            echo -e "${RED}❌ 起始端口无效${NC}"
+            return 1
+        fi
 
         echo -e "\n${YELLOW}>>> 正在分配端口（跳过已占用）...${NC}"
         PORT_LIST=()
@@ -429,6 +457,14 @@ select_ports() {
         read -p "端口范围结束 [默认 60000]: " RANGE_END
         RANGE_START=${RANGE_START:-20000}
         RANGE_END=${RANGE_END:-60000}
+        if ! valid_port "$RANGE_START" || ! valid_port "$RANGE_END" || [ "$RANGE_END" -lt "$RANGE_START" ]; then
+            echo -e "${RED}❌ 端口范围无效${NC}"
+            return 1
+        fi
+        if [ $((RANGE_END - RANGE_START + 1)) -lt "$USER_COUNT" ]; then
+            echo -e "${RED}❌ 端口范围小于用户数量${NC}"
+            return 1
+        fi
 
         echo -e "\n${YELLOW}>>> 正在随机分配端口（跳过已占用）...${NC}"
         PORT_LIST=()
@@ -1304,17 +1340,23 @@ PYEOF
 do_update() {
     REMOTE_PATH="chnnic/VOLSS/refs/heads/main/volss.sh"
     REMOTE_URL="https://raw.githubusercontent.com/$REMOTE_PATH"
-    TMP_NEW="/tmp/volss_new.sh"
+    TMP_DIR=$(mktemp -d /tmp/volss-update.XXXXXX) || {
+        echo -e "${RED}❌ 创建临时目录失败${NC}"
+        return 1
+    }
+    TMP_NEW="$TMP_DIR/volss_new.sh"
 
     echo -e "\n${YELLOW}>>> 检查更新...${NC}"
 
-    # 下载新版本（多镜像尝试）
+    # 默认只使用官方源；如确需第三方镜像，可显式设置 VOLSS_ALLOW_THIRD_PARTY_MIRRORS=1
+    UPDATE_BASES=("https://raw.githubusercontent.com")
+    if third_party_mirrors_enabled; then
+        UPDATE_BASES+=("https://raw.gitmirror.com" "https://gh.api.99988866.xyz/https://raw.githubusercontent.com")
+    fi
     DL_OK=0
-    for BASE in "https://raw.githubusercontent.com" \
-                "https://raw.gitmirror.com" \
-                "https://gh.api.99988866.xyz/https://raw.githubusercontent.com"; do
-        wget -q --timeout=20 -O $TMP_NEW "$BASE/$REMOTE_PATH" 2>/dev/null
-        if [ $? -eq 0 ] && [ -s $TMP_NEW ] && head -1 $TMP_NEW | grep -q '#!/'; then
+    for BASE in "${UPDATE_BASES[@]}"; do
+        wget -q --timeout=20 -O "$TMP_NEW" "$BASE/$REMOTE_PATH" 2>/dev/null
+        if [ $? -eq 0 ] && [ -s "$TMP_NEW" ] && head -1 "$TMP_NEW" | grep -q '#!/'; then
             DL_OK=1
             break
         fi
@@ -1322,12 +1364,12 @@ do_update() {
 
     if [ "$DL_OK" -ne 1 ]; then
         echo -e "${RED}❌ 下载失败，请检查网络或 GitHub 地址${NC}"
-        rm -f $TMP_NEW
+        rm -rf "$TMP_DIR"
         return 1
     fi
 
     # 获取远程版本号
-    REMOTE_VER=$(grep '^VERSION=' $TMP_NEW | cut -d'"' -f2)
+    REMOTE_VER=$(grep '^VERSION=' "$TMP_NEW" | cut -d'"' -f2)
     LOCAL_VER=$VERSION
 
     echo -e "本地版本: ${YELLOW}$LOCAL_VER${NC}"
@@ -1335,13 +1377,13 @@ do_update() {
 
     if [ "$REMOTE_VER" = "$LOCAL_VER" ]; then
         echo -e "${GREEN}✅ 已是最新版本，无需更新${NC}"
-        rm -f $TMP_NEW
+        rm -rf "$TMP_DIR"
         return 0
     fi
 
     read -p "发现新版本 $REMOTE_VER，确认更新？[y/N]: " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
-        rm -f $TMP_NEW
+        rm -rf "$TMP_DIR"
         return
     fi
 
@@ -1350,8 +1392,9 @@ do_update() {
     echo -e "已备份当前脚本至: ${YELLOW}${SCRIPT_INSTALL_PATH}.bak${NC}"
 
     # 替换脚本到固定路径
-    mv $TMP_NEW $SCRIPT_INSTALL_PATH
+    mv "$TMP_NEW" $SCRIPT_INSTALL_PATH
     chmod +x $SCRIPT_INSTALL_PATH
+    rm -rf "$TMP_DIR"
 
     # 更新快捷命令（仅当是 volss 自己的快捷命令时才更新）
     if [ ! -f "$SHORTCUT" ] || grep -q "volss" "$SHORTCUT" 2>/dev/null; then
@@ -1548,12 +1591,14 @@ RULESET_URLS=(
 )
 
 # GitHub 镜像列表，下载失败时自动切换
-GITHUB_MIRRORS=(
-    "https://raw.githubusercontent.com"
-    "https://raw.gitmirror.com"
-    "https://raw.fastgit.org"
-    "https://gh.api.99988866.xyz/https://raw.githubusercontent.com"
-)
+GITHUB_MIRRORS=("https://raw.githubusercontent.com")
+if third_party_mirrors_enabled; then
+    GITHUB_MIRRORS+=(
+        "https://raw.gitmirror.com"
+        "https://raw.fastgit.org"
+        "https://gh.api.99988866.xyz/https://raw.githubusercontent.com"
+    )
+fi
 
 # 初始化规则集目录
 init_ruleset_dir() {
@@ -1572,7 +1617,16 @@ mirror_url() {
 download_ruleset() {
     local NAME=$1
     local URL=$2
-    local TMP="/tmp/ruleset_${NAME}.tmp"
+    if ! valid_ruleset_name "$NAME"; then
+        echo -e "  ${RED}❌ 规则集名称只能包含英文、数字、下划线和中划线${NC}"
+        return 1
+    fi
+    local TMP_DIR
+    TMP_DIR=$(mktemp -d /tmp/volss-ruleset.XXXXXX) || {
+        echo -e "  ${RED}❌ 创建临时目录失败${NC}"
+        return 1
+    }
+    local TMP="$TMP_DIR/ruleset.tmp"
     local OUT="$ACL_RULESET_DIR/${NAME}.acl"
 
     echo -e "  ${YELLOW}下载中: $NAME ...${NC}"
@@ -1590,6 +1644,7 @@ download_ruleset() {
     done
 
     if [ $SUCCESS -eq 0 ]; then
+        rm -rf "$TMP_DIR"
         echo -e "  ${RED}❌ 下载失败: $NAME（所有镜像均不可用）${NC}"
         return 1
     fi
@@ -1597,7 +1652,7 @@ download_ruleset() {
     # 转换格式：过滤注释和空行，每行加 || 前缀
     grep -v "^#" "$TMP" | grep -v "^$" | grep -v "^\*\." | sed 's/^/||/' > "$OUT"
     COUNT=$(wc -l < "$OUT")
-    rm -f "$TMP"
+    rm -rf "$TMP_DIR"
     echo -e "  ${GREEN}✅ $NAME 已下载，共 $COUNT 条规则${NC}"
     return 0
 }
@@ -1731,7 +1786,11 @@ manage_rulesets() {
             14)
                 read -p "规则集名称 (英文，如 mylist): " CUSTOM_NAME
                 read -p "规则集 URL: " CUSTOM_URL
-                if [ -n "$CUSTOM_NAME" ] && [ -n "$CUSTOM_URL" ]; then
+                if ! valid_ruleset_name "$CUSTOM_NAME"; then
+                    echo -e "${RED}规则集名称只能包含英文、数字、下划线和中划线${NC}"
+                elif [[ ! "$CUSTOM_URL" =~ ^https?:// ]]; then
+                    echo -e "${RED}规则集 URL 必须以 http:// 或 https:// 开头${NC}"
+                elif [ -n "$CUSTOM_NAME" ] && [ -n "$CUSTOM_URL" ]; then
                     RULESET_URLS["$CUSTOM_NAME"]="自定义|$CUSTOM_URL"
                     download_ruleset "$CUSTOM_NAME" "$CUSTOM_URL" && rebuild_acl
                 fi
