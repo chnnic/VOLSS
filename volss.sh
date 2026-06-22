@@ -1772,7 +1772,7 @@ del_acl_domain() {
 # ========== ACL 规则集管理 ==========
 ACL_RULESET_DIR="/etc/shadowsocks-rust/rulesets"
 
-# 规则集定义：名称|描述|来源URL
+# 规则集定义：名称|描述|来源URL列表（逗号分隔，按顺序回退）
 declare -A RULESET_URLS
 RULESET_URLS=(
     ["ads"]="广告拦截|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Ads"
@@ -1781,10 +1781,10 @@ RULESET_URLS=(
     ["malware"]="恶意软件|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Malware"
     ["scam"]="诈骗欺诈|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Scam"
     ["tracking"]="追踪统计|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Tracking"
-    ["crypto"]="挖矿劫持|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Crypto"
+    ["crypto"]="挖矿劫持|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Cryptocurrency,https://raw.githubusercontent.com/blocklistproject/Lists/master/crypto.txt"
     ["dating"]="交友网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Dating"
-    ["bt"]="BT下载|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Torrents"
-    ["finance"]="金融理财|https://raw.githubusercontent.com/hagezi/dns-blocklists/main/domains/gambling.txt"
+    ["bt"]="BT下载|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Torrents,https://raw.githubusercontent.com/blocklistproject/Lists/master/torrent.txt,https://raw.githubusercontent.com/blocklistproject/Lists/master/piracy.txt"
+    ["finance"]="金融理财|https://raw.githubusercontent.com/blocklistproject/Lists/master/fraud.txt,https://raw.githubusercontent.com/blocklistproject/Lists/master/phishing.txt"
 )
 
 # GitHub 镜像列表，下载失败时自动切换
@@ -1813,7 +1813,7 @@ mirror_url() {
 # 下载并转换规则集为 ss-rust ACL 格式
 download_ruleset() {
     local NAME=$1
-    local URL=$2
+    local URLS=$2
     if ! valid_ruleset_name "$NAME"; then
         echo -e "  ${RED}❌ 规则集名称只能包含英文、数字、下划线和中划线${NC}"
         return 1
@@ -1828,16 +1828,28 @@ download_ruleset() {
 
     echo -e "  ${YELLOW}下载中: $NAME ...${NC}"
 
-    # 依次尝试各镜像
+    # 依次尝试候选源与镜像
     local SUCCESS=0
-    for MIRROR in "${GITHUB_MIRRORS[@]}"; do
-        local TRY_URL
-        TRY_URL=$(mirror_url "$URL" "$MIRROR")
-        if wget -q --timeout=15 -O "$TMP" "$TRY_URL" 2>/dev/null && [ -s "$TMP" ]; then
-            SUCCESS=1
-            break
+    local BASE_URL TRY_URL MIRROR
+    IFS=',' read -r -a BASE_URLS <<< "$URLS"
+    for BASE_URL in "${BASE_URLS[@]}"; do
+        [ -n "$BASE_URL" ] || continue
+        if [[ "$BASE_URL" == https://raw.githubusercontent.com/* ]]; then
+            for MIRROR in "${GITHUB_MIRRORS[@]}"; do
+                TRY_URL=$(mirror_url "$BASE_URL" "$MIRROR")
+                if wget -q --timeout=15 -O "$TMP" "$TRY_URL" 2>/dev/null && [ -s "$TMP" ]; then
+                    SUCCESS=1
+                    break 2
+                fi
+                rm -f "$TMP"
+            done
+        else
+            if wget -q --timeout=15 -O "$TMP" "$BASE_URL" 2>/dev/null && [ -s "$TMP" ]; then
+                SUCCESS=1
+                break
+            fi
+            rm -f "$TMP"
         fi
-        rm -f "$TMP"
     done
 
     if [ $SUCCESS -eq 0 ]; then
@@ -1846,8 +1858,29 @@ download_ruleset() {
         return 1
     fi
 
-    # 转换格式：过滤注释和空行，每行加 || 前缀
-    grep -v "^#" "$TMP" | grep -v "^$" | grep -v "^\*\." | sed 's/^/||/' > "$OUT"
+    # 转换格式：兼容纯域名、hosts、AdGuard/ACL 常见写法，输出 ss-rust ACL 域名规则
+    awk '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+        {
+            sub(/\r$/, "")
+            line = trim($0)
+            if (line == "" || line ~ /^#/) next
+            sub(/[[:space:]]+#.*$/, "", line)
+            if (line ~ /^(0\.0\.0\.0|127\.0\.0\.1|::1)[[:space:]]+/) {
+                split(line, fields, /[[:space:]]+/)
+                line = fields[2]
+            }
+            sub(/^\|\|/, "", line)
+            sub(/\^$/, "", line)
+            sub(/^domain-suffix:/, "", line)
+            sub(/^\*\./, "", line)
+            if (line ~ /^[A-Za-z0-9._-]+$/ && line ~ /\./) print "||" line
+        }
+    ' "$TMP" | LC_ALL=C sort -u > "$OUT"
     COUNT=$(wc -l < "$OUT")
     rm -rf "$TMP_DIR"
     echo -e "  ${GREEN}✅ $NAME 已下载，共 $COUNT 条规则${NC}"
