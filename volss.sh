@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.5.2
+#   版本: V1.5.3
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.5.2"
+VERSION="V1.5.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -58,6 +58,7 @@ detect_system() {
 detect_system
 
 SCRIPT_INSTALL_PATH="/usr/local/bin/volss.sh"
+CONFIG_DIR="/etc/shadowsocks-rust"
 CONFIG="/etc/shadowsocks-rust/config.json"
 RUNTIME="/etc/shadowsocks-rust/runtime.json"
 ACL_PATH="/etc/shadowsocks-rust/blocklist.acl"
@@ -66,6 +67,30 @@ TRAFFIC_FILE="/etc/shadowsocks-rust/traffic.json"
 MANUAL_FILE="/etc/shadowsocks-rust/manual.list"
 SHORTCUT="/usr/local/bin/volss"
 ACL_RULESET_DIR="/etc/shadowsocks-rust/rulesets"
+
+# ========== 安全写入与权限 ==========
+make_temp_for() {
+    local TARGET=$1
+    local DIR BASE
+    DIR=$(dirname "$TARGET")
+    BASE=$(basename "$TARGET")
+    mktemp "${DIR}/.${BASE}.XXXXXX"
+}
+
+secure_file() {
+    local FILE=$1
+    [ -f "$FILE" ] && chmod 600 "$FILE" 2>/dev/null || true
+}
+
+secure_data_files() {
+    local FILE
+    for FILE in "$CONFIG" "$RUNTIME" "$LINKS_FILE" "$TRAFFIC_FILE" "$MANUAL_FILE" "$ACL_PATH"; do
+        secure_file "$FILE"
+    done
+    if [ -d "$ACL_RULESET_DIR" ]; then
+        find "$ACL_RULESET_DIR" -type f -name '*.acl' -exec chmod 600 {} \; 2>/dev/null || true
+    fi
+}
 
 # ========== 服务运行状态检测 ==========
 check_svc_running() {
@@ -174,6 +199,10 @@ valid_port() {
 
 valid_ruleset_name() {
     [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]]
+}
+
+valid_domain() {
+    [[ "$1" =~ ^[A-Za-z0-9._*-]+$ ]]
 }
 
 third_party_mirrors_enabled() {
@@ -413,7 +442,7 @@ install_ssrust() {
 
     mv "$TMP_DIR/ssserver" "$SS_BIN"
     chmod +x $SS_BIN
-    mkdir -p /etc/shadowsocks-rust
+    mkdir -p "$CONFIG_DIR"
     rm -rf "$TMP_DIR"
 
     echo -e "${GREEN}✅ ss-rust $LATEST 安装完成${NC}"
@@ -542,9 +571,15 @@ config_acl() {
         echo -e "\n${YELLOW}输入要屏蔽的域名，每行一个，输入空行结束：${NC}"
         echo -e "${BLUE}示例: ippure.com${NC}"
 
-        cat > $ACL_PATH << 'ACLEOF'
+        local TMP_ACL
+        TMP_ACL=$(make_temp_for "$ACL_PATH") || {
+            echo -e "${RED}❌ 创建 ACL 临时文件失败${NC}"
+            return 1
+        }
+        cat > "$TMP_ACL" << 'ACLEOF'
 [outbound_block_list]
 ACLEOF
+        mv "$TMP_ACL" "$ACL_PATH"
 
         while true; do
             read -r -p "域名 (空行结束): " DOMAIN
@@ -552,6 +587,7 @@ ACLEOF
             # 去掉用户可能输入的前缀
             DOMAIN=$(echo "$DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//')
             echo "$DOMAIN" >> $MANUAL_FILE
+            secure_file "$MANUAL_FILE"
             echo -e "  ${GREEN}已添加: $DOMAIN（含所有子域名）${NC}"
         done
 
@@ -574,15 +610,25 @@ gen_password() {
 
 generate_config() {
     echo -e "\n${YELLOW}>>> 生成配置文件和 SS 链接...${NC}"
+    local TMP_CONFIG TMP_LINKS
+    TMP_CONFIG=$(make_temp_for "$CONFIG") || {
+        echo -e "${RED}❌ 创建配置临时文件失败${NC}"
+        return 1
+    }
+    TMP_LINKS=$(make_temp_for "$LINKS_FILE") || {
+        rm -f "$TMP_CONFIG"
+        echo -e "${RED}❌ 创建链接临时文件失败${NC}"
+        return 1
+    }
 
     # ACL 写在顶层，不写在每个 server 块里
     if [ "$USE_ACL_FLAG" = true ]; then
-        echo "{\"acl\":\"$ACL_PATH\",\"servers\":[" > $CONFIG
+        echo "{\"acl\":\"$ACL_PATH\",\"servers\":[" > "$TMP_CONFIG"
     else
-        echo '{"servers":[' > $CONFIG
+        echo '{"servers":[' > "$TMP_CONFIG"
     fi
 
-    : > $LINKS_FILE
+    : > "$TMP_LINKS"
 
     TOTAL=${#PORT_LIST[@]}
     for i in $(seq 0 $((TOTAL - 1))); do
@@ -591,22 +637,25 @@ generate_config() {
         NUM=$((i + 1))
 
         if [ $NUM -lt "$TOTAL" ]; then
-            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}," >> $CONFIG
+            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}," >> "$TMP_CONFIG"
         else
-            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}" >> $CONFIG
+            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}" >> "$TMP_CONFIG"
         fi
 
         USERINFO=$(echo -n "$METHOD:$PASS" | base64 | tr -d '\n')
-        echo "ss://${USERINFO}@${HOST}:${PORT}#用户${NUM}" >> $LINKS_FILE
+        echo "ss://${USERINFO}@${HOST}:${PORT}#用户${NUM}" >> "$TMP_LINKS"
     done
 
-    echo ']}' >> $CONFIG
+    echo ']}' >> "$TMP_CONFIG"
+    mv "$TMP_CONFIG" "$CONFIG"
+    mv "$TMP_LINKS" "$LINKS_FILE"
+    secure_data_files
     echo -e "${GREEN}✅ 配置生成完成${NC}"
 }
 
 apply_config() {
     python3 << PYEOF
-import json, os
+import json, os, tempfile
 
 with open('$CONFIG', 'r') as f:
     config = json.load(f)
@@ -625,9 +674,14 @@ if 'acl' in config and os.path.exists(config['acl']):
 elif os.path.exists('$ACL_PATH'):
     runtime['acl'] = '$ACL_PATH'
 
-with open('$RUNTIME', 'w') as f:
+runtime_file = '$RUNTIME'
+runtime_dir = os.path.dirname(runtime_file)
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(runtime_file) + '.', dir=runtime_dir, text=True)
+with os.fdopen(fd, 'w') as f:
     json.dump(runtime, f, indent=2)
+os.replace(tmp, runtime_file)
 PYEOF
+    secure_data_files
 
     svc_reload
     svc_restart
@@ -883,7 +937,7 @@ show_links() {
 # ========== 保存当前 iptables 计数到文件 ==========
 save_traffic() {
     python3 << PYEOF
-import json, subprocess, os
+import json, subprocess, os, tempfile
 
 config_file = '$CONFIG'
 traffic_file = '$TRAFFIC_FILE'
@@ -927,8 +981,11 @@ for s in c['servers']:
     history[port]['tx'] += tx
     history[port]['rx'] += rx
 
-with open(traffic_file, 'w') as f:
+traffic_dir = os.path.dirname(traffic_file)
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(traffic_file) + '.', dir=traffic_dir, text=True)
+with os.fdopen(fd, 'w') as f:
     json.dump(history, f, indent=2)
+os.replace(tmp, traffic_file)
 
 # 关键：读取后只清零本脚本管理端口的计数器，避免影响其他 iptables 统计
 import re
@@ -950,6 +1007,7 @@ for s in c['servers']:
         except Exception:
             pass
 PYEOF
+    secure_data_files
 }
 
 show_traffic() {
@@ -997,6 +1055,10 @@ PYEOF
 reset_traffic() {
     list_users
     read -r -p "输入要重置的用户编号 (0=全部重置): " NUM
+    if ! is_uint "$NUM"; then
+        echo -e "${RED}无效编号${NC}"
+        return
+    fi
 
     if [ "$NUM" = "0" ]; then
         # 只清零本脚本管理端口的内核计数器
@@ -1010,15 +1072,19 @@ print(' '.join(str(s['server_port']) for s in c['servers']))
         # 写入归零数据并记录重置时间
         RESET_TIME=$(date '+%Y-%m-%d %H:%M:%S')
         python3 << PYEOF
-import json
+import json, os, tempfile
 with open('$CONFIG') as f:
     c = json.load(f)
 history = {}
 for s in c['servers']:
     history[str(s['server_port'])] = {'tx': 0, 'rx': 0, 'reset_time': '$RESET_TIME'}
-with open('$TRAFFIC_FILE', 'w') as f:
+traffic_file = '$TRAFFIC_FILE'
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(traffic_file) + '.', dir=os.path.dirname(traffic_file), text=True)
+with os.fdopen(fd, 'w') as f:
     json.dump(history, f, indent=2)
+os.replace(tmp, traffic_file)
 PYEOF
+        secure_data_files
         echo -e "${GREEN}✅ 所有用户流量已重置${NC}"
         return
     fi
@@ -1043,16 +1109,20 @@ if 0 <= idx < len(ports):
     # 写入该端口归零
     RESET_TIME=$(date '+%Y-%m-%d %H:%M:%S')
     python3 << PYEOF
-import json, os
+import json, os, tempfile
 if os.path.exists('$TRAFFIC_FILE'):
     with open('$TRAFFIC_FILE') as f:
         history = json.load(f)
 else:
     history = {}
 history['$PORT'] = {'tx': 0, 'rx': 0, 'reset_time': '$RESET_TIME'}
-with open('$TRAFFIC_FILE', 'w') as f:
+traffic_file = '$TRAFFIC_FILE'
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(traffic_file) + '.', dir=os.path.dirname(traffic_file), text=True)
+with os.fdopen(fd, 'w') as f:
     json.dump(history, f, indent=2)
+os.replace(tmp, traffic_file)
 PYEOF
+    secure_data_files
 
     echo -e "${GREEN}✅ 端口 $PORT 流量已重置${NC}"
 }
@@ -1060,6 +1130,10 @@ PYEOF
 disable_user() {
     list_users
     read -r -p "输入要暂停的用户编号: " NUM
+    if ! is_uint "$NUM" || [ "$NUM" -lt 1 ]; then
+        echo -e "${RED}无效编号${NC}"
+        return
+    fi
 
     PORT=$(python3 -c "
 import json
@@ -1073,15 +1147,18 @@ if 0 <= idx < len(ports):
     if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
 
     python3 << PYEOF
-import json
+import json, os, tempfile
 with open('$CONFIG') as f:
     c = json.load(f)
 for s in c['servers']:
     if s['server_port'] == $PORT:
         s['disabled'] = True
         break
-with open('$CONFIG', 'w') as f:
+config_file = '$CONFIG'
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w') as f:
     json.dump(c, f, indent=2)
+os.replace(tmp, config_file)
 PYEOF
 
     apply_config
@@ -1091,6 +1168,10 @@ PYEOF
 enable_user() {
     list_users
     read -r -p "输入要恢复的用户编号: " NUM
+    if ! is_uint "$NUM" || [ "$NUM" -lt 1 ]; then
+        echo -e "${RED}无效编号${NC}"
+        return
+    fi
 
     PORT=$(python3 -c "
 import json
@@ -1104,15 +1185,18 @@ if 0 <= idx < len(ports):
     if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
 
     python3 << PYEOF
-import json
+import json, os, tempfile
 with open('$CONFIG') as f:
     c = json.load(f)
 for s in c['servers']:
     if s['server_port'] == $PORT:
         s.pop('disabled', None)
         break
-with open('$CONFIG', 'w') as f:
+config_file = '$CONFIG'
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w') as f:
     json.dump(c, f, indent=2)
+os.replace(tmp, config_file)
 PYEOF
 
     apply_config
@@ -1122,6 +1206,10 @@ PYEOF
 delete_user() {
     list_users
     read -r -p "输入要删除的用户编号: " NUM
+    if ! is_uint "$NUM" || [ "$NUM" -lt 1 ]; then
+        echo -e "${RED}无效编号${NC}"
+        return
+    fi
     read -r -p "确认删除？[y/N]: " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
 
@@ -1137,16 +1225,24 @@ if 0 <= idx < len(ports):
     if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
 
     python3 << PYEOF
-import json
+import json, os, tempfile
 with open('$CONFIG') as f:
     c = json.load(f)
 c['servers'] = [s for s in c['servers'] if s['server_port'] != $PORT]
-with open('$CONFIG', 'w') as f:
+config_file = '$CONFIG'
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w') as f:
     json.dump(c, f, indent=2)
+os.replace(tmp, config_file)
 PYEOF
 
-    grep -v ":${PORT}#" $LINKS_FILE > /tmp/ss_links_tmp.txt
-    mv /tmp/ss_links_tmp.txt $LINKS_FILE
+    TMP_LINKS=$(make_temp_for "$LINKS_FILE") || {
+        echo -e "${RED}❌ 创建链接临时文件失败${NC}"
+        return
+    }
+    grep -v ":${PORT}#" "$LINKS_FILE" > "$TMP_LINKS"
+    mv "$TMP_LINKS" "$LINKS_FILE"
+    secure_data_files
 
     for CHAIN in INPUT OUTPUT; do
         for PROTO in tcp udp; do
@@ -1215,7 +1311,11 @@ print(c['servers'][0]['method'] if c['servers'] else '')
     fi
     [ -z "$HOST" ] && basic_config
 
-    : > $LINKS_FILE
+    local TMP_LINKS
+    TMP_LINKS=$(make_temp_for "$LINKS_FILE") || {
+        echo -e "${RED}❌ 创建链接临时文件失败${NC}"
+        return 1
+    }
     python3 << PYEOF
 import json, base64
 with open('$CONFIG') as f:
@@ -1224,9 +1324,11 @@ lines = []
 for i, s in enumerate(c['servers'], 1):
     userinfo = base64.b64encode(f"{s['method']}:{s['password']}".encode()).decode()
     lines.append(f"ss://{userinfo}@{'$HOST'}:{s['server_port']}#用户{i}")
-with open('$LINKS_FILE', 'w') as f:
+with open('$TMP_LINKS', 'w') as f:
     f.write('\n'.join(lines) + '\n')
 PYEOF
+    mv "$TMP_LINKS" "$LINKS_FILE"
+    secure_data_files
 }
 
 add_user() {
@@ -1310,7 +1412,7 @@ print(' '.join(str(s['server_port']) for s in c['servers']))
     # 追加到 config.json
     NEW_PORTS_STR="${NEW_PORTS[*]}"
     python3 << PYEOF
-import json, os, base64, subprocess
+import json, os, subprocess, tempfile
 
 with open('$CONFIG') as f:
     c = json.load(f)
@@ -1334,10 +1436,14 @@ for p in new_ports:
         'mode': 'tcp_and_udp'
     })
 
-with open('$CONFIG', 'w') as f:
+config_file = '$CONFIG'
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w') as f:
     json.dump(c, f, indent=2)
+os.replace(tmp, config_file)
 print(f"✅ 已添加 {len(new_ports)} 个新用户")
 PYEOF
+    secure_data_files
 
     # 为新端口添加 iptables 统计规则
     for PORT in "${NEW_PORTS[@]}"; do
@@ -1436,7 +1542,7 @@ EOF
     if [ -f "$CONFIG" ]; then
         echo -e "\n${YELLOW}>>> 自动修复旧版配置...${NC}"
         python3 << PYEOF
-import json, os
+import json, os, tempfile
 
 config_file = '$CONFIG'
 runtime_file = '$RUNTIME'
@@ -1459,8 +1565,10 @@ if os.path.exists(acl_path) and c.get('acl') != acl_path:
     changed = True
 
 if changed:
-    with open(config_file, 'w') as f:
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+    with os.fdopen(fd, 'w') as f:
         json.dump(c, f, indent=2)
+    os.replace(tmp, config_file)
     print("✅ config.json 已迁移")
 
 # 重新生成 runtime
@@ -1473,8 +1581,10 @@ runtime = {'servers': servers}
 if os.path.exists(acl_path):
     runtime['acl'] = acl_path
 
-with open(runtime_file, 'w') as f:
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(runtime_file) + '.', dir=os.path.dirname(runtime_file), text=True)
+with os.fdopen(fd, 'w') as f:
     json.dump(runtime, f, indent=2)
+os.replace(tmp, runtime_file)
 print("✅ runtime.json 已更新")
 PYEOF
 
@@ -1541,12 +1651,17 @@ add_acl_domain() {
     read -r -p "输入要屏蔽的域名: " NEW_DOMAIN
     if [ -n "$NEW_DOMAIN" ]; then
         NEW_DOMAIN=$(echo "$NEW_DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//')
+        if ! valid_domain "$NEW_DOMAIN"; then
+            echo -e "${RED}域名格式无效${NC}"
+            return
+        fi
         # 检查是否已存在
         if grep -qx "$NEW_DOMAIN" "$MANUAL_FILE" 2>/dev/null; then
             echo -e "${YELLOW}⚠ $NEW_DOMAIN 已存在${NC}"
             return
         fi
         echo "$NEW_DOMAIN" >> $MANUAL_FILE
+        secure_file "$MANUAL_FILE"
         rebuild_acl
         echo -e "${GREEN}✅ 已添加: $NEW_DOMAIN（含所有子域名）${NC}"
     fi
@@ -1576,6 +1691,10 @@ del_acl_domain() {
     for NUM in "${NUMS[@]}"; do
         NUM=$(echo "$NUM" | tr -d ' ')
         [ -z "$NUM" ] && continue
+        if ! is_uint "$NUM"; then
+            echo -e "${RED}编号 $NUM 无效，跳过${NC}"
+            continue
+        fi
         IDX=$((NUM-1))
         if [ $IDX -lt 0 ] || [ $IDX -ge ${#MANUAL_ARR[@]} ]; then
             echo -e "${RED}编号 $NUM 无效，跳过${NC}"
@@ -1589,9 +1708,14 @@ del_acl_domain() {
     if [ "$DELETED" -gt 0 ]; then
         # 从 manual.list 删除对应行
         for DOMAIN in "${TO_DELETE[@]}"; do
-            grep -vx "$DOMAIN" "$MANUAL_FILE" > /tmp/manual_tmp.txt
-            mv /tmp/manual_tmp.txt "$MANUAL_FILE"
+            TMP_MANUAL=$(make_temp_for "$MANUAL_FILE") || {
+                echo -e "${RED}❌ 创建手动列表临时文件失败${NC}"
+                return
+            }
+            grep -vx "$DOMAIN" "$MANUAL_FILE" > "$TMP_MANUAL"
+            mv "$TMP_MANUAL" "$MANUAL_FILE"
         done
+        secure_file "$MANUAL_FILE"
         rebuild_acl
         echo -e "${GREEN}✅ 共删除 $DELETED 条，服务已重启${NC}"
     fi
@@ -2047,10 +2171,12 @@ EOF
         if [ -f "$ACL_PATH" ] && [ -f "$RUNTIME" ]; then
             if ! grep -q '"acl"' "$RUNTIME" 2>/dev/null; then
                 python3 -c "
-import json
+import json, os, tempfile
 with open('$RUNTIME') as f: r=json.load(f)
 r['acl']='$ACL_PATH'
-with open('$RUNTIME','w') as f: json.dump(r,f,indent=2)
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename('$RUNTIME') + '.', dir=os.path.dirname('$RUNTIME'), text=True)
+with os.fdopen(fd, 'w') as f: json.dump(r,f,indent=2)
+os.replace(tmp, '$RUNTIME')
 print('✅ runtime.json acl 字段已补全')
 "
                 svc_restart
@@ -2063,15 +2189,17 @@ print('✅ runtime.json acl 字段已补全')
             MODE_NUM=$(grep -c "tcp_and_udp" "$RUNTIME" 2>/dev/null || echo 0)
             if [ "$SERVER_NUM" != "$MODE_NUM" ]; then
                 python3 << PYEOF
-import json
+import json, os, tempfile
 for path in ['$CONFIG', '$RUNTIME']:
     try:
         with open(path) as f:
             c = json.load(f)
         for s in c.get('servers', []):
             s['mode'] = 'tcp_and_udp'
-        with open(path, 'w') as f:
+        fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.', dir=os.path.dirname(path), text=True)
+        with os.fdopen(fd, 'w') as f:
             json.dump(c, f, indent=2)
+        os.replace(tmp, path)
     except:
         pass
 print('✅ UDP 模式已自动开启')
@@ -2080,6 +2208,7 @@ PYEOF
             fi
         fi
     fi
+    secure_data_files
 fi
 
 case "$1" in
