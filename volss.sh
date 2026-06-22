@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.5.3
+#   版本: V1.5.4
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.5.3"
+VERSION="V1.5.4"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -67,6 +67,7 @@ TRAFFIC_FILE="/etc/shadowsocks-rust/traffic.json"
 MANUAL_FILE="/etc/shadowsocks-rust/manual.list"
 SHORTCUT="/usr/local/bin/volss"
 ACL_RULESET_DIR="/etc/shadowsocks-rust/rulesets"
+TRAFFIC_CHAIN="VOLSS_TRAFFIC"
 
 # ========== 安全写入与权限 ==========
 make_temp_for() {
@@ -209,11 +210,117 @@ third_party_mirrors_enabled() {
     [ "${VOLSS_ALLOW_THIRD_PARTY_MIRRORS:-0}" = "1" ]
 }
 
+persist_firewall_rules() {
+    if [ "$SYSTEM" = "alpine" ]; then
+        if [ ! -f /etc/init.d/iptables ]; then
+            apk add --no-cache iptables >/dev/null 2>&1
+        fi
+        mkdir -p /etc/iptables
+        rc-update add iptables default 2>/dev/null
+        /etc/init.d/iptables save 2>/dev/null || iptables-save > /etc/iptables/rules-save 2>/dev/null
+    else
+        netfilter-persistent save 2>/dev/null || true
+    fi
+}
+
+config_ports() {
+    python3 -c "
+import json
+try:
+    with open('$CONFIG') as f:
+        c = json.load(f)
+    print(' '.join(str(s['server_port']) for s in c.get('servers', [])))
+except Exception:
+    pass
+"
+}
+
+ensure_traffic_chain() {
+    iptables -N "$TRAFFIC_CHAIN" 2>/dev/null || true
+
+    for CHAIN in INPUT OUTPUT; do
+        while iptables -D "$CHAIN" -j "$TRAFFIC_CHAIN" 2>/dev/null; do :; done
+        iptables -I "$CHAIN" 1 -j "$TRAFFIC_CHAIN"
+    done
+}
+
+remove_legacy_traffic_rules_for_ports() {
+    local PORTS="$1"
+    local PORT PROTO
+    for PORT in $PORTS; do
+        for PROTO in tcp udp; do
+            while iptables -D INPUT  -p "$PROTO" --dport "$PORT" 2>/dev/null; do :; done
+            while iptables -D OUTPUT -p "$PROTO" --sport "$PORT" 2>/dev/null; do :; done
+        done
+    done
+}
+
+add_traffic_rules_for_ports() {
+    local PORTS="$1"
+    local PORT PROTO
+    for PORT in $PORTS; do
+        for PROTO in tcp udp; do
+            iptables -A "$TRAFFIC_CHAIN" -p "$PROTO" --dport "$PORT"
+            iptables -A "$TRAFFIC_CHAIN" -p "$PROTO" --sport "$PORT"
+        done
+    done
+}
+
+add_traffic_rules_for_new_ports() {
+    local PORTS="$1"
+    [ -n "$PORTS" ] || return 0
+    ensure_traffic_chain
+    remove_legacy_traffic_rules_for_ports "$PORTS"
+    add_traffic_rules_for_ports "$PORTS"
+    zero_traffic_counters_for_ports "$PORTS"
+    persist_firewall_rules
+}
+
+rebuild_traffic_rules() {
+    local PORTS="$1"
+    if [ -z "$PORTS" ]; then
+        cleanup_traffic_rules ""
+        return 0
+    fi
+    ensure_traffic_chain
+    iptables -F "$TRAFFIC_CHAIN" 2>/dev/null || true
+    remove_legacy_traffic_rules_for_ports "$PORTS"
+    add_traffic_rules_for_ports "$PORTS"
+    zero_traffic_counters_for_ports "$PORTS"
+    persist_firewall_rules
+}
+
+cleanup_traffic_rules() {
+    local PORTS="$1"
+    remove_legacy_traffic_rules_for_ports "$PORTS"
+    iptables -F "$TRAFFIC_CHAIN" 2>/dev/null || true
+    for CHAIN in INPUT OUTPUT; do
+        while iptables -D "$CHAIN" -j "$TRAFFIC_CHAIN" 2>/dev/null; do :; done
+    done
+    iptables -X "$TRAFFIC_CHAIN" 2>/dev/null || true
+    persist_firewall_rules
+}
+
+traffic_chain_installed() {
+    iptables -L "$TRAFFIC_CHAIN" -n >/dev/null 2>&1
+}
+
+migrate_traffic_rules_if_needed() {
+    check_installed || return 0
+    traffic_chain_installed && return 0
+    local PORTS
+    PORTS=$(config_ports)
+    [ -n "$PORTS" ] || return 0
+    save_traffic
+    rebuild_traffic_rules "$PORTS"
+}
+
 # 只清零指定端口的 iptables 计数器（精确匹配，不影响其他统计）
 zero_traffic_counters_for_ports() {
     local PORTS="$1"
     local CHAIN L PORT LINES
-    for CHAIN in INPUT OUTPUT; do
+    for CHAIN in "$TRAFFIC_CHAIN" INPUT OUTPUT; do
+        iptables -L "$CHAIN" -n >/dev/null 2>&1 || continue
         for PORT in $PORTS; do
             LINES=$(iptables -nvL "$CHAIN" --line-numbers 2>/dev/null | awk -v p="$PORT" '$0 ~ ("dpt:"p"( |$)") || $0 ~ ("spt:"p"( |$)") {print $1}' | sort -rn)
             for L in $LINES; do
@@ -758,40 +865,8 @@ EOF
 init_traffic() {
     echo -e "\n${YELLOW}>>> 初始化流量统计规则...${NC}"
 
-    PORTS=$(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-for s in c['servers']:
-    print(s['server_port'])
-")
-
-    for PORT in $PORTS; do
-        for PROTO in tcp udp; do
-            # 清理该端口所有旧规则，避免冗余
-            while iptables -D INPUT  -p $PROTO --dport "$PORT" 2>/dev/null; do :; done
-            while iptables -D OUTPUT -p $PROTO --sport "$PORT" 2>/dev/null; do :; done
-            # 置顶插入（位置1），确保 ACCEPT 之前匹配
-            iptables -I INPUT  1 -p $PROTO --dport "$PORT"
-            iptables -I OUTPUT 1 -p $PROTO --sport "$PORT"
-        done
-    done
-
-    # 只重置本脚本管理端口的计数器，避免影响服务器上其他 iptables 统计
-    zero_traffic_counters_for_ports "$PORTS"
-
-    # 持久化 iptables 规则
-    if [ "$SYSTEM" = "alpine" ]; then
-        # 确保 iptables 服务已安装
-        if [ ! -f /etc/init.d/iptables ]; then
-            apk add --no-cache iptables >/dev/null 2>&1
-        fi
-        mkdir -p /etc/iptables
-        rc-update add iptables default 2>/dev/null
-        /etc/init.d/iptables save 2>/dev/null || iptables-save > /etc/iptables/rules-save 2>/dev/null
-    else
-        netfilter-persistent save 2>/dev/null
-    fi
+    PORTS=$(config_ports)
+    rebuild_traffic_rules "$PORTS"
 
     echo -e "${GREEN}✅ 流量统计初始化完成${NC}"
 }
@@ -867,27 +942,8 @@ do_uninstall() {
 
     # 清理 iptables 流量统计规则
     if [ -f "$CONFIG" ]; then
-        PORTS=$(python3 -c "
-import json
-try:
-    with open('$CONFIG') as f:
-        c = json.load(f)
-    for s in c['servers']:
-        print(s['server_port'])
-except: pass
-" 2>/dev/null)
-        for PORT in $PORTS; do
-            for PROTO in tcp udp; do
-                while iptables -D INPUT  -p $PROTO --dport "$PORT" 2>/dev/null; do :; done
-                while iptables -D OUTPUT -p $PROTO --sport "$PORT" 2>/dev/null; do :; done
-            done
-        done
-        # 持久化
-        if [ "$SYSTEM" = "alpine" ]; then
-            /etc/init.d/iptables save 2>/dev/null
-        else
-            netfilter-persistent save 2>/dev/null
-        fi
+        PORTS=$(config_ports)
+        cleanup_traffic_rules "$PORTS"
     fi
 
     svc_stop 2>/dev/null
@@ -971,11 +1027,22 @@ def get_bytes(chain, port, direction):
     except:
         return 0
 
+def chain_exists(chain):
+    return subprocess.run(['iptables', '-L', chain, '-n'],
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+traffic_chain = '$TRAFFIC_CHAIN'
+use_traffic_chain = chain_exists(traffic_chain)
+
 # 读取增量并累加
 for s in c['servers']:
     port = str(s['server_port'])
-    tx = get_bytes('OUTPUT', s['server_port'], 'sport')
-    rx = get_bytes('INPUT',  s['server_port'], 'dport')
+    if use_traffic_chain:
+        tx = get_bytes(traffic_chain, s['server_port'], 'sport')
+        rx = get_bytes(traffic_chain, s['server_port'], 'dport')
+    else:
+        tx = get_bytes('OUTPUT', s['server_port'], 'sport')
+        rx = get_bytes('INPUT',  s['server_port'], 'dport')
     if port not in history:
         history[port] = {'tx': 0, 'rx': 0}
     history[port]['tx'] += tx
@@ -991,7 +1058,8 @@ os.replace(tmp, traffic_file)
 import re
 for s in c['servers']:
     port = s['server_port']
-    for chain in ('INPUT', 'OUTPUT'):
+    chains = (traffic_chain,) if use_traffic_chain else ('INPUT', 'OUTPUT')
+    for chain in chains:
         try:
             out = subprocess.check_output(['iptables', '-nvL', chain, '--line-numbers'], text=True)
             pat = re.compile(r'\b[sd]pt:%d(?:\D|$)' % port)
@@ -1244,12 +1312,8 @@ PYEOF
     mv "$TMP_LINKS" "$LINKS_FILE"
     secure_data_files
 
-    for CHAIN in INPUT OUTPUT; do
-        for PROTO in tcp udp; do
-            while iptables -D "$CHAIN" -p $PROTO --dport "$PORT" 2>/dev/null; do :; done
-            while iptables -D "$CHAIN" -p $PROTO --sport "$PORT" 2>/dev/null; do :; done
-        done
-    done
+    PORTS=$(config_ports)
+    rebuild_traffic_rules "$PORTS"
 
     apply_config
     echo -e "${RED}🗑 端口 $PORT 已删除${NC}"
@@ -1445,23 +1509,7 @@ print(f"✅ 已添加 {len(new_ports)} 个新用户")
 PYEOF
     secure_data_files
 
-    # 为新端口添加 iptables 统计规则
-    for PORT in "${NEW_PORTS[@]}"; do
-        for PROTO in tcp udp; do
-            while iptables -D INPUT  -p $PROTO --dport "$PORT" 2>/dev/null; do :; done
-            while iptables -D OUTPUT -p $PROTO --sport "$PORT" 2>/dev/null; do :; done
-            iptables -I INPUT  1 -p $PROTO --dport "$PORT"
-            iptables -I OUTPUT 1 -p $PROTO --sport "$PORT"
-        done
-    done
-    zero_traffic_counters_for_ports "$NEW_PORTS_STR"
-
-    # 持久化 iptables
-    if [ "$SYSTEM" = "alpine" ]; then
-        /etc/init.d/iptables save 2>/dev/null || iptables-save > /etc/iptables/rules-save 2>/dev/null
-    else
-        netfilter-persistent save 2>/dev/null
-    fi
+    add_traffic_rules_for_new_ports "$NEW_PORTS_STR"
 
     rebuild_links
     apply_config
@@ -2209,6 +2257,7 @@ PYEOF
         fi
     fi
     secure_data_files
+    migrate_traffic_rules_if_needed
 fi
 
 case "$1" in
