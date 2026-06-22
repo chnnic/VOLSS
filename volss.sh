@@ -1783,7 +1783,7 @@ RULESET_URLS=(
     ["tracking"]="追踪统计|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Tracking"
     ["crypto"]="挖矿劫持|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Cryptocurrency,https://raw.githubusercontent.com/blocklistproject/Lists/master/crypto.txt"
     ["dating"]="交友网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Dating"
-    ["bt"]="BT下载|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Torrents,https://raw.githubusercontent.com/blocklistproject/Lists/master/torrent.txt,https://raw.githubusercontent.com/blocklistproject/Lists/master/piracy.txt"
+    ["bt"]="BT下载|https://raw.githubusercontent.com/blocklistproject/Lists/master/torrent.txt,https://raw.githubusercontent.com/blocklistproject/Lists/master/piracy.txt,https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Torrents"
     ["finance"]="金融理财|https://raw.githubusercontent.com/blocklistproject/Lists/master/fraud.txt,https://raw.githubusercontent.com/blocklistproject/Lists/master/phishing.txt"
 )
 
@@ -1808,6 +1808,22 @@ mirror_url() {
     local URL=$1
     local MIRROR=$2
     echo "${URL/https:\/\/raw.githubusercontent.com/$MIRROR}"
+}
+
+# 下载 URL 到指定文件。优先 wget，失败后回退 curl，兼容不同系统网络栈。
+fetch_url() {
+    local URL=$1
+    local OUT=$2
+    rm -f "$OUT"
+    if command -v wget >/dev/null 2>&1; then
+        wget -q --timeout=15 -O "$OUT" "$URL" 2>/dev/null && [ -s "$OUT" ] && return 0
+    fi
+    rm -f "$OUT"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --max-time 20 -o "$OUT" "$URL" 2>/dev/null && [ -s "$OUT" ] && return 0
+    fi
+    rm -f "$OUT"
+    return 1
 }
 
 # 下载并转换规则集为 ss-rust ACL 格式
@@ -1837,18 +1853,16 @@ download_ruleset() {
         if [[ "$BASE_URL" == https://raw.githubusercontent.com/* ]]; then
             for MIRROR in "${GITHUB_MIRRORS[@]}"; do
                 TRY_URL=$(mirror_url "$BASE_URL" "$MIRROR")
-                if wget -q --timeout=15 -O "$TMP" "$TRY_URL" 2>/dev/null && [ -s "$TMP" ]; then
+                if fetch_url "$TRY_URL" "$TMP"; then
                     SUCCESS=1
                     break 2
                 fi
-                rm -f "$TMP"
             done
         else
-            if wget -q --timeout=15 -O "$TMP" "$BASE_URL" 2>/dev/null && [ -s "$TMP" ]; then
+            if fetch_url "$BASE_URL" "$TMP"; then
                 SUCCESS=1
                 break
             fi
-            rm -f "$TMP"
         fi
     done
 
