@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.5.4
+#   版本: V1.5.5
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.5.4"
+VERSION="V1.5.5"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -204,6 +204,18 @@ valid_ruleset_name() {
 
 valid_domain() {
     [[ "$1" =~ ^[A-Za-z0-9._*-]+$ ]]
+}
+
+normalize_domain() {
+    echo "$1" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//'
+}
+
+manual_domain_count() {
+    if [ -f "$MANUAL_FILE" ]; then
+        awk 'NF {count++} END {print count + 0}' "$MANUAL_FILE"
+    else
+        echo 0
+    fi
 }
 
 third_party_mirrors_enabled() {
@@ -523,7 +535,7 @@ install_ssrust() {
     for PREFIX in "${DOWNLOAD_PREFIXES[@]}"; do
         TRY_URL="${PREFIX}${URL}"
         echo "下载中: $TRY_URL"
-        if wget --timeout=30 -O "$TMP_TAR" "$TRY_URL" 2>/dev/null && [ -s "$TMP_TAR" ]; then
+        if fetch_url "$TRY_URL" "$TMP_TAR" 45; then
             DOWNLOADED=1
             break
         fi
@@ -692,8 +704,16 @@ ACLEOF
             read -r -p "域名 (空行结束): " DOMAIN
             [ -z "$DOMAIN" ] && break
             # 去掉用户可能输入的前缀
-            DOMAIN=$(echo "$DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//')
-            echo "$DOMAIN" >> $MANUAL_FILE
+            DOMAIN=$(normalize_domain "$DOMAIN")
+            if ! valid_domain "$DOMAIN"; then
+                echo -e "  ${RED}域名格式无效，已跳过${NC}"
+                continue
+            fi
+            if grep -Fqx -- "$DOMAIN" "$MANUAL_FILE" 2>/dev/null; then
+                echo -e "  ${YELLOW}$DOMAIN 已存在，已跳过${NC}"
+                continue
+            fi
+            echo "$DOMAIN" >> "$MANUAL_FILE"
             secure_file "$MANUAL_FILE"
             echo -e "  ${GREEN}已添加: $DOMAIN（含所有子域名）${NC}"
         done
@@ -1535,7 +1555,7 @@ do_update() {
     fi
     DL_OK=0
     for BASE in "${UPDATE_BASES[@]}"; do
-        if wget -q --timeout=20 -O "$TMP_NEW" "$BASE/$REMOTE_PATH" 2>/dev/null && [ -s "$TMP_NEW" ] && head -1 "$TMP_NEW" | grep -q '#!/'; then
+        if fetch_url "$BASE/$REMOTE_PATH" "$TMP_NEW" 25 && head -1 "$TMP_NEW" | grep -q '#!/'; then
             DL_OK=1
             break
         fi
@@ -1636,11 +1656,10 @@ os.replace(tmp, runtime_file)
 print("✅ runtime.json 已更新")
 PYEOF
 
-        # 修复旧版 ACL 格式（domain-suffix: → ||，移除无效头部）
+        # 修复旧版 ACL 格式（domain-suffix: → ||，移除 ssserver 不使用的本地 ACL 段）
         if [ -f "$ACL_PATH" ]; then
             sed -i 's/^domain-suffix:/||/' $ACL_PATH
             sed -i '/^\[bypass_list\]$/d' $ACL_PATH
-            sed -i '/^\[accept_all\]$/d' $ACL_PATH
             sed -i '/^\[proxy_list\]$/d' $ACL_PATH
             sed -i '/^$/d' $ACL_PATH
             # 确保文件以 [outbound_block_list] 开头
@@ -1698,17 +1717,17 @@ PYEOF
 add_acl_domain() {
     read -r -p "输入要屏蔽的域名: " NEW_DOMAIN
     if [ -n "$NEW_DOMAIN" ]; then
-        NEW_DOMAIN=$(echo "$NEW_DOMAIN" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//')
+        NEW_DOMAIN=$(normalize_domain "$NEW_DOMAIN")
         if ! valid_domain "$NEW_DOMAIN"; then
             echo -e "${RED}域名格式无效${NC}"
             return
         fi
         # 检查是否已存在
-        if grep -qx "$NEW_DOMAIN" "$MANUAL_FILE" 2>/dev/null; then
+        if grep -Fqx -- "$NEW_DOMAIN" "$MANUAL_FILE" 2>/dev/null; then
             echo -e "${YELLOW}⚠ $NEW_DOMAIN 已存在${NC}"
             return
         fi
-        echo "$NEW_DOMAIN" >> $MANUAL_FILE
+        echo "$NEW_DOMAIN" >> "$MANUAL_FILE"
         secure_file "$MANUAL_FILE"
         rebuild_acl
         echo -e "${GREEN}✅ 已添加: $NEW_DOMAIN（含所有子域名）${NC}"
@@ -1760,7 +1779,7 @@ del_acl_domain() {
                 echo -e "${RED}❌ 创建手动列表临时文件失败${NC}"
                 return
             }
-            grep -vx "$DOMAIN" "$MANUAL_FILE" > "$TMP_MANUAL"
+            grep -Fvx -- "$DOMAIN" "$MANUAL_FILE" > "$TMP_MANUAL"
             mv "$TMP_MANUAL" "$MANUAL_FILE"
         done
         secure_file "$MANUAL_FILE"
@@ -1783,7 +1802,7 @@ RULESET_URLS=(
     ["tracking"]="追踪统计|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Tracking"
     ["crypto"]="挖矿劫持|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Cryptocurrency,https://raw.githubusercontent.com/blocklistproject/Lists/master/crypto.txt"
     ["dating"]="交友网站|https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Dating"
-    ["bt"]="BT下载|https://raw.githubusercontent.com/blocklistproject/Lists/master/torrent.txt,https://raw.githubusercontent.com/blocklistproject/Lists/master/piracy.txt,https://raw.githubusercontent.com/ShadowWhisperer/BlockLists/master/Lists/Torrents"
+    ["bt"]="BT下载|https://raw.githubusercontent.com/blocklistproject/Lists/master/torrent.txt,https://raw.githubusercontent.com/blocklistproject/Lists/master/piracy.txt"
     ["finance"]="金融理财|https://raw.githubusercontent.com/blocklistproject/Lists/master/fraud.txt,https://raw.githubusercontent.com/blocklistproject/Lists/master/phishing.txt"
 )
 
@@ -1814,13 +1833,14 @@ mirror_url() {
 fetch_url() {
     local URL=$1
     local OUT=$2
+    local TIMEOUT=${3:-20}
     rm -f "$OUT"
     if command -v wget >/dev/null 2>&1; then
-        wget -q --timeout=15 -O "$OUT" "$URL" 2>/dev/null && [ -s "$OUT" ] && return 0
+        wget -q --timeout="$TIMEOUT" -O "$OUT" "$URL" 2>/dev/null && [ -s "$OUT" ] && return 0
     fi
     rm -f "$OUT"
     if command -v curl >/dev/null 2>&1; then
-        curl -fsSL --max-time 20 -o "$OUT" "$URL" 2>/dev/null && [ -s "$OUT" ] && return 0
+        curl -fsSL --max-time "$TIMEOUT" -o "$OUT" "$URL" 2>/dev/null && [ -s "$OUT" ] && return 0
     fi
     rm -f "$OUT"
     return 1
@@ -1840,6 +1860,7 @@ download_ruleset() {
         return 1
     }
     local TMP="$TMP_DIR/ruleset.tmp"
+    local TMP_OUT="$TMP_DIR/${NAME}.acl"
     local OUT="$ACL_RULESET_DIR/${NAME}.acl"
 
     echo -e "  ${YELLOW}下载中: $NAME ...${NC}"
@@ -1894,8 +1915,15 @@ download_ruleset() {
             sub(/^\*\./, "", line)
             if (line ~ /^[A-Za-z0-9._-]+$/ && line ~ /\./) print "||" line
         }
-    ' "$TMP" | LC_ALL=C sort -u > "$OUT"
-    COUNT=$(wc -l < "$OUT")
+    ' "$TMP" | LC_ALL=C sort -u > "$TMP_OUT"
+    COUNT=$(wc -l < "$TMP_OUT")
+    if [ "$COUNT" -eq 0 ]; then
+        rm -rf "$TMP_DIR"
+        echo -e "  ${RED}❌ 下载失败: $NAME（未解析到有效域名规则，已保留旧规则）${NC}"
+        return 1
+    fi
+    mv "$TMP_OUT" "$OUT"
+    chmod 600 "$OUT" 2>/dev/null || true
     rm -rf "$TMP_DIR"
     echo -e "  ${GREEN}✅ $NAME 已下载，共 $COUNT 条规则${NC}"
     return 0
@@ -1982,12 +2010,25 @@ manage_rulesets() {
             11)
                 echo -e "${YELLOW}>>> 安装全部规则集...${NC}"
                 local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt" "finance")
+                local OK=0 FAIL=0
+                local FAILED_RULESETS=()
                 for KEY in "${KEYS[@]}"; do
                     IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
-                    download_ruleset "$KEY" "$URL"
+                    if download_ruleset "$KEY" "$URL"; then
+                        OK=$((OK + 1))
+                    else
+                        FAIL=$((FAIL + 1))
+                        FAILED_RULESETS+=("$KEY")
+                    fi
                 done
-                rebuild_acl
-                echo -e "${GREEN}✅ 全部规则集安装完成${NC}"
+                [ "$OK" -gt 0 ] && rebuild_acl
+                if [ "$FAIL" -eq 0 ]; then
+                    echo -e "${GREEN}✅ 全部规则集安装完成（成功 $OK 个）${NC}"
+                elif [ "$OK" -gt 0 ]; then
+                    echo -e "${YELLOW}⚠ 规则集部分安装完成：成功 $OK 个，失败 $FAIL 个（${FAILED_RULESETS[*]}）${NC}"
+                else
+                    echo -e "${RED}❌ 没有规则集安装成功，请检查网络或源地址${NC}"
+                fi
                 ;;
             12)
                 echo -e "\n已安装的规则集："
@@ -2016,16 +2057,36 @@ manage_rulesets() {
                 ;;
             13)
                 echo -e "${YELLOW}>>> 更新已安装规则集...${NC}"
+                local OK=0 FAIL=0 SKIP=0
+                local FAILED_RULESETS=()
+                local SKIPPED_RULESETS=()
                 for RULESET_FILE in "$ACL_RULESET_DIR"/*.acl; do
                     [ -f "$RULESET_FILE" ] || continue
                     KEY=$(basename "$RULESET_FILE" .acl)
                     if [ -n "${RULESET_URLS[$KEY]}" ]; then
                         IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
-                        download_ruleset "$KEY" "$URL"
+                        if download_ruleset "$KEY" "$URL"; then
+                            OK=$((OK + 1))
+                        else
+                            FAIL=$((FAIL + 1))
+                            FAILED_RULESETS+=("$KEY")
+                        fi
+                    else
+                        SKIP=$((SKIP + 1))
+                        SKIPPED_RULESETS+=("$KEY")
                     fi
                 done
-                rebuild_acl
-                echo -e "${GREEN}✅ 更新完成${NC}"
+                [ "$OK" -gt 0 ] && rebuild_acl
+                if [ "$OK" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$SKIP" -eq 0 ]; then
+                    echo -e "${YELLOW}没有已安装的规则集${NC}"
+                elif [ "$FAIL" -eq 0 ]; then
+                    echo -e "${GREEN}✅ 更新完成（成功 $OK 个）${NC}"
+                elif [ "$OK" -gt 0 ]; then
+                    echo -e "${YELLOW}⚠ 规则集部分更新完成：成功 $OK 个，失败 $FAIL 个（${FAILED_RULESETS[*]}，已保留旧规则）${NC}"
+                else
+                    echo -e "${RED}❌ 已安装规则集更新失败（${FAILED_RULESETS[*]}，已保留旧规则）${NC}"
+                fi
+                [ "$SKIP" -gt 0 ] && echo -e "${YELLOW}⚠ 已跳过自定义规则集（未保存 URL，暂不能自动更新）: ${SKIPPED_RULESETS[*]}${NC}"
                 ;;
             14)
                 read -r -p "规则集名称 (英文，如 mylist): " CUSTOM_NAME
@@ -2053,7 +2114,7 @@ manage_rulesets() {
                         COUNT=$(wc -l < "$RULESET_FILE")
                         printf "  %-15s %s 条\n" "$NAME" "$COUNT"
                     done
-                    MANUAL=$(grep -c "^||.*#manual" "$ACL_PATH" 2>/dev/null || true)
+                    MANUAL=$(manual_domain_count)
                     [ "$MANUAL" -gt 0 ] && printf "  %-15s %s 条\n" "手动添加" "$MANUAL"
                 else
                     echo -e "  未配置 ACL"
@@ -2162,9 +2223,9 @@ show_main_menu() {
                 echo -e "${BLUE}  =================================================${NC}"
                 if [ -f "$ACL_PATH" ]; then
                     TOTAL=$(grep -c "^||" "$ACL_PATH")
-                    MANUAL_COUNT=0
-                    [ -f "$MANUAL_FILE" ] && MANUAL_COUNT=$(grep -c "." "$MANUAL_FILE" 2>/dev/null || echo 0)
+                    MANUAL_COUNT=$(manual_domain_count)
                     RULESET_COUNT=$((TOTAL - MANUAL_COUNT))
+                    [ "$RULESET_COUNT" -lt 0 ] && RULESET_COUNT=0
                     echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}（手动: $MANUAL_COUNT 条，规则集: $RULESET_COUNT 条）"
 
                     echo -e "\n  ${CYAN}── 手动添加 ($MANUAL_COUNT 条) ──${NC}"
@@ -2243,16 +2304,15 @@ EOF
         fi
     fi
 
-    # 自检：ACL 格式修复（移除无效头部，确保 outbound_block_list 存在）
+    # 自检：ACL 格式修复（移除 ssserver 不使用的本地 ACL 段，确保 outbound_block_list 存在）
     if [ -f "$ACL_PATH" ]; then
         NEED_FIX=0
-        grep -q "^\[accept_all\]" "$ACL_PATH" && NEED_FIX=1
         grep -q "^\[bypass_list\]" "$ACL_PATH" && NEED_FIX=1
+        grep -q "^\[proxy_list\]" "$ACL_PATH" && NEED_FIX=1
         grep -q "^domain-suffix:" "$ACL_PATH" && NEED_FIX=1
         if [ "$NEED_FIX" -eq 1 ]; then
             sed -i 's/^domain-suffix:/||/' $ACL_PATH
             sed -i '/^\[bypass_list\]$/d' $ACL_PATH
-            sed -i '/^\[accept_all\]$/d' $ACL_PATH
             sed -i '/^\[proxy_list\]$/d' $ACL_PATH
             sed -i '/^$/d' $ACL_PATH
             if ! grep -q "^\[outbound_block_list\]" $ACL_PATH; then
