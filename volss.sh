@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.5.5
+#   版本: V1.5.6
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.5.5"
+VERSION="V1.5.6"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,6 +68,9 @@ MANUAL_FILE="/etc/shadowsocks-rust/manual.list"
 SHORTCUT="/usr/local/bin/volss"
 ACL_RULESET_DIR="/etc/shadowsocks-rust/rulesets"
 TRAFFIC_CHAIN="VOLSS_TRAFFIC"
+STATE_LOCK_DIR="/run/volss.lock"
+SS_USER="ssrust"
+SS_GROUP="ssrust"
 
 # ========== 安全写入与权限 ==========
 make_temp_for() {
@@ -80,7 +83,35 @@ make_temp_for() {
 
 secure_file() {
     local FILE=$1
-    [ -f "$FILE" ] && chmod 600 "$FILE" 2>/dev/null || true
+    if [ -f "$FILE" ]; then
+        chmod 600 "$FILE" 2>/dev/null || true
+    fi
+}
+
+group_exists() {
+    getent group "$1" >/dev/null 2>&1 || grep -q "^$1:" /etc/group 2>/dev/null
+}
+
+ensure_service_user() {
+    if [ "$SYSTEM" = "alpine" ]; then
+        group_exists "$SS_GROUP" || addgroup -S "$SS_GROUP" >/dev/null 2>&1
+        id -u "$SS_USER" >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin -G "$SS_GROUP" "$SS_USER" >/dev/null 2>&1
+    else
+        group_exists "$SS_GROUP" || groupadd --system "$SS_GROUP" >/dev/null 2>&1
+        id -u "$SS_USER" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --gid "$SS_GROUP" "$SS_USER" >/dev/null 2>&1
+    fi
+}
+
+secure_runtime_owner() {
+    id -u "$SS_USER" >/dev/null 2>&1 || return 0
+    if [ -f "$RUNTIME" ]; then
+        chown "$SS_USER:$SS_GROUP" "$RUNTIME" 2>/dev/null || true
+        chmod 400 "$RUNTIME" 2>/dev/null || true
+    fi
+    if [ -f "$ACL_PATH" ]; then
+        chown "$SS_USER:$SS_GROUP" "$ACL_PATH" 2>/dev/null || true
+        chmod 400 "$ACL_PATH" 2>/dev/null || true
+    fi
 }
 
 secure_data_files() {
@@ -90,6 +121,102 @@ secure_data_files() {
     done
     if [ -d "$ACL_RULESET_DIR" ]; then
         find "$ACL_RULESET_DIR" -type f -name '*.acl' -exec chmod 600 {} \; 2>/dev/null || true
+    fi
+    secure_runtime_owner
+}
+
+acquire_state_lock() {
+    local WAITED=0
+    while ! mkdir "$STATE_LOCK_DIR" 2>/dev/null; do
+        if [ -f "$STATE_LOCK_DIR/pid" ]; then
+            local LOCK_PID
+            LOCK_PID=$(cat "$STATE_LOCK_DIR/pid" 2>/dev/null || true)
+            if [ -n "$LOCK_PID" ] && ! kill -0 "$LOCK_PID" 2>/dev/null; then
+                rm -f "$STATE_LOCK_DIR/pid" 2>/dev/null || true
+                rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
+                continue
+            fi
+        fi
+        WAITED=$((WAITED + 1))
+        if [ "$WAITED" -ge 30 ]; then
+            echo -e "${RED}❌ 状态文件正被其他 volss 进程使用，请稍后重试${NC}"
+            return 1
+        fi
+        sleep 1
+    done
+    echo "$$" > "$STATE_LOCK_DIR/pid" 2>/dev/null || true
+}
+
+release_state_lock() {
+    rm -f "$STATE_LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$STATE_LOCK_DIR" 2>/dev/null || true
+}
+
+with_state_lock() {
+    if [ "${STATE_LOCK_HELD:-0}" = "1" ]; then
+        "$@"
+        return $?
+    fi
+    acquire_state_lock || return 1
+    STATE_LOCK_HELD=1
+    trap 'release_state_lock; exit 130' INT TERM HUP
+    "$@"
+    local STATUS=$?
+    trap - INT TERM HUP
+    STATE_LOCK_HELD=0
+    release_state_lock
+    return "$STATUS"
+}
+
+harden_service_if_needed() {
+    check_installed || return 0
+    ensure_service_user
+    local CHANGED=0
+
+    if [ "$SYSTEM" = "alpine" ]; then
+        if [ -f "$SERVICE" ] && ! grep -q '^command_user=' "$SERVICE" 2>/dev/null; then
+            sed -i "/^command_background=/a command_user=\"$SS_USER:$SS_GROUP\"" "$SERVICE"
+            CHANGED=1
+        fi
+    else
+        if [ -f "$SERVICE" ]; then
+            if grep -q "^User=root" "$SERVICE" 2>/dev/null; then
+                sed -i "s/^User=root/User=$SS_USER/" "$SERVICE"
+                CHANGED=1
+            elif ! grep -q "^User=" "$SERVICE" 2>/dev/null; then
+                sed -i "/^\[Service\]/a User=$SS_USER" "$SERVICE"
+                CHANGED=1
+            fi
+            if ! grep -q "^Group=" "$SERVICE" 2>/dev/null; then
+                sed -i "/^User=$SS_USER/a Group=$SS_GROUP" "$SERVICE"
+                CHANGED=1
+            fi
+            if ! grep -q "ExecStop" "$SERVICE" 2>/dev/null; then
+                sed -i "/ExecStart=.*/a ExecStop=+/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'" "$SERVICE"
+                CHANGED=1
+            elif grep -q "^ExecStop=/bin/bash" "$SERVICE" 2>/dev/null; then
+                sed -i 's#^ExecStop=/bin/bash#ExecStop=+/bin/bash#' "$SERVICE"
+                CHANGED=1
+            fi
+            if ! grep -q "^ProtectSystem=strict" "$SERVICE" 2>/dev/null; then
+                if grep -q "^RestartSec=" "$SERVICE" 2>/dev/null; then
+                    sed -i "/^RestartSec=.*/a ProtectHome=true\nProtectSystem=strict\nReadOnlyPaths=$SS_BIN\nReadWritePaths=$CONFIG_DIR\nPrivateTmp=true" "$SERVICE"
+                else
+                    sed -i "/^ExecStop=.*/a ProtectHome=true\nProtectSystem=strict\nReadOnlyPaths=$SS_BIN\nReadWritePaths=$CONFIG_DIR\nPrivateTmp=true" "$SERVICE"
+                fi
+                CHANGED=1
+            elif ! grep -q "^ReadWritePaths=$CONFIG_DIR" "$SERVICE" 2>/dev/null; then
+                sed -i "/^ProtectSystem=strict/a ReadWritePaths=$CONFIG_DIR" "$SERVICE"
+                CHANGED=1
+            fi
+        fi
+    fi
+
+    secure_data_files
+    if [ "$CHANGED" -eq 1 ]; then
+        svc_reload
+        svc_restart 2>/dev/null || true
+        echo -e "${GREEN}✅ 服务权限已自动加固${NC}"
     fi
 }
 
@@ -220,6 +347,36 @@ manual_domain_count() {
 
 third_party_mirrors_enabled() {
     [ "${VOLSS_ALLOW_THIRD_PARTY_MIRRORS:-0}" = "1" ]
+}
+
+sha256_file() {
+    local FILE=$1
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$FILE" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$FILE" | awk '{print $NF}'
+    elif command -v python3 >/dev/null 2>&1; then
+        python3 - "$FILE" << 'PYEOF'
+import hashlib
+import sys
+
+h = hashlib.sha256()
+with open(sys.argv[1], 'rb') as f:
+    for chunk in iter(lambda: f.read(1024 * 1024), b''):
+        h.update(chunk)
+print(h.hexdigest())
+PYEOF
+    else
+        return 1
+    fi
+}
+
+verify_sha256() {
+    local FILE=$1
+    local EXPECTED=$2
+    local ACTUAL
+    ACTUAL=$(sha256_file "$FILE") || return 1
+    [ "$ACTUAL" = "$EXPECTED" ]
 }
 
 persist_firewall_rules() {
@@ -486,8 +643,8 @@ install_deps() {
 install_ssrust() {
     echo -e "\n${YELLOW}>>> 安装 Shadowsocks-Rust...${NC}"
 
-    LATEST=$(curl -s https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest \
-        | grep tag_name | cut -d'"' -f4)
+    RELEASE_JSON=$(curl -fsSL --max-time 20 https://api.github.com/repos/shadowsocks/shadowsocks-rust/releases/latest 2>/dev/null)
+    LATEST=$(printf '%s\n' "$RELEASE_JSON" | python3 -c "import json, sys; print(json.load(sys.stdin).get('tag_name', ''))" 2>/dev/null)
 
     if [ -z "$LATEST" ]; then
         echo -e "${RED}❌ 获取版本号失败，请检查网络${NC}"
@@ -519,7 +676,23 @@ install_ssrust() {
         esac
     fi
 
-    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${LATEST}/shadowsocks-${LATEST}.${ARCH_NAME}.tar.xz"
+    ASSET_NAME="shadowsocks-${LATEST}.${ARCH_NAME}.tar.xz"
+    EXPECTED_SHA256=$(printf '%s\n' "$RELEASE_JSON" | python3 -c "
+import json, sys
+name = sys.argv[1]
+for asset in json.load(sys.stdin).get('assets', []):
+    if asset.get('name') == name:
+        digest = asset.get('digest', '')
+        if digest.startswith('sha256:'):
+            print(digest.split(':', 1)[1])
+        break
+" "$ASSET_NAME" 2>/dev/null)
+    if [ -z "$EXPECTED_SHA256" ]; then
+        echo -e "${RED}❌ 未找到 $ASSET_NAME 的 SHA256 校验信息，已停止安装${NC}"
+        return 1
+    fi
+
+    URL="https://github.com/shadowsocks/shadowsocks-rust/releases/download/${LATEST}/${ASSET_NAME}"
     TMP_DIR=$(mktemp -d /tmp/volss.XXXXXX) || {
         echo -e "${RED}❌ 创建临时目录失败${NC}"
         return 1
@@ -547,6 +720,12 @@ install_ssrust() {
         return 1
     fi
 
+    if ! verify_sha256 "$TMP_TAR" "$EXPECTED_SHA256"; then
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ 下载文件 SHA256 校验失败，已停止安装${NC}"
+        return 1
+    fi
+
     if ! tar -xJf "$TMP_TAR" -C "$TMP_DIR" 2>/dev/null; then
         rm -rf "$TMP_DIR"
         echo -e "${RED}❌ 解压失败，请确认已安装 xz${NC}"
@@ -560,7 +739,7 @@ install_ssrust() {
     fi
 
     mv "$TMP_DIR/ssserver" "$SS_BIN"
-    chmod +x $SS_BIN
+    chmod +x "$SS_BIN"
     mkdir -p "$CONFIG_DIR"
     rm -rf "$TMP_DIR"
 
@@ -729,7 +908,7 @@ ACLEOF
 
 gen_password() {
     if [ "$KEY_LEN" -gt 0 ]; then
-        openssl rand -base64 $KEY_LEN
+        openssl rand -base64 "$KEY_LEN"
     else
         openssl rand -base64 32 | tr -d '=' | cut -c1-24
     fi
@@ -816,6 +995,7 @@ PYEOF
 
 create_service() {
     echo -e "\n${YELLOW}>>> 创建系统服务...${NC}"
+    ensure_service_user
 
     if [ "$SYSTEM" = "alpine" ]; then
         cat > $SERVICE << EOF
@@ -826,6 +1006,7 @@ description="Shadowsocks-Rust Server"
 command="$SS_BIN"
 command_args="-c $RUNTIME"
 command_background=true
+command_user="$SS_USER:$SS_GROUP"
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="/var/log/shadowsocks-rust.log"
 error_log="/var/log/shadowsocks-rust.log"
@@ -853,11 +1034,17 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+User=$SS_USER
+Group=$SS_GROUP
 ExecStart=$SS_BIN -c $RUNTIME
-ExecStop=/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'
+ExecStop=+/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'
 Restart=always
 RestartSec=5s
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=$SS_BIN
+ReadWritePaths=$CONFIG_DIR
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target
@@ -929,7 +1116,7 @@ EOF
 }
 
 # ========== 完整安装流程 ==========
-do_install() {
+do_install_locked() {
     if check_installed; then
         echo -e "${YELLOW}⚠ 检测到已安装 Shadowsocks-Rust${NC}"
         read -r -p "是否重新安装？[y/N]: " CONFIRM
@@ -955,7 +1142,7 @@ do_install() {
 }
 
 # ========== 卸载 ==========
-do_uninstall() {
+do_uninstall_locked() {
     echo -e "${RED}⚠ 此操作将完全卸载 Shadowsocks-Rust${NC}"
     read -r -p "确认卸载？[y/N]: " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
@@ -974,6 +1161,14 @@ do_uninstall() {
 
     echo -e "${GREEN}✅ 卸载完成${NC}"
     read -r -p "按回车继续..."
+}
+
+do_install() {
+    with_state_lock do_install_locked
+}
+
+do_uninstall() {
+    with_state_lock do_uninstall_locked
 }
 
 # =============================================
@@ -1010,8 +1205,7 @@ show_links() {
     echo -e "  链接已保存至: ${YELLOW}$LINKS_FILE${NC}"
 }
 
-# ========== 保存当前 iptables 计数到文件 ==========
-save_traffic() {
+save_traffic_locked() {
     python3 << PYEOF
 import json, subprocess, os, tempfile
 
@@ -1021,81 +1215,88 @@ traffic_file = '$TRAFFIC_FILE'
 with open(config_file) as f:
     c = json.load(f)
 
-# 读取已有历史数据
-if os.path.exists(traffic_file):
+try:
     with open(traffic_file) as f:
         history = json.load(f)
-else:
+except Exception:
     history = {}
-
-def get_bytes(chain, port, direction):
-    import re
-    try:
-        out = subprocess.check_output(['iptables', '-nvxL', chain], text=True)
-        total = 0
-        # 精确匹配 spt:PORT / dpt:PORT 后接非数字或行尾，避免 3000 误匹配 30001
-        pat = re.compile(r'\b%s:%d(?:\D|$)' % ('spt' if direction == 'sport' else 'dpt', port))
-        for line in out.splitlines():
-            if pat.search(line):
-                parts = line.split()
-                if len(parts) >= 2:
-                    try:
-                        total += int(parts[1])
-                    except ValueError:
-                        pass
-        return total
-    except:
-        return 0
 
 def chain_exists(chain):
     return subprocess.run(['iptables', '-L', chain, '-n'],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
+def snapshot_and_zero(chain):
+    try:
+        return subprocess.check_output(['iptables', '-nvxL', chain, '-Z'], text=True)
+    except Exception:
+        return ''
+
+def snapshot_only(chain):
+    try:
+        return subprocess.check_output(['iptables', '-nvxL', chain], text=True)
+    except Exception:
+        return ''
+
+def collect_bytes(output, ports):
+    import re
+    totals = {str(port): {'tx': 0, 'rx': 0} for port in ports}
+    patterns = []
+    for port in ports:
+        patterns.append((str(port), 'tx', re.compile(r'\bspt:%d(?:\D|$)' % port)))
+        patterns.append((str(port), 'rx', re.compile(r'\bdpt:%d(?:\D|$)' % port)))
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            byte_count = int(parts[1])
+        except ValueError:
+            continue
+        for key, direction, pat in patterns:
+            if pat.search(line):
+                totals[key][direction] += byte_count
+    return totals
+
 traffic_chain = '$TRAFFIC_CHAIN'
 use_traffic_chain = chain_exists(traffic_chain)
+ports = [int(s['server_port']) for s in c['servers']]
 
-# 读取增量并累加
+if use_traffic_chain:
+    totals = collect_bytes(snapshot_and_zero(traffic_chain), ports)
+else:
+    output_totals = collect_bytes(snapshot_only('OUTPUT'), ports)
+    input_totals = collect_bytes(snapshot_only('INPUT'), ports)
+    totals = {}
+    for port in ports:
+        key = str(port)
+        totals[key] = {
+            'tx': output_totals.get(key, {}).get('tx', 0),
+            'rx': input_totals.get(key, {}).get('rx', 0),
+        }
+
 for s in c['servers']:
     port = str(s['server_port'])
-    if use_traffic_chain:
-        tx = get_bytes(traffic_chain, s['server_port'], 'sport')
-        rx = get_bytes(traffic_chain, s['server_port'], 'dport')
-    else:
-        tx = get_bytes('OUTPUT', s['server_port'], 'sport')
-        rx = get_bytes('INPUT',  s['server_port'], 'dport')
     if port not in history:
         history[port] = {'tx': 0, 'rx': 0}
-    history[port]['tx'] += tx
-    history[port]['rx'] += rx
+    history[port]['tx'] += totals.get(port, {}).get('tx', 0)
+    history[port]['rx'] += totals.get(port, {}).get('rx', 0)
 
 traffic_dir = os.path.dirname(traffic_file)
 fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(traffic_file) + '.', dir=traffic_dir, text=True)
 with os.fdopen(fd, 'w') as f:
     json.dump(history, f, indent=2)
 os.replace(tmp, traffic_file)
-
-# 关键：读取后只清零本脚本管理端口的计数器，避免影响其他 iptables 统计
-import re
-for s in c['servers']:
-    port = s['server_port']
-    chains = (traffic_chain,) if use_traffic_chain else ('INPUT', 'OUTPUT')
-    for chain in chains:
-        try:
-            out = subprocess.check_output(['iptables', '-nvL', chain, '--line-numbers'], text=True)
-            pat = re.compile(r'\b[sd]pt:%d(?:\D|$)' % port)
-            lines = []
-            for line in out.splitlines():
-                if pat.search(line):
-                    parts = line.split()
-                    if parts and parts[0].isdigit():
-                        lines.append(int(parts[0]))
-            for line_no in sorted(lines, reverse=True):
-                subprocess.run(['iptables', '-Z', chain, str(line_no)], check=False,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except Exception:
-            pass
 PYEOF
+    if ! traffic_chain_installed; then
+        PORTS=$(config_ports)
+        zero_traffic_counters_for_ports "$PORTS"
+    fi
     secure_data_files
+}
+
+# ========== 保存当前 iptables 计数到文件 ==========
+save_traffic() {
+    with_state_lock save_traffic_locked
 }
 
 show_traffic() {
@@ -1140,7 +1341,7 @@ PYEOF
     echo -e "  ${YELLOW}提示: 手动重置前流量数据永久累计，不受重启影响${NC}"
 }
 
-reset_traffic() {
+reset_traffic_locked() {
     list_users
     read -r -p "输入要重置的用户编号 (0=全部重置): " NUM
     if ! is_uint "$NUM"; then
@@ -1215,7 +1416,7 @@ PYEOF
     echo -e "${GREEN}✅ 端口 $PORT 流量已重置${NC}"
 }
 
-disable_user() {
+disable_user_locked() {
     list_users
     read -r -p "输入要暂停的用户编号: " NUM
     if ! is_uint "$NUM" || [ "$NUM" -lt 1 ]; then
@@ -1253,7 +1454,7 @@ PYEOF
     echo -e "${YELLOW}⏸ 端口 $PORT 已暂停${NC}"
 }
 
-enable_user() {
+enable_user_locked() {
     list_users
     read -r -p "输入要恢复的用户编号: " NUM
     if ! is_uint "$NUM" || [ "$NUM" -lt 1 ]; then
@@ -1291,7 +1492,7 @@ PYEOF
     echo -e "${GREEN}✅ 端口 $PORT 已恢复${NC}"
 }
 
-delete_user() {
+delete_user_locked() {
     list_users
     read -r -p "输入要删除的用户编号: " NUM
     if ! is_uint "$NUM" || [ "$NUM" -lt 1 ]; then
@@ -1339,7 +1540,7 @@ PYEOF
     echo -e "${RED}🗑 端口 $PORT 已删除${NC}"
 }
 
-regen_users() {
+regen_users_locked() {
     echo -e "${YELLOW}>>> 重新生成所有用户密码（端口保持不变）${NC}"
     read -r -p "确认？所有密码将变更，旧链接失效 [y/N]: " CONFIRM
     if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
@@ -1415,7 +1616,7 @@ PYEOF
     secure_data_files
 }
 
-add_user() {
+add_user_locked() {
     if ! check_installed; then
         echo -e "${RED}请先安装 Shadowsocks-Rust${NC}"; return
     fi
@@ -1537,6 +1738,30 @@ PYEOF
     echo -e "${GREEN}✅ 新用户添加完成${NC}"
 }
 
+reset_traffic() {
+    with_state_lock reset_traffic_locked
+}
+
+disable_user() {
+    with_state_lock disable_user_locked
+}
+
+enable_user() {
+    with_state_lock enable_user_locked
+}
+
+delete_user() {
+    with_state_lock delete_user_locked
+}
+
+regen_users() {
+    with_state_lock regen_users_locked
+}
+
+add_user() {
+    with_state_lock add_user_locked
+}
+
 # ========== 更新脚本 ==========
 do_update() {
     REMOTE_PATH="chnnic/VOLSS/refs/heads/main/volss.sh"
@@ -1555,7 +1780,7 @@ do_update() {
     fi
     DL_OK=0
     for BASE in "${UPDATE_BASES[@]}"; do
-        if fetch_url "$BASE/$REMOTE_PATH" "$TMP_NEW" 25 && head -1 "$TMP_NEW" | grep -q '#!/'; then
+        if fetch_url "$BASE/$REMOTE_PATH" "$TMP_NEW" 25 && bash -n "$TMP_NEW" 2>/dev/null && grep -q '^VERSION="V' "$TMP_NEW"; then
             DL_OK=1
             break
         fi
@@ -1656,6 +1881,8 @@ os.replace(tmp, runtime_file)
 print("✅ runtime.json 已更新")
 PYEOF
 
+        harden_service_if_needed
+
         # 修复旧版 ACL 格式（domain-suffix: → ||，移除 ssserver 不使用的本地 ACL 段）
         if [ -f "$ACL_PATH" ]; then
             sed -i 's/^domain-suffix:/||/' $ACL_PATH
@@ -1693,15 +1920,9 @@ if changed:
     print("✅ mode 字段已补全（TCP+UDP）")
 PYEOF
 
-        if grep -q "Restart=on-failure" $SERVICE 2>/dev/null; then
+        if [ "$SYSTEM" != "alpine" ] && grep -q "Restart=on-failure" $SERVICE 2>/dev/null; then
             sed -i 's/Restart=on-failure/Restart=always/' $SERVICE
             echo -e "${GREEN}✅ 服务文件已修复${NC}"
-        fi
-
-        # 确保 ExecStop 存在
-        if ! grep -q "ExecStop" $SERVICE 2>/dev/null; then
-            sed -i "/ExecStart=.*/a ExecStop=/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'" $SERVICE
-            echo -e "${GREEN}✅ 服务停止钩子已添加${NC}"
         fi
 
         svc_reload
@@ -1714,7 +1935,7 @@ PYEOF
     exec bash "$SCRIPT_INSTALL_PATH" --menu
 }
 
-add_acl_domain() {
+add_acl_domain_locked() {
     read -r -p "输入要屏蔽的域名: " NEW_DOMAIN
     if [ -n "$NEW_DOMAIN" ]; then
         NEW_DOMAIN=$(normalize_domain "$NEW_DOMAIN")
@@ -1734,7 +1955,7 @@ add_acl_domain() {
     fi
 }
 
-del_acl_domain() {
+del_acl_domain_locked() {
     if [ ! -f "$MANUAL_FILE" ] || [ ! -s "$MANUAL_FILE" ]; then
         echo -e "${YELLOW}没有手动添加的域名${NC}"; return
     fi
@@ -1786,6 +2007,14 @@ del_acl_domain() {
         rebuild_acl
         echo -e "${GREEN}✅ 共删除 $DELETED 条，服务已重启${NC}"
     fi
+}
+
+add_acl_domain() {
+    with_state_lock add_acl_domain_locked
+}
+
+del_acl_domain() {
+    with_state_lock del_acl_domain_locked
 }
 
 # ========== ACL 规则集管理 ==========
@@ -1954,7 +2183,7 @@ rebuild_acl() {
 }
 
 # 显示规则集菜单
-manage_rulesets() {
+manage_rulesets_locked() {
     init_ruleset_dir
 
     while true; do
@@ -2126,6 +2355,10 @@ manage_rulesets() {
         esac
         read -r -p "按回车继续..."
     done
+}
+
+manage_rulesets() {
+    with_state_lock manage_rulesets_locked
 }
 
 
@@ -2304,6 +2537,8 @@ EOF
         fi
     fi
 
+    harden_service_if_needed
+
     # 自检：ACL 格式修复（移除 ssserver 不使用的本地 ACL 段，确保 outbound_block_list 存在）
     if [ -f "$ACL_PATH" ]; then
         NEED_FIX=0
@@ -2318,6 +2553,7 @@ EOF
             if ! grep -q "^\[outbound_block_list\]" $ACL_PATH; then
                 sed -i '1i [outbound_block_list]' $ACL_PATH
             fi
+            secure_data_files
             svc_restart 2>/dev/null
             echo -e "${GREEN}✅ ACL 格式已自动修复并重启服务${NC}"
         fi
@@ -2334,6 +2570,7 @@ with os.fdopen(fd, 'w') as f: json.dump(r,f,indent=2)
 os.replace(tmp, '$RUNTIME')
 print('✅ runtime.json acl 字段已补全')
 "
+                secure_data_files
                 svc_restart
             fi
         fi
@@ -2359,6 +2596,7 @@ for path in ['$CONFIG', '$RUNTIME']:
         pass
 print('✅ UDP 模式已自动开启')
 PYEOF
+                secure_data_files
                 svc_restart
             fi
         fi
