@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.5.6
+#   版本: V1.5.7
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.5.6"
+VERSION="V1.5.7"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -63,6 +63,7 @@ CONFIG="/etc/shadowsocks-rust/config.json"
 RUNTIME="/etc/shadowsocks-rust/runtime.json"
 ACL_PATH="/etc/shadowsocks-rust/blocklist.acl"
 LINKS_FILE="/etc/shadowsocks-rust/ss_links.txt"
+SERVER_HOST_FILE="/etc/shadowsocks-rust/server_host"
 TRAFFIC_FILE="/etc/shadowsocks-rust/traffic.json"
 MANUAL_FILE="/etc/shadowsocks-rust/manual.list"
 SHORTCUT="/usr/local/bin/volss"
@@ -94,11 +95,11 @@ group_exists() {
 
 ensure_service_user() {
     if [ "$SYSTEM" = "alpine" ]; then
-        group_exists "$SS_GROUP" || addgroup -S "$SS_GROUP" >/dev/null 2>&1
-        id -u "$SS_USER" >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin -G "$SS_GROUP" "$SS_USER" >/dev/null 2>&1
+        group_exists "$SS_GROUP" || addgroup -S "$SS_GROUP" >/dev/null 2>&1 || return 1
+        id -u "$SS_USER" >/dev/null 2>&1 || adduser -S -D -H -s /sbin/nologin -G "$SS_GROUP" "$SS_USER" >/dev/null 2>&1 || return 1
     else
-        group_exists "$SS_GROUP" || groupadd --system "$SS_GROUP" >/dev/null 2>&1
-        id -u "$SS_USER" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --gid "$SS_GROUP" "$SS_USER" >/dev/null 2>&1
+        group_exists "$SS_GROUP" || groupadd --system "$SS_GROUP" >/dev/null 2>&1 || return 1
+        id -u "$SS_USER" >/dev/null 2>&1 || useradd --system --no-create-home --shell /usr/sbin/nologin --gid "$SS_GROUP" "$SS_USER" >/dev/null 2>&1 || return 1
     fi
 }
 
@@ -116,7 +117,7 @@ secure_runtime_owner() {
 
 secure_data_files() {
     local FILE
-    for FILE in "$CONFIG" "$RUNTIME" "$LINKS_FILE" "$TRAFFIC_FILE" "$MANUAL_FILE" "$ACL_PATH"; do
+    for FILE in "$CONFIG" "$RUNTIME" "$LINKS_FILE" "$SERVER_HOST_FILE" "$TRAFFIC_FILE" "$MANUAL_FILE" "$ACL_PATH"; do
         secure_file "$FILE"
     done
     if [ -d "$ACL_RULESET_DIR" ]; then
@@ -170,12 +171,19 @@ with_state_lock() {
 
 harden_service_if_needed() {
     check_installed || return 0
-    ensure_service_user
+    ensure_service_user || {
+        echo -e "${RED}❌ 无法创建 Shadowsocks 服务用户${NC}"
+        return 1
+    }
     local CHANGED=0
 
     if [ "$SYSTEM" = "alpine" ]; then
         if [ -f "$SERVICE" ] && ! grep -q '^command_user=' "$SERVICE" 2>/dev/null; then
             sed -i "/^command_background=/a command_user=\"$SS_USER:$SS_GROUP\"" "$SERVICE"
+            CHANGED=1
+        fi
+        if [ -f "$SERVICE" ] && grep -q -- '--save-traffic' "$SERVICE" 2>/dev/null && ! grep -q -- '--save-traffic-if-unlocked' "$SERVICE" 2>/dev/null; then
+            sed -i 's/--save-traffic/--save-traffic-if-unlocked/g' "$SERVICE"
             CHANGED=1
         fi
     else
@@ -192,10 +200,14 @@ harden_service_if_needed() {
                 CHANGED=1
             fi
             if ! grep -q "ExecStop" "$SERVICE" 2>/dev/null; then
-                sed -i "/ExecStart=.*/a ExecStop=+/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'" "$SERVICE"
+                sed -i "/ExecStart=.*/a ExecStop=+/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic-if-unlocked'" "$SERVICE"
                 CHANGED=1
             elif grep -q "^ExecStop=/bin/bash" "$SERVICE" 2>/dev/null; then
                 sed -i 's#^ExecStop=/bin/bash#ExecStop=+/bin/bash#' "$SERVICE"
+                CHANGED=1
+            fi
+            if grep -q -- '--save-traffic' "$SERVICE" 2>/dev/null && ! grep -q -- '--save-traffic-if-unlocked' "$SERVICE" 2>/dev/null; then
+                sed -i 's/--save-traffic/--save-traffic-if-unlocked/g' "$SERVICE"
                 CHANGED=1
             fi
             if ! grep -q "^ProtectSystem=strict" "$SERVICE" 2>/dev/null; then
@@ -333,6 +345,112 @@ valid_domain() {
     [[ "$1" =~ ^[A-Za-z0-9._*-]+$ ]]
 }
 
+normalize_server_host() {
+    python3 - "$1" << 'PYEOF'
+import ipaddress
+import re
+import sys
+
+host = sys.argv[1].strip()
+if host.startswith('[') and host.endswith(']'):
+    host = host[1:-1]
+if not host or any(ch.isspace() for ch in host):
+    raise SystemExit(1)
+
+try:
+    print(ipaddress.ip_address(host).compressed)
+    raise SystemExit(0)
+except ValueError:
+    pass
+
+host = host.rstrip('.')
+try:
+    ascii_host = host.encode('idna').decode('ascii').lower()
+except UnicodeError:
+    raise SystemExit(1)
+if len(ascii_host) > 253:
+    raise SystemExit(1)
+labels = ascii_host.split('.')
+if not labels or any(
+    not label
+    or len(label) > 63
+    or not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?', label)
+    for label in labels
+):
+    raise SystemExit(1)
+print(ascii_host)
+PYEOF
+}
+
+format_ss_host() {
+    if [[ "$1" == *:* ]]; then
+        printf '[%s]\n' "$1"
+    else
+        printf '%s\n' "$1"
+    fi
+}
+
+server_bind_address() {
+    if python3 - << 'PYEOF' >/dev/null 2>&1
+import socket
+
+sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+try:
+    sock.bind(('::', 0))
+finally:
+    sock.close()
+PYEOF
+    then
+        echo "::"
+    else
+        echo "0.0.0.0"
+    fi
+}
+
+save_server_host() {
+    local HOST_VALUE=$1
+    local TMP_HOST
+    mkdir -p "$CONFIG_DIR" || return 1
+    TMP_HOST=$(make_temp_for "$SERVER_HOST_FILE") || return 1
+    printf '%s\n' "$HOST_VALUE" > "$TMP_HOST" || {
+        rm -f "$TMP_HOST"
+        return 1
+    }
+    mv "$TMP_HOST" "$SERVER_HOST_FILE" || return 1
+    secure_file "$SERVER_HOST_FILE"
+}
+
+get_server_host() {
+    local HOST_VALUE=""
+    if [ -s "$SERVER_HOST_FILE" ]; then
+        HOST_VALUE=$(normalize_server_host "$(head -n 1 "$SERVER_HOST_FILE")" 2>/dev/null) || HOST_VALUE=""
+    fi
+    if [ -z "$HOST_VALUE" ] && [ -s "$LINKS_FILE" ]; then
+        HOST_VALUE=$(python3 - "$LINKS_FILE" << 'PYEOF'
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as f:
+    line = f.readline().strip()
+try:
+    authority = line.split('@', 1)[1].split('#', 1)[0]
+    if authority.startswith('['):
+        host = authority[1:authority.index(']')]
+    else:
+        host = authority.rsplit(':', 1)[0]
+    print(host)
+except (IndexError, ValueError):
+    raise SystemExit(1)
+PYEOF
+) || HOST_VALUE=""
+        if [ -n "$HOST_VALUE" ]; then
+            HOST_VALUE=$(normalize_server_host "$HOST_VALUE" 2>/dev/null) || HOST_VALUE=""
+        fi
+    fi
+    [ -n "$HOST_VALUE" ] || return 1
+    save_server_host "$HOST_VALUE" || return 1
+    printf '%s\n' "$HOST_VALUE"
+}
+
 normalize_domain() {
     echo "$1" | sed 's/^domain-suffix://; s/^||//; s/^|//; s/^www\.//'
 }
@@ -387,9 +505,26 @@ persist_firewall_rules() {
         mkdir -p /etc/iptables
         rc-update add iptables default 2>/dev/null
         /etc/init.d/iptables save 2>/dev/null || iptables-save > /etc/iptables/rules-save 2>/dev/null
+        if ipv6_firewall_available; then
+            if [ -f /etc/init.d/ip6tables ]; then
+                rc-update add ip6tables default 2>/dev/null
+                /etc/init.d/ip6tables save 2>/dev/null || true
+            else
+                ip6tables-save > /etc/iptables/rules6-save 2>/dev/null || true
+            fi
+        fi
     else
         netfilter-persistent save 2>/dev/null || true
     fi
+}
+
+ipv6_firewall_available() {
+    command -v ip6tables >/dev/null 2>&1 && ip6tables -L -n >/dev/null 2>&1
+}
+
+firewall_tools() {
+    command -v iptables >/dev/null 2>&1 && iptables -L -n >/dev/null 2>&1 && echo iptables
+    ipv6_firewall_available && echo ip6tables
 }
 
 config_ports() {
@@ -405,32 +540,40 @@ except Exception:
 }
 
 ensure_traffic_chain() {
-    iptables -N "$TRAFFIC_CHAIN" 2>/dev/null || true
-
-    for CHAIN in INPUT OUTPUT; do
-        while iptables -D "$CHAIN" -j "$TRAFFIC_CHAIN" 2>/dev/null; do :; done
-        iptables -I "$CHAIN" 1 -j "$TRAFFIC_CHAIN"
+    local IPT CHAIN TOOLS
+    TOOLS=$(firewall_tools)
+    [ -n "$TOOLS" ] || return 1
+    for IPT in $TOOLS; do
+        "$IPT" -N "$TRAFFIC_CHAIN" 2>/dev/null || true
+        for CHAIN in INPUT OUTPUT; do
+            while "$IPT" -D "$CHAIN" -j "$TRAFFIC_CHAIN" 2>/dev/null; do :; done
+            "$IPT" -I "$CHAIN" 1 -j "$TRAFFIC_CHAIN" || return 1
+        done
     done
 }
 
 remove_legacy_traffic_rules_for_ports() {
     local PORTS="$1"
-    local PORT PROTO
-    for PORT in $PORTS; do
-        for PROTO in tcp udp; do
-            while iptables -D INPUT  -p "$PROTO" --dport "$PORT" 2>/dev/null; do :; done
-            while iptables -D OUTPUT -p "$PROTO" --sport "$PORT" 2>/dev/null; do :; done
+    local IPT PORT PROTO
+    for IPT in $(firewall_tools); do
+        for PORT in $PORTS; do
+            for PROTO in tcp udp; do
+                while "$IPT" -D INPUT  -p "$PROTO" --dport "$PORT" 2>/dev/null; do :; done
+                while "$IPT" -D OUTPUT -p "$PROTO" --sport "$PORT" 2>/dev/null; do :; done
+            done
         done
     done
 }
 
 add_traffic_rules_for_ports() {
     local PORTS="$1"
-    local PORT PROTO
-    for PORT in $PORTS; do
-        for PROTO in tcp udp; do
-            iptables -A "$TRAFFIC_CHAIN" -p "$PROTO" --dport "$PORT"
-            iptables -A "$TRAFFIC_CHAIN" -p "$PROTO" --sport "$PORT"
+    local IPT PORT PROTO
+    for IPT in $(firewall_tools); do
+        for PORT in $PORTS; do
+            for PROTO in tcp udp; do
+                "$IPT" -A "$TRAFFIC_CHAIN" -p "$PROTO" --dport "$PORT" || return 1
+                "$IPT" -A "$TRAFFIC_CHAIN" -p "$PROTO" --sport "$PORT" || return 1
+            done
         done
     done
 }
@@ -438,9 +581,9 @@ add_traffic_rules_for_ports() {
 add_traffic_rules_for_new_ports() {
     local PORTS="$1"
     [ -n "$PORTS" ] || return 0
-    ensure_traffic_chain
+    ensure_traffic_chain || return 1
     remove_legacy_traffic_rules_for_ports "$PORTS"
-    add_traffic_rules_for_ports "$PORTS"
+    add_traffic_rules_for_ports "$PORTS" || return 1
     zero_traffic_counters_for_ports "$PORTS"
     persist_firewall_rules
 }
@@ -451,10 +594,13 @@ rebuild_traffic_rules() {
         cleanup_traffic_rules ""
         return 0
     fi
-    ensure_traffic_chain
-    iptables -F "$TRAFFIC_CHAIN" 2>/dev/null || true
+    ensure_traffic_chain || return 1
+    local IPT
+    for IPT in $(firewall_tools); do
+        "$IPT" -F "$TRAFFIC_CHAIN" 2>/dev/null || return 1
+    done
     remove_legacy_traffic_rules_for_ports "$PORTS"
-    add_traffic_rules_for_ports "$PORTS"
+    add_traffic_rules_for_ports "$PORTS" || return 1
     zero_traffic_counters_for_ports "$PORTS"
     persist_firewall_rules
 }
@@ -462,38 +608,48 @@ rebuild_traffic_rules() {
 cleanup_traffic_rules() {
     local PORTS="$1"
     remove_legacy_traffic_rules_for_ports "$PORTS"
-    iptables -F "$TRAFFIC_CHAIN" 2>/dev/null || true
-    for CHAIN in INPUT OUTPUT; do
-        while iptables -D "$CHAIN" -j "$TRAFFIC_CHAIN" 2>/dev/null; do :; done
+    local IPT CHAIN
+    for IPT in $(firewall_tools); do
+        "$IPT" -F "$TRAFFIC_CHAIN" 2>/dev/null || true
+        for CHAIN in INPUT OUTPUT; do
+            while "$IPT" -D "$CHAIN" -j "$TRAFFIC_CHAIN" 2>/dev/null; do :; done
+        done
+        "$IPT" -X "$TRAFFIC_CHAIN" 2>/dev/null || true
     done
-    iptables -X "$TRAFFIC_CHAIN" 2>/dev/null || true
     persist_firewall_rules
 }
 
-traffic_chain_installed() {
-    iptables -L "$TRAFFIC_CHAIN" -n >/dev/null 2>&1
+traffic_chains_installed() {
+    local IPT FOUND=0
+    for IPT in $(firewall_tools); do
+        FOUND=1
+        "$IPT" -L "$TRAFFIC_CHAIN" -n >/dev/null 2>&1 || return 1
+    done
+    [ "$FOUND" -eq 1 ]
 }
 
 migrate_traffic_rules_if_needed() {
     check_installed || return 0
-    traffic_chain_installed && return 0
+    traffic_chains_installed && return 0
     local PORTS
     PORTS=$(config_ports)
     [ -n "$PORTS" ] || return 0
-    save_traffic
+    save_traffic || return 1
     rebuild_traffic_rules "$PORTS"
 }
 
 # 只清零指定端口的 iptables 计数器（精确匹配，不影响其他统计）
 zero_traffic_counters_for_ports() {
     local PORTS="$1"
-    local CHAIN L PORT LINES
-    for CHAIN in "$TRAFFIC_CHAIN" INPUT OUTPUT; do
-        iptables -L "$CHAIN" -n >/dev/null 2>&1 || continue
-        for PORT in $PORTS; do
-            LINES=$(iptables -nvL "$CHAIN" --line-numbers 2>/dev/null | awk -v p="$PORT" '$0 ~ ("dpt:"p"( |$)") || $0 ~ ("spt:"p"( |$)") {print $1}' | sort -rn)
-            for L in $LINES; do
-                iptables -Z "$CHAIN" "$L" 2>/dev/null
+    local IPT CHAIN L PORT LINES
+    for IPT in $(firewall_tools); do
+        for CHAIN in "$TRAFFIC_CHAIN" INPUT OUTPUT; do
+            "$IPT" -L "$CHAIN" -n >/dev/null 2>&1 || continue
+            for PORT in $PORTS; do
+                LINES=$("$IPT" -nvL "$CHAIN" --line-numbers 2>/dev/null | awk -v p="$PORT" '$0 ~ ("dpt:"p"( |$)") || $0 ~ ("spt:"p"( |$)") {print $1}' | sort -rn)
+                for L in $LINES; do
+                    "$IPT" -Z "$CHAIN" "$L" 2>/dev/null
+                done
             done
         done
     done
@@ -630,12 +786,24 @@ do_time_sync() {
 install_deps() {
     echo -e "\n${YELLOW}>>> 安装依赖...${NC}"
     if [ "$SYSTEM" = "alpine" ]; then
-        apk update -q
-        apk add --no-cache curl wget openssl python3 iproute2 xz iptables net-tools bash coreutils
+        apk update -q || {
+            echo -e "${RED}❌ 更新 Alpine 软件索引失败${NC}"
+            return 1
+        }
+        apk add --no-cache curl wget openssl python3 iproute2 xz iptables net-tools bash coreutils || {
+            echo -e "${RED}❌ 安装依赖失败${NC}"
+            return 1
+        }
     else
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update -qq
-        apt-get install -y curl wget openssl python3 iproute2 xz-utils iptables-persistent -qq
+        apt-get update -qq || {
+            echo -e "${RED}❌ 更新 APT 软件索引失败${NC}"
+            return 1
+        }
+        apt-get install -y curl wget openssl python3 iproute2 xz-utils iptables-persistent -qq || {
+            echo -e "${RED}❌ 安装依赖失败${NC}"
+            return 1
+        }
     fi
     echo -e "${GREEN}✅ 依赖安装完成${NC}"
 }
@@ -738,9 +906,13 @@ for asset in json.load(sys.stdin).get('assets', []):
         return 1
     fi
 
-    mv "$TMP_DIR/ssserver" "$SS_BIN"
-    chmod +x "$SS_BIN"
-    mkdir -p "$CONFIG_DIR"
+    mv "$TMP_DIR/ssserver" "$SS_BIN" || {
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ 安装 ssserver 文件失败${NC}"
+        return 1
+    }
+    chmod +x "$SS_BIN" || return 1
+    mkdir -p "$CONFIG_DIR" || return 1
     rm -rf "$TMP_DIR"
 
     echo -e "${GREEN}✅ ss-rust $LATEST 安装完成${NC}"
@@ -794,6 +966,10 @@ select_ports() {
         PORT_LIST=()
         CURRENT=$START_PORT
         while [ ${#PORT_LIST[@]} -lt "$USER_COUNT" ]; do
+            if [ "$CURRENT" -gt 65535 ]; then
+                echo -e "${RED}❌ 端口耗尽，无法分配足够端口${NC}"
+                return 1
+            fi
             if port_in_use "$CURRENT"; then
                 echo -e "  ${YELLOW}端口 $CURRENT 已占用，跳过${NC}"
             else
@@ -801,10 +977,6 @@ select_ports() {
                 echo -e "  ${GREEN}端口 $CURRENT 可用 ✓${NC}"
             fi
             CURRENT=$((CURRENT + 1))
-            if [ $CURRENT -gt 65535 ]; then
-                echo -e "${RED}❌ 端口耗尽，无法分配足够端口${NC}"
-                return 1
-            fi
         done
 
     else
@@ -823,27 +995,16 @@ select_ports() {
 
         echo -e "\n${YELLOW}>>> 正在随机分配端口（跳过已占用）...${NC}"
         PORT_LIST=()
-        TRIED=0
-        MAX_TRY=$(( RANGE_END - RANGE_START ))
-
-        while [ ${#PORT_LIST[@]} -lt "$USER_COUNT" ]; do
-            RAND_PORT=$(( RANGE_START + RANDOM % (RANGE_END - RANGE_START + 1) ))
-            # 检查是否已在列表中
-            DUP=0
-            for P in "${PORT_LIST[@]}"; do
-                [ "$P" = "$RAND_PORT" ] && DUP=1 && break
-            done
-            if [ "$DUP" = "1" ] || port_in_use $RAND_PORT; then
-                TRIED=$((TRIED + 1))
-                if [ $TRIED -gt $MAX_TRY ]; then
-                    echo -e "${RED}❌ 范围内可用端口不足${NC}"
-                    return 1
-                fi
-                continue
-            fi
+        while IFS= read -r RAND_PORT; do
+            port_in_use "$RAND_PORT" && continue
             PORT_LIST+=("$RAND_PORT")
             echo -e "  ${GREEN}端口 $RAND_PORT 已分配 ✓${NC}"
-        done
+            [ ${#PORT_LIST[@]} -ge "$USER_COUNT" ] && break
+        done < <(shuf -i "$RANGE_START-$RANGE_END")
+        if [ ${#PORT_LIST[@]} -lt "$USER_COUNT" ]; then
+            echo -e "${RED}❌ 范围内可用端口不足${NC}"
+            return 1
+        fi
     fi
 
     echo -e "${GREEN}✅ 端口分配完成，共 ${#PORT_LIST[@]} 个${NC}"
@@ -851,14 +1012,34 @@ select_ports() {
 
 basic_config() {
     echo -e "\n${YELLOW}>>> 服务器信息${NC}"
-    read -r -p "服务器域名或IP [默认自动检测]: " HOST
-    if [ -z "$HOST" ]; then
-        HOST=$(curl -s4 --max-time 5 ifconfig.me 2>/dev/null \
-            || curl -s4 --max-time 5 ip.sb 2>/dev/null \
-            || curl -s4 --max-time 5 api.ipify.org 2>/dev/null \
-            || curl -s4 --max-time 5 ifconfig.co 2>/dev/null)
-        echo -e "检测到IP: ${GREEN}$HOST${NC}"
-    fi
+    local INPUT_HOST NORMALIZED URL CANDIDATE
+    while true; do
+        read -r -p "服务器域名或IP [默认自动检测]: " INPUT_HOST
+        if [ -z "$INPUT_HOST" ]; then
+            INPUT_HOST=""
+            for URL in https://ifconfig.me/ip https://ip.sb https://api.ipify.org https://ifconfig.co/ip; do
+                CANDIDATE=$(curl -fsS4 --max-time 5 "$URL" 2>/dev/null | tr -d '\r\n') || continue
+                if NORMALIZED=$(normalize_server_host "$CANDIDATE" 2>/dev/null); then
+                    INPUT_HOST=$NORMALIZED
+                    break
+                fi
+            done
+            if [ -z "$INPUT_HOST" ]; then
+                echo -e "${RED}❌ 自动检测失败，请手动输入域名或 IP${NC}"
+                continue
+            fi
+        fi
+        if NORMALIZED=$(normalize_server_host "$INPUT_HOST" 2>/dev/null); then
+            HOST=$NORMALIZED
+            save_server_host "$HOST" || {
+                echo -e "${RED}❌ 保存服务器地址失败${NC}"
+                return 1
+            }
+            echo -e "服务器地址: ${GREEN}$HOST${NC}"
+            return 0
+        fi
+        echo -e "${RED}❌ 域名或 IP 格式无效${NC}"
+    done
 }
 
 config_acl() {
@@ -898,7 +1079,7 @@ ACLEOF
         done
 
         USE_ACL_FLAG=true
-        rebuild_acl
+        rebuild_acl || return 1
         echo -e "${GREEN}✅ ACL 配置完成${NC}"
     else
         USE_ACL_FLAG=false
@@ -916,7 +1097,14 @@ gen_password() {
 
 generate_config() {
     echo -e "\n${YELLOW}>>> 生成配置文件和 SS 链接...${NC}"
-    local TMP_CONFIG TMP_LINKS
+    local TMP_CONFIG TMP_LINKS BIND_ADDRESS LINK_HOST
+    HOST=$(normalize_server_host "$HOST" 2>/dev/null) || {
+        echo -e "${RED}❌ 服务器地址无效${NC}"
+        return 1
+    }
+    save_server_host "$HOST" || return 1
+    BIND_ADDRESS=$(server_bind_address)
+    LINK_HOST=$(format_ss_host "$HOST")
     TMP_CONFIG=$(make_temp_for "$CONFIG") || {
         echo -e "${RED}❌ 创建配置临时文件失败${NC}"
         return 1
@@ -943,24 +1131,28 @@ generate_config() {
         NUM=$((i + 1))
 
         if [ $NUM -lt "$TOTAL" ]; then
-            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}," >> "$TMP_CONFIG"
+            echo "  {\"server\":\"$BIND_ADDRESS\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}," >> "$TMP_CONFIG"
         else
-            echo "  {\"server\":\"::\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}" >> "$TMP_CONFIG"
+            echo "  {\"server\":\"$BIND_ADDRESS\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}" >> "$TMP_CONFIG"
         fi
 
         USERINFO=$(echo -n "$METHOD:$PASS" | base64 | tr -d '\n')
-        echo "ss://${USERINFO}@${HOST}:${PORT}#用户${NUM}" >> "$TMP_LINKS"
+        echo "ss://${USERINFO}@${LINK_HOST}:${PORT}#用户${NUM}" >> "$TMP_LINKS"
     done
 
-    echo ']}' >> "$TMP_CONFIG"
-    mv "$TMP_CONFIG" "$CONFIG"
-    mv "$TMP_LINKS" "$LINKS_FILE"
+    echo ']}' >> "$TMP_CONFIG" || return 1
+    mv "$TMP_CONFIG" "$CONFIG" || return 1
+    mv "$TMP_LINKS" "$LINKS_FILE" || return 1
     secure_data_files
     echo -e "${GREEN}✅ 配置生成完成${NC}"
 }
 
 apply_config() {
-    python3 << PYEOF
+    # 锁内配置变更会触发服务重启；先由当前进程保存计数，ExecStop 看到锁后可直接跳过。
+    if [ -f "$TRAFFIC_FILE" ] || traffic_chains_installed; then
+        save_traffic || return 1
+    fi
+    if ! python3 << PYEOF
 import json, os, tempfile
 
 with open('$CONFIG', 'r') as f:
@@ -987,15 +1179,25 @@ with os.fdopen(fd, 'w') as f:
     json.dump(runtime, f, indent=2)
 os.replace(tmp, runtime_file)
 PYEOF
+    then
+        echo -e "${RED}❌ 生成 runtime.json 失败${NC}"
+        return 1
+    fi
     secure_data_files
 
-    svc_reload
-    svc_restart
+    svc_reload || return 1
+    if ! svc_restart; then
+        echo -e "${RED}❌ Shadowsocks-Rust 服务重启失败${NC}"
+        return 1
+    fi
 }
 
 create_service() {
     echo -e "\n${YELLOW}>>> 创建系统服务...${NC}"
-    ensure_service_user
+    ensure_service_user || {
+        echo -e "${RED}❌ 创建 Shadowsocks 服务用户失败${NC}"
+        return 1
+    }
 
     if [ "$SYSTEM" = "alpine" ]; then
         cat > $SERVICE << EOF
@@ -1022,10 +1224,10 @@ start_pre() {
 }
 
 stop_pre() {
-    [ -f $SCRIPT_INSTALL_PATH ] && bash $SCRIPT_INSTALL_PATH --save-traffic 2>/dev/null || true
+    [ -f $SCRIPT_INSTALL_PATH ] && bash $SCRIPT_INSTALL_PATH --save-traffic-if-unlocked 2>/dev/null || true
 }
 EOF
-        chmod +x $SERVICE
+        chmod +x "$SERVICE" || return 1
     else
         cat > $SERVICE << EOF
 [Unit]
@@ -1037,7 +1239,7 @@ Type=simple
 User=$SS_USER
 Group=$SS_GROUP
 ExecStart=$SS_BIN -c $RUNTIME
-ExecStop=+/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic'
+ExecStop=+/bin/bash -c 'bash $SCRIPT_INSTALL_PATH --save-traffic-if-unlocked'
 Restart=always
 RestartSec=5s
 ProtectHome=true
@@ -1051,10 +1253,20 @@ WantedBy=multi-user.target
 EOF
     fi
 
-    apply_config
-    svc_reload
-    svc_enable
-    svc_restart
+    if [ ! -s "$SERVICE" ]; then
+        echo -e "${RED}❌ 写入系统服务文件失败${NC}"
+        return 1
+    fi
+
+    svc_reload || {
+        echo -e "${RED}❌ 重新加载服务配置失败${NC}"
+        return 1
+    }
+    apply_config || return 1
+    svc_enable || {
+        echo -e "${RED}❌ 设置服务开机启动失败${NC}"
+        return 1
+    }
     sleep 2
 
     if check_svc_running; then
@@ -1066,6 +1278,7 @@ EOF
         else
             echo "日志: journalctl -u shadowsocks-rust -n 20"
         fi
+        return 1
     fi
 }
 
@@ -1073,7 +1286,10 @@ init_traffic() {
     echo -e "\n${YELLOW}>>> 初始化流量统计规则...${NC}"
 
     PORTS=$(config_ports)
-    rebuild_traffic_rules "$PORTS"
+    rebuild_traffic_rules "$PORTS" || {
+        echo -e "${RED}❌ 初始化流量统计规则失败${NC}"
+        return 1
+    }
 
     echo -e "${GREEN}✅ 流量统计初始化完成${NC}"
 }
@@ -1101,11 +1317,15 @@ install_shortcut() {
         fi
     fi
 
-    cat > $SHORTCUT << EOF
+    if ! cat > "$SHORTCUT" << EOF
 #!/bin/bash
 bash $SCRIPT_INSTALL_PATH --menu
 EOF
-    chmod +x $SHORTCUT
+    then
+        echo -e "${RED}❌ 写入快捷命令失败${NC}"
+        return 1
+    fi
+    chmod +x "$SHORTCUT" || return 1
 
     # 验证快捷命令是否可用
     if [ -f "$SCRIPT_INSTALL_PATH" ]; then
@@ -1123,16 +1343,16 @@ do_install_locked() {
         if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then return; fi
     fi
 
-    install_deps
-    install_ssrust   || { read -r -p "按回车返回..."; return; }
-    select_method
-    basic_config
-    select_ports     || { read -r -p "按回车返回..."; return; }
-    config_acl
-    generate_config
-    create_service
-    init_traffic
-    install_shortcut
+    install_deps      || { read -r -p "按回车返回..."; return 1; }
+    install_ssrust    || { read -r -p "按回车返回..."; return 1; }
+    select_method     || { read -r -p "按回车返回..."; return 1; }
+    basic_config      || { read -r -p "按回车返回..."; return 1; }
+    select_ports      || { read -r -p "按回车返回..."; return 1; }
+    config_acl        || { read -r -p "按回车返回..."; return 1; }
+    generate_config   || { read -r -p "按回车返回..."; return 1; }
+    create_service    || { read -r -p "按回车返回..."; return 1; }
+    init_traffic      || { read -r -p "按回车返回..."; return 1; }
+    install_shortcut  || { read -r -p "按回车返回..."; return 1; }
 
     echo ""
     show_links
@@ -1200,13 +1420,13 @@ show_links() {
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    SS 链接列表${NC}"
     echo -e "${BLUE}  =================================================${NC}"
-    cat $LINKS_FILE
+    cat "$LINKS_FILE"
     echo -e "  ${BLUE}=================================================${NC}"
     echo -e "  链接已保存至: ${YELLOW}$LINKS_FILE${NC}"
 }
 
 save_traffic_locked() {
-    python3 << PYEOF
+    if ! python3 << PYEOF
 import json, subprocess, os, tempfile
 
 config_file = '$CONFIG'
@@ -1221,19 +1441,26 @@ try:
 except Exception:
     history = {}
 
-def chain_exists(chain):
-    return subprocess.run(['iptables', '-L', chain, '-n'],
+def tool_available(tool):
+    try:
+        return subprocess.run([tool, '-L', '-n'],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except OSError:
+        return False
+
+def chain_exists(tool, chain):
+    return subprocess.run([tool, '-L', chain, '-n'],
                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 
-def snapshot_and_zero(chain):
+def snapshot_and_zero(tool, chain):
     try:
-        return subprocess.check_output(['iptables', '-nvxL', chain, '-Z'], text=True)
+        return subprocess.check_output([tool, '-nvxL', chain, '-Z'], text=True)
     except Exception:
         return ''
 
-def snapshot_only(chain):
+def snapshot_only(tool, chain):
     try:
-        return subprocess.check_output(['iptables', '-nvxL', chain], text=True)
+        return subprocess.check_output([tool, '-nvxL', chain], text=True)
     except Exception:
         return ''
 
@@ -1258,21 +1485,26 @@ def collect_bytes(output, ports):
     return totals
 
 traffic_chain = '$TRAFFIC_CHAIN'
-use_traffic_chain = chain_exists(traffic_chain)
 ports = [int(s['server_port']) for s in c['servers']]
+totals = {str(port): {'tx': 0, 'rx': 0} for port in ports}
 
-if use_traffic_chain:
-    totals = collect_bytes(snapshot_and_zero(traffic_chain), ports)
-else:
-    output_totals = collect_bytes(snapshot_only('OUTPUT'), ports)
-    input_totals = collect_bytes(snapshot_only('INPUT'), ports)
-    totals = {}
+for tool in (tool for tool in ('iptables', 'ip6tables') if tool_available(tool)):
+    if chain_exists(tool, traffic_chain):
+        family_totals = collect_bytes(snapshot_and_zero(tool, traffic_chain), ports)
+    else:
+        output_totals = collect_bytes(snapshot_only(tool, 'OUTPUT'), ports)
+        input_totals = collect_bytes(snapshot_only(tool, 'INPUT'), ports)
+        family_totals = {}
+        for port in ports:
+            key = str(port)
+            family_totals[key] = {
+                'tx': output_totals.get(key, {}).get('tx', 0),
+                'rx': input_totals.get(key, {}).get('rx', 0),
+            }
     for port in ports:
         key = str(port)
-        totals[key] = {
-            'tx': output_totals.get(key, {}).get('tx', 0),
-            'rx': input_totals.get(key, {}).get('rx', 0),
-        }
+        totals[key]['tx'] += family_totals.get(key, {}).get('tx', 0)
+        totals[key]['rx'] += family_totals.get(key, {}).get('rx', 0)
 
 for s in c['servers']:
     port = str(s['server_port'])
@@ -1287,7 +1519,11 @@ with os.fdopen(fd, 'w') as f:
     json.dump(history, f, indent=2)
 os.replace(tmp, traffic_file)
 PYEOF
-    if ! traffic_chain_installed; then
+    then
+        echo -e "${RED}❌ 保存流量数据失败${NC}"
+        return 1
+    fi
+    if ! traffic_chains_installed; then
         PORTS=$(config_ports)
         zero_traffic_counters_for_ports "$PORTS"
     fi
@@ -1299,9 +1535,23 @@ save_traffic() {
     with_state_lock save_traffic_locked
 }
 
+save_traffic_if_unlocked() {
+    # 配置操作持锁并主动保存流量时，避免 systemd/OpenRC 的停止钩子反向等待同一把锁。
+    if [ -d "$STATE_LOCK_DIR" ]; then
+        local LOCK_PID=""
+        [ -f "$STATE_LOCK_DIR/pid" ] && LOCK_PID=$(cat "$STATE_LOCK_DIR/pid" 2>/dev/null || true)
+        if [ -z "$LOCK_PID" ] || kill -0 "$LOCK_PID" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$STATE_LOCK_DIR/pid" 2>/dev/null || true
+        rmdir "$STATE_LOCK_DIR" 2>/dev/null || return 0
+    fi
+    save_traffic
+}
+
 show_traffic() {
     # 先同步当前 iptables 增量到历史文件，并清零计数器
-    save_traffic
+    save_traffic || return 1
 
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    流量统计  ${YELLOW}(单向流量，实际带宽消耗约为 x2)${NC}"
@@ -1450,7 +1700,7 @@ with os.fdopen(fd, 'w') as f:
 os.replace(tmp, config_file)
 PYEOF
 
-    apply_config
+    apply_config || return 1
     echo -e "${YELLOW}⏸ 端口 $PORT 已暂停${NC}"
 }
 
@@ -1488,7 +1738,7 @@ with os.fdopen(fd, 'w') as f:
 os.replace(tmp, config_file)
 PYEOF
 
-    apply_config
+    apply_config || return 1
     echo -e "${GREEN}✅ 端口 $PORT 已恢复${NC}"
 }
 
@@ -1510,10 +1760,13 @@ ports = [s['server_port'] for s in c['servers']]
 idx = $NUM - 1
 if 0 <= idx < len(ports):
     print(ports[idx])
-")
+    ")
     if [ -z "$PORT" ]; then echo -e "${RED}无效编号${NC}"; return; fi
 
-    python3 << PYEOF
+    # 配置仍包含待删除端口时先保存所有内核计数，避免刷新规则造成流量丢失。
+    save_traffic || return 1
+
+    if ! python3 << PYEOF
 import json, os, tempfile
 with open('$CONFIG') as f:
     c = json.load(f)
@@ -1523,20 +1776,33 @@ fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir
 with os.fdopen(fd, 'w') as f:
     json.dump(c, f, indent=2)
 os.replace(tmp, config_file)
-PYEOF
 
-    TMP_LINKS=$(make_temp_for "$LINKS_FILE") || {
-        echo -e "${RED}❌ 创建链接临时文件失败${NC}"
-        return
-    }
-    grep -v ":${PORT}#" "$LINKS_FILE" > "$TMP_LINKS"
-    mv "$TMP_LINKS" "$LINKS_FILE"
+traffic_file = '$TRAFFIC_FILE'
+try:
+    with open(traffic_file) as f:
+        history = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    history = {}
+history.pop(str($PORT), None)
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(traffic_file) + '.', dir=os.path.dirname(traffic_file), text=True)
+with os.fdopen(fd, 'w') as f:
+    json.dump(history, f, indent=2)
+os.replace(tmp, traffic_file)
+PYEOF
+    then
+        echo -e "${RED}❌ 删除用户配置失败${NC}"
+        return 1
+    fi
     secure_data_files
 
     PORTS=$(config_ports)
-    rebuild_traffic_rules "$PORTS"
+    rebuild_traffic_rules "$PORTS" || {
+        echo -e "${RED}❌ 重建流量规则失败${NC}"
+        return 1
+    }
 
-    apply_config
+    rebuild_links || return 1
+    apply_config || return 1
     echo -e "${RED}🗑 端口 $PORT 已删除${NC}"
 }
 
@@ -1549,8 +1815,12 @@ regen_users_locked() {
 import json
 with open('$CONFIG') as f:
     c = json.load(f)
-print(c['servers'][0]['method'])
+print(c['servers'][0]['method'] if c.get('servers') else '')
 ")
+    if [ -z "$METHOD" ]; then
+        echo -e "${RED}❌ 当前没有用户，请先添加用户${NC}"
+        return 1
+    fi
 
     case $METHOD in
         *aes-128*)  KEY_LEN=16 ;;
@@ -1567,17 +1837,13 @@ print(' '.join(str(s['server_port']) for s in c['servers']))
 ")
     read -r -a PORT_LIST <<< "$PORT_STR"
 
-    # 获取服务器地址（从现有链接提取，避免重新检测）
-    if [ -f "$LINKS_FILE" ] && [ -s "$LINKS_FILE" ]; then
-        HOST=$(head -1 "$LINKS_FILE" | sed 's/.*@//; s/:.*//')
-    fi
-    [ -z "$HOST" ] && basic_config
+    HOST=$(get_server_host 2>/dev/null) || basic_config || return 1
 
     USE_ACL_FLAG=$([ -f "$ACL_PATH" ] && echo true || echo false)
 
-    generate_config
-    apply_config
-    init_traffic
+    generate_config || return 1
+    apply_config || return 1
+    init_traffic || return 1
     show_links
 }
 
@@ -1590,30 +1856,46 @@ with open('$CONFIG') as f:
     c = json.load(f)
 print(c['servers'][0]['method'] if c['servers'] else '')
 ")
-    # 获取服务器地址
-    if [ -f "$LINKS_FILE" ] && [ -s "$LINKS_FILE" ]; then
-        HOST=$(head -1 "$LINKS_FILE" | sed 's/.*@//; s/:.*//; s/#.*//')
-    fi
-    [ -z "$HOST" ] && basic_config
+    HOST=$(get_server_host 2>/dev/null) || basic_config || return 1
+    local LINK_HOST
+    LINK_HOST=$(format_ss_host "$HOST")
 
     local TMP_LINKS
     TMP_LINKS=$(make_temp_for "$LINKS_FILE") || {
         echo -e "${RED}❌ 创建链接临时文件失败${NC}"
         return 1
     }
-    python3 << PYEOF
+    if ! python3 - "$CONFIG" "$TMP_LINKS" "$LINK_HOST" << 'PYEOF'
 import json, base64
-with open('$CONFIG') as f:
+import sys
+
+with open(sys.argv[1]) as f:
     c = json.load(f)
 lines = []
 for i, s in enumerate(c['servers'], 1):
     userinfo = base64.b64encode(f"{s['method']}:{s['password']}".encode()).decode()
-    lines.append(f"ss://{userinfo}@{'$HOST'}:{s['server_port']}#用户{i}")
-with open('$TMP_LINKS', 'w') as f:
-    f.write('\n'.join(lines) + '\n')
+    lines.append(f"ss://{userinfo}@{sys.argv[3]}:{s['server_port']}#用户{i}")
+with open(sys.argv[2], 'w') as f:
+    if lines:
+        f.write('\n'.join(lines) + '\n')
 PYEOF
-    mv "$TMP_LINKS" "$LINKS_FILE"
+    then
+        rm -f "$TMP_LINKS"
+        echo -e "${RED}❌ 重建 SS 链接失败${NC}"
+        return 1
+    fi
+    mv "$TMP_LINKS" "$LINKS_FILE" || return 1
     secure_data_files
+}
+
+migrate_server_host_if_needed() {
+    check_installed || return 0
+    [ -s "$LINKS_FILE" ] || return 0
+    local STORED_HOST
+    STORED_HOST=$(get_server_host 2>/dev/null) || return 0
+    if [[ "$STORED_HOST" == *:* ]] && ! grep -Fq "@[$STORED_HOST]:" "$LINKS_FILE"; then
+        rebuild_links
+    fi
 }
 
 add_user_locked() {
@@ -1633,6 +1915,13 @@ print(c['servers'][0]['method'] if c['servers'] else '2022-blake3-aes-128-gcm')
         *aes-256*|*chacha20*) KEY_LEN=32 ;;
         *) KEY_LEN=0 ;;
     esac
+    BIND_ADDRESS=$(python3 -c "
+import json
+with open('$CONFIG') as f:
+    c = json.load(f)
+print(c['servers'][0].get('server', '') if c.get('servers') else '')
+" 2>/dev/null)
+    [ -n "$BIND_ADDRESS" ] || BIND_ADDRESS=$(server_bind_address)
     echo -e "${YELLOW}>>> 添加新用户（加密方式: ${GREEN}$METHOD${YELLOW}）${NC}"
 
     read -r -p "新增用户数量 [默认 1]: " ADD_COUNT
@@ -1645,6 +1934,10 @@ print(c['servers'][0]['method'] if c['servers'] else '2022-blake3-aes-128-gcm')
     echo -e "  2) 手动指定端口"
     read -r -p "请选择 [1-2，默认1]: " ADD_MODE
     ADD_MODE=${ADD_MODE:-1}
+    if [ "$ADD_MODE" != "1" ] && [ "$ADD_MODE" != "2" ]; then
+        echo -e "${RED}❌ 无效的端口分配方式${NC}"
+        return 1
+    fi
 
     # 现有端口列表（用于查重）
     EXIST_PORTS=$(python3 -c "
@@ -1678,6 +1971,10 @@ print(' '.join(str(s['server_port']) for s in c['servers']))
         [ -z "$MAX_PORT" ] && MAX_PORT=30000
         CURRENT=$((MAX_PORT + 1))
         while [ ${#NEW_PORTS[@]} -lt "$ADD_COUNT" ]; do
+            if [ "$CURRENT" -gt 65535 ]; then
+                echo -e "${RED}❌ 端口耗尽${NC}"
+                return 1
+            fi
             if echo "$EXIST_PORTS ${NEW_PORTS[*]}" | grep -qw "$CURRENT"; then
                 CURRENT=$((CURRENT+1)); continue
             fi
@@ -1688,15 +1985,12 @@ print(' '.join(str(s['server_port']) for s in c['servers']))
                 echo -e "  ${GREEN}端口 $CURRENT 可用 ✓${NC}"
             fi
             CURRENT=$((CURRENT+1))
-            if [ $CURRENT -gt 65535 ]; then
-                echo -e "${RED}❌ 端口耗尽${NC}"; return
-            fi
         done
     fi
 
     # 追加到 config.json
     NEW_PORTS_STR="${NEW_PORTS[*]}"
-    python3 << PYEOF
+    if ! python3 << PYEOF
 import json, os, subprocess, tempfile
 
 with open('$CONFIG') as f:
@@ -1714,7 +2008,7 @@ def gen_pass():
 
 for p in new_ports:
     c['servers'].append({
-        'server': '::',
+        'server': '$BIND_ADDRESS',
         'server_port': int(p),
         'password': gen_pass(),
         'method': method,
@@ -1728,12 +2022,19 @@ with os.fdopen(fd, 'w') as f:
 os.replace(tmp, config_file)
 print(f"✅ 已添加 {len(new_ports)} 个新用户")
 PYEOF
+    then
+        echo -e "${RED}❌ 写入新用户配置失败${NC}"
+        return 1
+    fi
     secure_data_files
 
-    add_traffic_rules_for_new_ports "$NEW_PORTS_STR"
+    add_traffic_rules_for_new_ports "$NEW_PORTS_STR" || {
+        echo -e "${RED}❌ 添加流量统计规则失败${NC}"
+        return 1
+    }
 
-    rebuild_links
-    apply_config
+    rebuild_links || return 1
+    apply_config || return 1
     show_links
     echo -e "${GREEN}✅ 新用户添加完成${NC}"
 }
@@ -1897,7 +2198,7 @@ PYEOF
         fi
 
         # 强制重新生成 runtime.json 确保 ACL 字段正确写入
-        apply_config
+        apply_config || return 1
         echo -e "${GREEN}✅ runtime.json 已同步${NC}"
 
         # 补全旧配置缺失的 mode 字段
@@ -1950,7 +2251,7 @@ add_acl_domain_locked() {
         fi
         echo "$NEW_DOMAIN" >> "$MANUAL_FILE"
         secure_file "$MANUAL_FILE"
-        rebuild_acl
+        rebuild_acl || return 1
         echo -e "${GREEN}✅ 已添加: $NEW_DOMAIN（含所有子域名）${NC}"
     fi
 }
@@ -2004,7 +2305,7 @@ del_acl_domain_locked() {
             mv "$TMP_MANUAL" "$MANUAL_FILE"
         done
         secure_file "$MANUAL_FILE"
-        rebuild_acl
+        rebuild_acl || return 1
         echo -e "${GREEN}✅ 共删除 $DELETED 条，服务已重启${NC}"
     fi
 }
@@ -2160,26 +2461,54 @@ download_ruleset() {
 
 # 重新合并所有规则集到 ACL 文件
 rebuild_acl() {
-    init_ruleset_dir
+    init_ruleset_dir || return 1
+
+    local TMP_ACL
+    TMP_ACL=$(make_temp_for "$ACL_PATH") || {
+        echo -e "${RED}❌ 创建 ACL 临时文件失败${NC}"
+        return 1
+    }
 
     # 重建 ACL 文件，从 [outbound_block_list] 开始
-    echo "[outbound_block_list]" > $ACL_PATH
+    echo "[outbound_block_list]" > "$TMP_ACL" || return 1
 
     # 写入手动域名（从 manual.list 读取，纯净格式无标记）
     if [ -f "$MANUAL_FILE" ] && [ -s "$MANUAL_FILE" ]; then
         while IFS= read -r line; do
             [ -z "$line" ] && continue
-            echo "||$line" >> $ACL_PATH
+            echo "||$line" >> "$TMP_ACL"
         done < "$MANUAL_FILE"
     fi
 
     # 写入各规则集
     for RULESET_FILE in "$ACL_RULESET_DIR"/*.acl; do
         [ -f "$RULESET_FILE" ] || continue
-        cat "$RULESET_FILE" >> $ACL_PATH
+        cat "$RULESET_FILE" >> "$TMP_ACL"
     done
 
-    svc_restart
+    mv "$TMP_ACL" "$ACL_PATH" || return 1
+    secure_data_files
+
+    # 既有安装首次启用 ACL 时，同步持久配置和运行配置，确保立即生效。
+    if [ -f "$CONFIG" ]; then
+        if ! python3 << PYEOF
+import json, os, tempfile
+
+config_file = '$CONFIG'
+with open(config_file) as f:
+    config = json.load(f)
+config['acl'] = '$ACL_PATH'
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w') as f:
+    json.dump(config, f, indent=2)
+os.replace(tmp, config_file)
+PYEOF
+        then
+            echo -e "${RED}❌ 更新 ACL 配置失败${NC}"
+            return 1
+        fi
+        apply_config || return 1
+    fi
 }
 
 # 显示规则集菜单
@@ -2234,7 +2563,9 @@ manage_rulesets_locked() {
                     read -r -p "" CONFIRM
                     [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && continue
                 fi
-                download_ruleset "$KEY" "$URL" && rebuild_acl
+                if download_ruleset "$KEY" "$URL"; then
+                    rebuild_acl || echo -e "${RED}❌ 规则已下载，但应用 ACL 失败${NC}"
+                fi
                 ;;
             11)
                 echo -e "${YELLOW}>>> 安装全部规则集...${NC}"
@@ -2250,7 +2581,10 @@ manage_rulesets_locked() {
                         FAILED_RULESETS+=("$KEY")
                     fi
                 done
-                [ "$OK" -gt 0 ] && rebuild_acl
+                if [ "$OK" -gt 0 ] && ! rebuild_acl; then
+                    echo -e "${RED}❌ 规则集已下载，但应用 ACL 失败${NC}"
+                    FAIL=$((FAIL + 1))
+                fi
                 if [ "$FAIL" -eq 0 ]; then
                     echo -e "${GREEN}✅ 全部规则集安装完成（成功 $OK 个）${NC}"
                 elif [ "$OK" -gt 0 ]; then
@@ -2277,8 +2611,11 @@ manage_rulesets_locked() {
                     if [ $IDX -ge 0 ] && [ $IDX -lt ${#INSTALLED_ARR[@]} ]; then
                         DEL_NAME="${INSTALLED_ARR[$IDX]}"
                         rm -f "$ACL_RULESET_DIR/${DEL_NAME}.acl"
-                        rebuild_acl
-                        echo -e "${GREEN}✅ 已卸载: $DEL_NAME${NC}"
+                        if rebuild_acl; then
+                            echo -e "${GREEN}✅ 已卸载: $DEL_NAME${NC}"
+                        else
+                            echo -e "${RED}❌ 规则集文件已删除，但应用 ACL 失败${NC}"
+                        fi
                     else
                         echo -e "${RED}无效编号${NC}"
                     fi
@@ -2305,7 +2642,10 @@ manage_rulesets_locked() {
                         SKIPPED_RULESETS+=("$KEY")
                     fi
                 done
-                [ "$OK" -gt 0 ] && rebuild_acl
+                if [ "$OK" -gt 0 ] && ! rebuild_acl; then
+                    echo -e "${RED}❌ 规则集已更新，但应用 ACL 失败${NC}"
+                    FAIL=$((FAIL + 1))
+                fi
                 if [ "$OK" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$SKIP" -eq 0 ]; then
                     echo -e "${YELLOW}没有已安装的规则集${NC}"
                 elif [ "$FAIL" -eq 0 ]; then
@@ -2326,7 +2666,9 @@ manage_rulesets_locked() {
                     echo -e "${RED}规则集 URL 必须以 http:// 或 https:// 开头${NC}"
                 elif [ -n "$CUSTOM_NAME" ] && [ -n "$CUSTOM_URL" ]; then
                     RULESET_URLS["$CUSTOM_NAME"]="自定义|$CUSTOM_URL"
-                    download_ruleset "$CUSTOM_NAME" "$CUSTOM_URL" && rebuild_acl
+                    if download_ruleset "$CUSTOM_NAME" "$CUSTOM_URL"; then
+                        rebuild_acl || echo -e "${RED}❌ 规则已下载，但应用 ACL 失败${NC}"
+                    fi
                 fi
                 ;;
             15)
@@ -2518,10 +2860,14 @@ show_main_menu() {
 # =============================================
 #   主入口
 # =============================================
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+    return 0
+fi
+
 check_root
 
 # 自检：快捷命令不存在或指向错误时自动修复
-if [ "$1" != "--save-traffic" ]; then
+if [ "$1" != "--save-traffic" ] && [ "$1" != "--save-traffic-if-unlocked" ]; then
     if [ ! -f "$SHORTCUT" ] || ! grep -q "volss" "$SHORTCUT" 2>/dev/null; then
         CURRENT_SCRIPT=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
         if [ "$CURRENT_SCRIPT" != "$SCRIPT_INSTALL_PATH" ] && [ -f "$CURRENT_SCRIPT" ]; then
@@ -2602,12 +2948,14 @@ PYEOF
         fi
     fi
     secure_data_files
-    migrate_traffic_rules_if_needed
+    with_state_lock migrate_server_host_if_needed
+    with_state_lock migrate_traffic_rules_if_needed
 fi
 
 case "$1" in
-    --menu)         show_main_menu ;;
-    --save-traffic) save_traffic ;;
-    --version)      echo -e "Shadowsocks-Rust 管理脚本 ${GREEN}$VERSION${NC}" ;;
-    *)              show_main_menu ;;
+    --menu)                     show_main_menu ;;
+    --save-traffic)             save_traffic ;;
+    --save-traffic-if-unlocked) save_traffic_if_unlocked ;;
+    --version)                  echo -e "Shadowsocks-Rust 管理脚本 ${GREEN}$VERSION${NC}" ;;
+    *)                          show_main_menu ;;
 esac
