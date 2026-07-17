@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.6.0
+#   版本: V1.6.1
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.6.0"
+VERSION="V1.6.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -1625,8 +1625,13 @@ init_traffic() {
 }
 
 install_shortcut() {
-    # 获取当前脚本绝对路径
-    CURRENT_SCRIPT=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
+    local CURRENT_SCRIPT
+    CURRENT_SCRIPT=${1:-$(cd "$(dirname "$0")" && pwd)/$(basename "$0")}
+
+    if [ ! -f "$CURRENT_SCRIPT" ]; then
+        echo -e "${RED}❌ 未找到 volss 脚本: $CURRENT_SCRIPT${NC}"
+        return 1
+    fi
 
     # 将脚本复制到固定路径
     if [ "$CURRENT_SCRIPT" != "$SCRIPT_INSTALL_PATH" ]; then
@@ -1634,14 +1639,14 @@ install_shortcut() {
             echo -e "${RED}❌ 脚本复制失败，快捷命令将指向当前路径: $CURRENT_SCRIPT${NC}"
             SCRIPT_INSTALL_PATH="$CURRENT_SCRIPT"
         else
-            chmod +x "$SCRIPT_INSTALL_PATH"
+            chmod +x "$SCRIPT_INSTALL_PATH" || return 1
             echo -e "${GREEN}✅ 脚本已安装至: ${YELLOW}$SCRIPT_INSTALL_PATH${NC}"
         fi
     fi
 
     # 如果已存在且不是 volss 脚本则跳过，避免覆盖其他快捷命令
-    if [ -f "$SHORTCUT" ]; then
-        if ! grep -q "volss" "$SHORTCUT" 2>/dev/null; then
+    if [ -e "$SHORTCUT" ] || [ -L "$SHORTCUT" ]; then
+        if [ ! -f "$SHORTCUT" ] || ! grep -q "volss" "$SHORTCUT" 2>/dev/null; then
             echo -e "${YELLOW}⚠ $SHORTCUT 已被其他脚本占用，跳过注册${NC}"
             return
         fi
@@ -4319,6 +4324,7 @@ show_main_menu() {
         echo -e "      1)  安装 Shadowsocks-Rust"
         echo -e "      2)  卸载 Shadowsocks-Rust"
         echo -e "      3)  更新脚本"
+        echo -e "     31)  安装/修复 volss 快捷命令"
         echo -e "  ${CYAN}  -- 用户管理 --${NC}"
         echo -e "      4)  查看用户列表"
         echo -e "      5)  查看所有 SS 链接"
@@ -4354,7 +4360,7 @@ show_main_menu() {
         echo -e "  ${BLUE}-------------------------------------------------${NC}"
         echo -e "   ${RED}  0)  退出${NC}"
         echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-30]: " CHOICE
+        read -r -p "  请选择 [0-31]: " CHOICE
 
         # 未安装时拦截管理功能
         if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|2[0-9]|30)$ ]]; then
@@ -4367,6 +4373,7 @@ show_main_menu() {
             1)  do_install ;;
             2)  do_uninstall ;;
             3)  do_update ;;
+            31) install_shortcut; read -r -p "按回车继续..." ;;
             4)  list_users;    read -r -p "按回车继续..." ;;
             5)  show_links;    read -r -p "按回车继续..." ;;
             6)  add_user;      read -r -p "按回车继续..." ;;
@@ -4460,19 +4467,11 @@ fi
 
 check_root
 
-# 自检：快捷命令不存在或指向错误时自动修复
-if [ "$1" != "--save-traffic" ] && [ "$1" != "--save-traffic-if-unlocked" ] && [ "$1" != "--enforce-policies" ]; then
-    if [ ! -f "$SHORTCUT" ] || ! grep -q "volss" "$SHORTCUT" 2>/dev/null; then
+# 自检：快捷命令不存在时自动安装
+if [ "$1" != "--save-traffic" ] && [ "$1" != "--save-traffic-if-unlocked" ] && [ "$1" != "--enforce-policies" ] && [ "$1" != "--install-shortcut" ]; then
+    if [ ! -e "$SHORTCUT" ] && [ ! -L "$SHORTCUT" ]; then
         CURRENT_SCRIPT=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
-        if [ "$CURRENT_SCRIPT" != "$SCRIPT_INSTALL_PATH" ] && [ -f "$CURRENT_SCRIPT" ]; then
-            cp "$CURRENT_SCRIPT" "$SCRIPT_INSTALL_PATH" && chmod +x "$SCRIPT_INSTALL_PATH"
-        fi
-        if [ -f "$SCRIPT_INSTALL_PATH" ]; then
-            cat > $SHORTCUT << EOF
-#!/bin/bash
-bash $SCRIPT_INSTALL_PATH --menu
-EOF
-            chmod +x $SHORTCUT
+        if install_shortcut "$CURRENT_SCRIPT"; then
             echo -e "${GREEN}✅ 快捷命令已自动修复，输入 ${YELLOW}volss${GREEN} 呼出管理菜单${NC}"
         fi
     fi
@@ -4551,6 +4550,7 @@ fi
 
 case "$1" in
     --menu)                     show_main_menu ;;
+    --install-shortcut)         install_shortcut ;;
     --save-traffic)             save_traffic ;;
     --save-traffic-if-unlocked) save_traffic_if_unlocked ;;
     --enforce-policies)         enforce_user_policies ;;

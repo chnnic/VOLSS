@@ -352,6 +352,25 @@ EOF
     assert_eq "1" "$RESTARTS" "restart running service after core upgrade"
 }
 
+test_install_shortcut() {
+    SCRIPT_INSTALL_PATH="$TMP_ROOT/shortcut/bin/volss.sh"
+    SHORTCUT="$TMP_ROOT/shortcut/bin/volss"
+    mkdir -p "$(dirname "$SHORTCUT")"
+
+    install_shortcut "$SCRIPT_DIR/volss.sh" >/dev/null || fail "install volss shortcut independently"
+    assert_true "install fixed volss script" test -f "$SCRIPT_INSTALL_PATH"
+    assert_true "make fixed volss script executable" test -x "$SCRIPT_INSTALL_PATH"
+    assert_true "install volss shortcut" test -f "$SHORTCUT"
+    assert_true "make volss shortcut executable" test -x "$SHORTCUT"
+    assert_true "shortcut opens installed volss menu" grep -Fq "bash $SCRIPT_INSTALL_PATH --menu" "$SHORTCUT"
+
+    printf '#!/usr/bin/env bash\necho occupied\n' > "$SHORTCUT"
+    chmod +x "$SHORTCUT"
+    BEFORE=$(sha256_file "$SHORTCUT")
+    install_shortcut "$SCRIPT_DIR/volss.sh" >/dev/null || fail "preserve occupied shortcut"
+    assert_eq "$BEFORE" "$(sha256_file "$SHORTCUT")" "do not overwrite another program"
+}
+
 test_add_user_custom_name() {
     CONFIG_DIR="$TMP_ROOT/add-name"
     CONFIG="$CONFIG_DIR/config.json"
@@ -519,5 +538,6 @@ test_user_policy_enforcement
 test_port_listener_helper
 test_health_check
 test_ssserver_upgrade_preserves_config
+test_install_shortcut
 
 echo "PASS: $TESTS assertions"
