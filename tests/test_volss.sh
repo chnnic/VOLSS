@@ -33,6 +33,19 @@ test_host_helpers() {
     assert_eq "2001:db8::1" "$(normalize_server_host '[2001:0db8::1]')" "normalize IPv6"
     assert_eq "example.com" "$(normalize_server_host 'Example.COM.')" "normalize hostname"
     assert_eq "[2001:db8::1]" "$(format_ss_host '2001:db8::1')" "format IPv6 URI host"
+    assert_eq "4" "$(ip_address_family '198.51.100.10')" "detect IPv4 family"
+    assert_eq "6" "$(ip_address_family '2001:db8::1')" "detect IPv6 family"
+    curl() {
+        if [[ " $* " == *" -4 "* ]]; then
+            echo "198.51.100.10"
+        else
+            echo "2001:db8::3"
+        fi
+    }
+    detect_public_ips
+    unset -f curl
+    assert_eq "198.51.100.10" "$DETECTED_IPV4" "detect public IPv4 independently"
+    assert_eq "2001:db8::3" "$DETECTED_IPV6" "detect public IPv6 independently"
     if normalize_server_host 'bad host' >/dev/null 2>&1; then
         fail "reject invalid host"
     fi
@@ -51,7 +64,14 @@ test_host_helpers() {
     TRAFFIC_FILE="$CONFIG_DIR/traffic.json"
     MANUAL_FILE="$CONFIG_DIR/manual.list"
     RUNTIME="$CONFIG_DIR/runtime.json"
-    HOST="2001:db8::3"
+    DETECTED_IPV4="198.51.100.10"
+    DETECTED_IPV6="2001:db8::3"
+    select_entry_hosts "测试用户" 1 <<< $'3\n' >/dev/null || fail "select dual-stack entries"
+    assert_eq "198.51.100.10 2001:db8::3" "${ENTRY_HOSTS[*]}" "select IPv4 and IPv6 entries"
+    assert_eq "198.51.100.10" "$(cat "$SERVER_HOST_FILE")" "persist primary fallback host"
+
+    HOST="198.51.100.10"
+    ENTRY_HOSTS=("198.51.100.10" "[2001:0db8::3]")
     METHOD="2022-blake3-aes-128-gcm"
     KEY_LEN=16
     USE_ACL_FLAG=false
@@ -59,9 +79,12 @@ test_host_helpers() {
     LINK_NAME_PREFIX="Hong Kong Node"
     NAME_LIST=()
     generate_config >/dev/null || fail "generate IPv6 configuration"
-    assert_true "generate bracketed IPv6 link" grep -Fq '@[2001:db8::3]:30001#Hong%20Kong%20Node' "$LINKS_FILE"
+    assert_true "generate IPv4 entry link" grep -Fq '@198.51.100.10:30001#Hong%20Kong%20Node-IPv4' "$LINKS_FILE"
+    assert_true "generate bracketed IPv6 entry link" grep -Fq '@[2001:db8::3]:30001#Hong%20Kong%20Node-IPv6' "$LINKS_FILE"
+    assert_eq "2" "$(wc -l < "$LINKS_FILE")" "generate two links for one shared port"
     assert_true "generate supported bind address" grep -Eq '"server":"(::|0\.0\.0\.0)"' "$CONFIG"
     assert_eq "Hong Kong Node" "$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][0]['name'])")" "persist custom link name"
+    assert_eq "198.51.100.10 2001:db8::3" "$(python3 -c "import json; print(' '.join(json.load(open('$CONFIG'))['servers'][0]['entry_hosts']))")" "persist dual entry hosts"
     assert_eq "Node Name" "$(normalize_link_name '  Node Name  ')" "normalize link name"
     if normalize_link_name $'bad\tname' >/dev/null 2>&1; then
         fail "reject control characters in link name"
@@ -106,7 +129,7 @@ test_runtime_omits_link_names() {
     ACL_PATH="$CONFIG_DIR/blocklist.acl"
     ACL_RULESET_DIR="$CONFIG_DIR/rulesets"
     mkdir -p "$CONFIG_DIR"
-    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one","mode":"tcp_and_udp","name":"Node One","quota_bytes":1073741824,"expires_at":"2030-01-01","disabled_reason":"quota"}]}' > "$CONFIG"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one","mode":"tcp_and_udp","name":"Node One","entry_hosts":["198.51.100.10","2001:db8::10"],"quota_bytes":1073741824,"expires_at":"2030-01-01","disabled_reason":"quota"}]}' > "$CONFIG"
     traffic_chains_installed() { return 1; }
     svc_reload() { :; }
     svc_restart() { :; }
@@ -114,7 +137,7 @@ test_runtime_omits_link_names() {
 
     apply_config >/dev/null || fail "build runtime with managed name"
     assert_eq "0" "$(python3 -c "import json; print(int('name' in json.load(open('$RUNTIME'))['servers'][0]))")" "omit link name from runtime"
-    assert_eq "0" "$(python3 -c "import json; s=json.load(open('$RUNTIME'))['servers'][0]; print(int(any(k in s for k in ('quota_bytes','expires_at','disabled_reason'))))")" "omit policy metadata from runtime"
+    assert_eq "0" "$(python3 -c "import json; s=json.load(open('$RUNTIME'))['servers'][0]; print(int(any(k in s for k in ('entry_hosts','quota_bytes','expires_at','disabled_reason'))))")" "omit management metadata from runtime"
 }
 
 test_client_exports_and_qr() {
@@ -136,12 +159,14 @@ test_client_exports_and_qr() {
     NFT_RULES_FILE="$CONFIG_DIR/volss.nft"
     mkdir -p "$CONFIG_DIR"
     printf '%s\n' 'example.com' > "$SERVER_HOST_FILE"
-    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one","name":"Node One"},{"server":"::","server_port":30002,"method":"aes-256-gcm","password":"two","name":"节点二"}]}' > "$CONFIG"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one","name":"Node One","entry_hosts":["198.51.100.10","2001:db8::10"]},{"server":"::","server_port":30002,"method":"aes-256-gcm","password":"two","name":"节点二"}]}' > "$CONFIG"
 
     generate_client_configs || fail "generate client exports"
-    assert_eq "2" "$(grep -c 'udp: true' "$CLASH_CONFIG")" "Clash export enables UDP"
-    assert_eq "2" "$(grep -c 'udp: true' "$MIHOMO_CONFIG")" "Mihomo export enables UDP"
-    assert_eq "2" "$(python3 -c "import json; c=json.load(open('$SINGBOX_CONFIG')); print(sum(o.get('type') == 'shadowsocks' for o in c['outbounds']))")" "sing-box exports all users"
+    assert_eq "3" "$(grep -c 'udp: true' "$CLASH_CONFIG")" "Clash expands dual entries with UDP"
+    assert_eq "3" "$(grep -c 'udp: true' "$MIHOMO_CONFIG")" "Mihomo expands dual entries with UDP"
+    assert_eq "3" "$(python3 -c "import json; c=json.load(open('$SINGBOX_CONFIG')); print(sum(o.get('type') == 'shadowsocks' for o in c['outbounds']))")" "sing-box expands dual entries"
+    assert_true "Clash exports IPv4 entry" grep -Fq 'server: "198.51.100.10"' "$CLASH_CONFIG"
+    assert_true "Clash exports IPv6 entry" grep -Fq 'server: "2001:db8::10"' "$CLASH_CONFIG"
 
     qrencode() {
         local OUTPUT=""
@@ -155,9 +180,11 @@ test_client_exports_and_qr() {
         done
         [ -z "$OUTPUT" ] || printf 'png\n' > "$OUTPUT"
     }
-    printf '%s\n' 'ss://dGVzdA==@example.com:30001#Node%20One' 'ss://dGVzdA==@example.com:30002#Node%20Two' > "$LINKS_FILE"
+    printf '%s\n' 'ss://dGVzdA==@198.51.100.10:30001#Node%20One-IPv4' 'ss://dGVzdA==@[2001:db8::10]:30001#Node%20One-IPv6' 'ss://dGVzdA==@example.com:30002#Node%20Two' > "$LINKS_FILE"
     generate_qr_codes || fail "generate QR artifacts"
-    assert_true "generate SS QR image" test -f "$QR_DIR/ss-30001.png"
+    assert_true "generate IPv4 SS QR image" test -f "$QR_DIR/ss-30001-ipv4.png"
+    assert_true "generate IPv6 SS QR image" test -f "$QR_DIR/ss-30001-ipv6.png"
+    assert_true "generate single-entry SS QR image" test -f "$QR_DIR/ss-30002.png"
     assert_true "generate Clash QR image" test -f "$QR_DIR/clash-config.png"
 }
 
@@ -172,7 +199,7 @@ test_backup_validation() {
     TRAFFIC_BACKEND_FILE="$CONFIG_DIR/traffic_backend"
     ACL_RULESET_DIR="$CONFIG_DIR/rulesets"
     mkdir -p "$ACL_RULESET_DIR"
-    printf '%s\n' '{"servers":[{"server_port":30001,"method":"aes-256-gcm","password":"one","expires_at":"2030-01-01"}]}' > "$CONFIG"
+    printf '%s\n' '{"servers":[{"server_port":30001,"method":"aes-256-gcm","password":"one","entry_hosts":["198.51.100.40","2001:db8::40"],"expires_at":"2030-01-01"}]}' > "$CONFIG"
     printf '%s\n' 'example.com' > "$SERVER_HOST_FILE"
     printf '%s\n' '{"30001":{"tx":1,"rx":2}}' > "$TRAFFIC_FILE"
     printf '%s\n' '||example.com' > "$ACL_RULESET_DIR/test.acl"
@@ -210,6 +237,7 @@ PYEOF
     printf '%s\n' '{"servers":[{"server_port":40001,"method":"aes-256-gcm","password":"changed"}]}' > "$CONFIG"
     restore_backup_archive "$BACKUP" || fail "restore validated backup"
     assert_eq "one" "$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][0]['password'])")" "restore user configuration"
+    assert_eq "198.51.100.40 2001:db8::40" "$(python3 -c "import json; print(' '.join(json.load(open('$CONFIG'))['servers'][0]['entry_hosts']))")" "restore dual entry hosts"
 
     printf '%s\n' '{"servers":[{"server_port":40002,"method":"aes-256-gcm","password":"rollback"}]}' > "$CONFIG"
     apply_config() { return 1; }
@@ -390,10 +418,39 @@ test_add_user_custom_name() {
     apply_config() { :; }
     show_links() { :; }
     secure_data_files() { :; }
+    detect_public_ips() {
+        DETECTED_IPV4="198.51.100.20"
+        DETECTED_IPV6="2001:db8::20"
+    }
 
-    add_user_locked <<< $'1\n2\n31000\nAdded Node\n' >/dev/null || fail "add user with custom name"
+    add_user_locked <<< $'1\n2\n31000\nAdded Node\n3\n' >/dev/null || fail "add user with custom name and dual entries"
     assert_eq "Added Node" "$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][1]['name'])")" "persist added user name"
-    assert_true "encode added user link name" grep -Fq ':31000#Added%20Node' "$LINKS_FILE"
+    assert_eq "198.51.100.20 2001:db8::20" "$(python3 -c "import json; print(' '.join(json.load(open('$CONFIG'))['servers'][1]['entry_hosts']))")" "persist added user entries"
+    assert_true "encode added IPv4 link name" grep -Fq '@198.51.100.20:31000#Added%20Node-IPv4' "$LINKS_FILE"
+    assert_true "encode added IPv6 link name" grep -Fq '@[2001:db8::20]:31000#Added%20Node-IPv6' "$LINKS_FILE"
+}
+
+test_configure_existing_user_entries() {
+    CONFIG_DIR="$TMP_ROOT/configure-entries"
+    CONFIG="$CONFIG_DIR/config.json"
+    LINKS_FILE="$CONFIG_DIR/links.txt"
+    SERVER_HOST_FILE="$CONFIG_DIR/server_host"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' 'example.com' > "$SERVER_HOST_FILE"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":32000,"method":"aes-256-gcm","password":"one","mode":"tcp_and_udp","name":"Existing Node"}]}' > "$CONFIG"
+
+    check_installed() { return 0; }
+    list_users() { :; }
+    show_links() { :; }
+    secure_data_files() { :; }
+    detect_public_ips() {
+        DETECTED_IPV4="198.51.100.30"
+        DETECTED_IPV6="2001:db8::30"
+    }
+
+    configure_user_entries_locked <<< $'1\n3\n' >/dev/null || fail "configure existing user dual entries"
+    assert_eq "198.51.100.30 2001:db8::30" "$(python3 -c "import json; print(' '.join(json.load(open('$CONFIG'))['servers'][0]['entry_hosts']))")" "persist existing user entries"
+    assert_eq "2" "$(grep -c ':32000#' "$LINKS_FILE")" "rebuild two links on existing shared port"
 }
 
 test_port_selection() {
@@ -526,6 +583,7 @@ test_port_selection
 test_link_name_management
 test_runtime_omits_link_names
 test_add_user_custom_name
+test_configure_existing_user_entries
 test_acl_activation
 test_delete_user_state
 test_dual_stack_traffic

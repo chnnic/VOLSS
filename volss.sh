@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.6.1
+#   版本: V1.6.2
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.6.1"
+VERSION="V1.6.2"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -444,6 +444,128 @@ format_ss_host() {
     else
         printf '%s\n' "$1"
     fi
+}
+
+ip_address_family() {
+    python3 - "$1" << 'PYEOF'
+import ipaddress
+import sys
+
+try:
+    print(ipaddress.ip_address(sys.argv[1]).version)
+except ValueError:
+    raise SystemExit(1)
+PYEOF
+}
+
+detect_public_ip() {
+    local FAMILY=$1
+    local URL CANDIDATE NORMALIZED
+    local -a IP_CHECK_URLS
+    if [ "$FAMILY" = "4" ]; then
+        IP_CHECK_URLS=(https://api.ipify.org https://ifconfig.me/ip https://ip.sb https://ifconfig.co/ip)
+    else
+        IP_CHECK_URLS=(https://api6.ipify.org https://ifconfig.me/ip https://ip.sb https://ifconfig.co/ip)
+    fi
+
+    for URL in "${IP_CHECK_URLS[@]}"; do
+        if [ "$FAMILY" = "4" ]; then
+            CANDIDATE=$(curl -fsS -4 --max-time 5 "$URL" 2>/dev/null | tr -d '\r\n') || continue
+        else
+            CANDIDATE=$(curl -fsS -6 --max-time 5 "$URL" 2>/dev/null | tr -d '\r\n') || continue
+        fi
+        NORMALIZED=$(normalize_server_host "$CANDIDATE" 2>/dev/null) || continue
+        [ "$(ip_address_family "$NORMALIZED" 2>/dev/null)" = "$FAMILY" ] || continue
+        printf '%s\n' "$NORMALIZED"
+        return 0
+    done
+    return 1
+}
+
+detect_public_ips() {
+    DETECTED_IPV4=$(detect_public_ip 4 || true)
+    DETECTED_IPV6=$(detect_public_ip 6 || true)
+}
+
+entry_hosts_json() {
+    python3 - "$@" << 'PYEOF'
+import json
+import sys
+
+print(json.dumps(sys.argv[1:], ensure_ascii=False))
+PYEOF
+}
+
+select_entry_hosts() {
+    local CONTEXT=${1:-服务器}
+    local SAVE_DEFAULT=${2:-0}
+    local DEFAULT_CHOICE INPUT_CHOICE INPUT_HOST NORMALIZED
+
+    if [ -n "${DETECTED_IPV4:-}" ] && [ -n "${DETECTED_IPV6:-}" ]; then
+        DEFAULT_CHOICE=3
+    elif [ -n "${DETECTED_IPV4:-}" ]; then
+        DEFAULT_CHOICE=1
+    elif [ -n "${DETECTED_IPV6:-}" ]; then
+        DEFAULT_CHOICE=2
+    else
+        DEFAULT_CHOICE=4
+    fi
+
+    while true; do
+        echo -e "\n${YELLOW}>>> $CONTEXT 的连接入口${NC}"
+        echo -e "  1) IPv4  ${DETECTED_IPV4:-${RED}未检测到${NC}}"
+        echo -e "  2) IPv6  ${DETECTED_IPV6:-${RED}未检测到${NC}}"
+        if [ -n "${DETECTED_IPV4:-}" ] && [ -n "${DETECTED_IPV6:-}" ]; then
+            echo -e "  3) IPv4 + IPv6（生成两个入口，共用一个端口）"
+        else
+            echo -e "  3) IPv4 + IPv6 ${RED}（需要同时检测到双栈地址）${NC}"
+        fi
+        echo "  4) 手动输入域名或 IP"
+        read -r -p "请选择 [1-4，默认$DEFAULT_CHOICE]: " INPUT_CHOICE
+        INPUT_CHOICE=${INPUT_CHOICE:-$DEFAULT_CHOICE}
+        case $INPUT_CHOICE in
+            1)
+                [ -n "${DETECTED_IPV4:-}" ] || {
+                    echo -e "${RED}❌ 未检测到可用 IPv4 地址${NC}"
+                    continue
+                }
+                ENTRY_HOSTS=("$DETECTED_IPV4")
+                ;;
+            2)
+                [ -n "${DETECTED_IPV6:-}" ] || {
+                    echo -e "${RED}❌ 未检测到可用 IPv6 地址${NC}"
+                    continue
+                }
+                ENTRY_HOSTS=("$DETECTED_IPV6")
+                ;;
+            3)
+                if [ -z "${DETECTED_IPV4:-}" ] || [ -z "${DETECTED_IPV6:-}" ]; then
+                    echo -e "${RED}❌ 未同时检测到 IPv4 和 IPv6 地址${NC}"
+                    continue
+                fi
+                ENTRY_HOSTS=("$DETECTED_IPV4" "$DETECTED_IPV6")
+                ;;
+            4)
+                read -r -p "输入服务器域名或 IP: " INPUT_HOST
+                if ! NORMALIZED=$(normalize_server_host "$INPUT_HOST" 2>/dev/null); then
+                    echo -e "${RED}❌ 域名或 IP 格式无效${NC}"
+                    continue
+                fi
+                ENTRY_HOSTS=("$NORMALIZED")
+                ;;
+            *)
+                echo -e "${RED}❌ 无效选择${NC}"
+                continue
+                ;;
+        esac
+
+        HOST=${ENTRY_HOSTS[0]}
+        if [ "$SAVE_DEFAULT" = "1" ]; then
+            save_server_host "$HOST" || return 1
+        fi
+        echo -e "连接入口: ${GREEN}${ENTRY_HOSTS[*]}${NC}"
+        return 0
+    done
 }
 
 server_bind_address() {
@@ -1316,34 +1438,9 @@ select_ports() {
 
 basic_config() {
     echo -e "\n${YELLOW}>>> 服务器信息${NC}"
-    local INPUT_HOST NORMALIZED URL CANDIDATE
-    while true; do
-        read -r -p "服务器域名或IP [默认自动检测]: " INPUT_HOST
-        if [ -z "$INPUT_HOST" ]; then
-            INPUT_HOST=""
-            for URL in https://ifconfig.me/ip https://ip.sb https://api.ipify.org https://ifconfig.co/ip; do
-                CANDIDATE=$(curl -fsS4 --max-time 5 "$URL" 2>/dev/null | tr -d '\r\n') || continue
-                if NORMALIZED=$(normalize_server_host "$CANDIDATE" 2>/dev/null); then
-                    INPUT_HOST=$NORMALIZED
-                    break
-                fi
-            done
-            if [ -z "$INPUT_HOST" ]; then
-                echo -e "${RED}❌ 自动检测失败，请手动输入域名或 IP${NC}"
-                continue
-            fi
-        fi
-        if NORMALIZED=$(normalize_server_host "$INPUT_HOST" 2>/dev/null); then
-            HOST=$NORMALIZED
-            save_server_host "$HOST" || {
-                echo -e "${RED}❌ 保存服务器地址失败${NC}"
-                return 1
-            }
-            echo -e "服务器地址: ${GREEN}$HOST${NC}"
-            return 0
-        fi
-        echo -e "${RED}❌ 域名或 IP 格式无效${NC}"
-    done
+    echo "正在检测公网 IPv4 和 IPv6 地址..."
+    detect_public_ips
+    select_entry_hosts "服务器" 1
 }
 
 config_acl() {
@@ -1399,16 +1496,78 @@ gen_password() {
     fi
 }
 
+write_links_file() {
+    local CONFIG_PATH=$1
+    local OUTPUT_PATH=$2
+    local FALLBACK_HOST=$3
+    local DEFAULT_NAME=$4
+    python3 - "$CONFIG_PATH" "$OUTPUT_PATH" "$FALLBACK_HOST" "$DEFAULT_NAME" << 'PYEOF'
+import base64
+import ipaddress
+import json
+import sys
+from urllib.parse import quote
+
+config_path, output_path, fallback_host, default_name = sys.argv[1:]
+with open(config_path, encoding='utf-8') as f:
+    config = json.load(f)
+servers = config.get('servers', [])
+lines = []
+
+for index, server in enumerate(servers, 1):
+    hosts = server.get('entry_hosts')
+    if not isinstance(hosts, list) or not hosts or not all(isinstance(host, str) and host for host in hosts):
+        hosts = [fallback_host]
+    hosts = list(dict.fromkeys(hosts))
+    fallback_name = default_name if len(servers) == 1 else f'{default_name}-{index}'
+    base_name = server.get('name')
+    if not isinstance(base_name, str) or not base_name.strip():
+        base_name = fallback_name
+    base_name = base_name.strip()
+    userinfo = base64.b64encode(f"{server['method']}:{server['password']}".encode()).decode()
+
+    for entry_index, host in enumerate(hosts, 1):
+        authority = f'[{host}]' if ':' in host else host
+        name = base_name
+        if len(hosts) > 1:
+            try:
+                label = f'IPv{ipaddress.ip_address(host).version}'
+            except ValueError:
+                label = f'Entry{entry_index}'
+            name = f'{base_name}-{label}'
+        lines.append(
+            f"ss://{userinfo}@{authority}:{int(server['server_port'])}#{quote(name, safe='')}"
+        )
+
+with open(output_path, 'w', encoding='utf-8') as f:
+    if lines:
+        f.write('\n'.join(lines) + '\n')
+PYEOF
+}
+
 generate_config() {
     echo -e "\n${YELLOW}>>> 生成配置文件和 SS 链接...${NC}"
-    local TMP_CONFIG TMP_LINKS BIND_ADDRESS LINK_HOST NAME NAME_JSON TAG
-    HOST=$(normalize_server_host "$HOST" 2>/dev/null) || {
-        echo -e "${RED}❌ 服务器地址无效${NC}"
-        return 1
-    }
+    local TMP_CONFIG TMP_LINKS BIND_ADDRESS NAME NAME_JSON ENTRY_HOSTS_JSON ENTRY_HOST NORMALIZED_ENTRY
+    local -a CONFIG_ENTRY_HOSTS NORMALIZED_ENTRY_HOSTS
+    if declare -p ENTRY_HOSTS >/dev/null 2>&1 && [ "${#ENTRY_HOSTS[@]}" -gt 0 ]; then
+        CONFIG_ENTRY_HOSTS=("${ENTRY_HOSTS[@]}")
+    else
+        CONFIG_ENTRY_HOSTS=("$HOST")
+    fi
+    for ENTRY_HOST in "${CONFIG_ENTRY_HOSTS[@]}"; do
+        NORMALIZED_ENTRY=$(normalize_server_host "$ENTRY_HOST" 2>/dev/null) || {
+            echo -e "${RED}❌ 服务器入口地址无效: $ENTRY_HOST${NC}"
+            return 1
+        }
+        if [[ " ${NORMALIZED_ENTRY_HOSTS[*]} " != *" $NORMALIZED_ENTRY "* ]]; then
+            NORMALIZED_ENTRY_HOSTS+=("$NORMALIZED_ENTRY")
+        fi
+    done
+    CONFIG_ENTRY_HOSTS=("${NORMALIZED_ENTRY_HOSTS[@]}")
+    HOST=${CONFIG_ENTRY_HOSTS[0]}
     save_server_host "$HOST" || return 1
     BIND_ADDRESS=$(server_bind_address)
-    LINK_HOST=$(format_ss_host "$HOST")
+    ENTRY_HOSTS_JSON=$(entry_hosts_json "${CONFIG_ENTRY_HOSTS[@]}") || return 1
     TMP_CONFIG=$(make_temp_for "$CONFIG") || {
         echo -e "${RED}❌ 创建配置临时文件失败${NC}"
         return 1
@@ -1454,23 +1613,19 @@ import sys
 print(json.dumps(sys.argv[1], ensure_ascii=False))
 PYEOF
 )
-        TAG=$(encode_link_name "$NAME") || {
-            rm -f "$TMP_CONFIG" "$TMP_LINKS"
-            echo -e "${RED}❌ SS 链接名称编码失败${NC}"
-            return 1
-        }
-
         if [ $NUM -lt "$TOTAL" ]; then
-            echo "  {\"server\":\"$BIND_ADDRESS\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\",\"name\":$NAME_JSON}," >> "$TMP_CONFIG"
+            echo "  {\"server\":\"$BIND_ADDRESS\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\",\"name\":$NAME_JSON,\"entry_hosts\":$ENTRY_HOSTS_JSON}," >> "$TMP_CONFIG"
         else
-            echo "  {\"server\":\"$BIND_ADDRESS\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\",\"name\":$NAME_JSON}" >> "$TMP_CONFIG"
+            echo "  {\"server\":\"$BIND_ADDRESS\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\",\"name\":$NAME_JSON,\"entry_hosts\":$ENTRY_HOSTS_JSON}" >> "$TMP_CONFIG"
         fi
-
-        USERINFO=$(echo -n "$METHOD:$PASS" | base64 | tr -d '\n')
-        echo "ss://${USERINFO}@${LINK_HOST}:${PORT}#${TAG}" >> "$TMP_LINKS"
     done
 
     echo ']}' >> "$TMP_CONFIG" || return 1
+    if ! write_links_file "$TMP_CONFIG" "$TMP_LINKS" "$HOST" "$LINK_NAME_PREFIX"; then
+        rm -f "$TMP_CONFIG" "$TMP_LINKS"
+        echo -e "${RED}❌ 生成 SS 链接失败${NC}"
+        return 1
+    fi
     mv "$TMP_CONFIG" "$CONFIG" || return 1
     mv "$TMP_LINKS" "$LINKS_FILE" || return 1
     secure_data_files
@@ -1491,7 +1646,7 @@ with open('$CONFIG', 'r') as f:
 # 过滤禁用用户
 servers = [dict(s) for s in config['servers'] if not s.get('disabled', False)]
 for s in servers:
-    for field in ('disabled', 'acl', 'name', 'quota_bytes', 'expires_at', 'disabled_reason'):
+    for field in ('disabled', 'acl', 'name', 'entry_hosts', 'quota_bytes', 'expires_at', 'disabled_reason'):
         s.pop(field, None)
 
 runtime = {'servers': servers}
@@ -1742,10 +1897,11 @@ list_users() {
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    当前用户列表${NC}"
     echo -e "${BLUE}  =================================================${NC}"
-    printf "  ${CYAN}%-4s %-7s %-18s %-10s %-12s %-10s${NC}\n" "编号" "端口" "名称" "配额(GB)" "到期日" "状态"
+    printf "  ${CYAN}%-4s %-7s %-18s %-11s %-10s %-12s %-10s${NC}\n" "编号" "端口" "名称" "入口" "配额(GB)" "到期日" "状态"
     echo -e "  ${BLUE}-------------------------------------------------${NC}"
 
     python3 << PYEOF
+import ipaddress
 import json
 with open('$CONFIG') as f:
     c = json.load(f)
@@ -1759,6 +1915,24 @@ for i, s in enumerate(c['servers'], 1):
     quota = s.get('quota_bytes', 0)
     quota_text = '-' if not quota else f'{quota / 1024 ** 3:g}'
     expiry = s.get('expires_at', '-')
+    hosts = s.get('entry_hosts')
+    if not isinstance(hosts, list) or not hosts:
+        entry = '默认'
+    else:
+        families = set()
+        for host in hosts:
+            try:
+                families.add(ipaddress.ip_address(host).version)
+            except ValueError:
+                families.add('domain')
+        if families == {4, 6}:
+            entry = 'IPv4+IPv6'
+        elif families == {4}:
+            entry = 'IPv4'
+        elif families == {6}:
+            entry = 'IPv6'
+        else:
+            entry = '域名'
     reason = s.get('disabled_reason')
     if reason == 'quota':
         status = '配额暂停'
@@ -1766,7 +1940,7 @@ for i, s in enumerate(c['servers'], 1):
         status = '到期暂停'
     elif reason == 'manual':
         status = '手动暂停'
-    print(f"  {i:<4} {s['server_port']:<7} {name:<18} {quota_text:<10} {expiry:<12} {color}{status:<10}{reset}")
+    print(f"  {i:<4} {s['server_port']:<7} {name:<18} {entry:<11} {quota_text:<10} {expiry:<12} {color}{status:<10}{reset}")
 PYEOF
 
     echo -e "  ${BLUE}=================================================${NC}"
@@ -1791,6 +1965,7 @@ generate_client_configs() {
 
     if ! python3 - "$CONFIG" "$EXPORT_HOST" "$CLASH_CONFIG" "$MIHOMO_CONFIG" "$SINGBOX_CONFIG" << 'PYEOF'
 import json
+import ipaddress
 import os
 import sys
 import tempfile
@@ -1804,13 +1979,37 @@ if not servers:
 
 used_names = {'proxy'}
 users = []
+
+def entry_hosts(server):
+    hosts = server.get('entry_hosts')
+    if not isinstance(hosts, list) or not hosts or not all(isinstance(value, str) and value for value in hosts):
+        return [host]
+    return list(dict.fromkeys(hosts))
+
+def unique_name(candidate, port):
+    name = candidate
+    if name in used_names:
+        name = f'{candidate}-{port}'
+    serial = 2
+    while name in used_names:
+        name = f'{candidate}-{port}-{serial}'
+        serial += 1
+    used_names.add(name)
+    return name
+
 for index, server in enumerate(servers, 1):
     base_name = str(server.get('name') or f'user-{index}').strip()
-    name = base_name
-    if name in used_names:
-        name = f"{base_name}-{server['server_port']}"
-    used_names.add(name)
-    users.append((name, server))
+    hosts = entry_hosts(server)
+    for entry_index, entry_host in enumerate(hosts, 1):
+        candidate = base_name
+        if len(hosts) > 1:
+            try:
+                label = f'IPv{ipaddress.ip_address(entry_host).version}'
+            except ValueError:
+                label = f'Entry{entry_index}'
+            candidate = f'{base_name}-{label}'
+        name = unique_name(candidate, server['server_port'])
+        users.append((name, server, entry_host))
 
 def yaml_string(value):
     return json.dumps(str(value), ensure_ascii=False)
@@ -1823,11 +2022,11 @@ def build_clash():
         'log-level: info',
         'proxies:',
     ]
-    for name, server in users:
+    for name, server, entry_host in users:
         lines.extend([
             f"  - name: {yaml_string(name)}",
             '    type: ss',
-            f"    server: {yaml_string(host)}",
+            f"    server: {yaml_string(entry_host)}",
             f"    port: {int(server['server_port'])}",
             f"    cipher: {yaml_string(server['method'])}",
             f"    password: {yaml_string(server['password'])}",
@@ -1839,11 +2038,11 @@ def build_clash():
         '    type: select',
         '    proxies:',
     ])
-    lines.extend(f"      - {yaml_string(name)}" for name, _ in users)
+    lines.extend(f"      - {yaml_string(name)}" for name, _, _ in users)
     lines.extend(['rules:', '  - MATCH,PROXY'])
     return '\n'.join(lines) + '\n'
 
-tags = [name for name, _ in users]
+tags = [name for name, _, _ in users]
 singbox = {
     'log': {'level': 'info'},
     'inbounds': [
@@ -1865,12 +2064,12 @@ singbox = {
             {
                 'type': 'shadowsocks',
                 'tag': name,
-                'server': host,
+                'server': entry_host,
                 'server_port': int(server['server_port']),
                 'method': server['method'],
                 'password': server['password'],
             }
-            for name, server in users
+            for name, server, entry_host in users
         ],
     ],
 }
@@ -1922,28 +2121,58 @@ generate_qr_codes() {
     mkdir -p "$QR_DIR" || return 1
     rm -f "$QR_DIR"/ss-*.png "$QR_DIR"/clash-config.png
 
-    local -a QR_PORTS QR_LINKS
-    mapfile -t QR_PORTS < <(python3 - "$CONFIG" << 'PYEOF'
-import json
+    local -a QR_LABELS QR_LINKS
+    mapfile -t QR_LINKS < "$LINKS_FILE"
+    mapfile -t QR_LABELS < <(python3 - "$LINKS_FILE" << 'PYEOF'
+import collections
+import ipaddress
 import sys
-with open(sys.argv[1]) as f:
-    for server in json.load(f).get('servers', []):
-        print(server['server_port'])
+
+entries = []
+with open(sys.argv[1], encoding='utf-8') as f:
+    for line in f:
+        line = line.strip()
+        if not line:
+            continue
+        authority = line.split('@', 1)[1].split('#', 1)[0]
+        if authority.startswith('['):
+            end = authority.index(']')
+            host = authority[1:end]
+            port = authority[end + 2:]
+        else:
+            host, port = authority.rsplit(':', 1)
+        entries.append((host, port))
+
+counts = collections.Counter(port for _, port in entries)
+used = set()
+for index, (host, port) in enumerate(entries, 1):
+    label = port
+    if counts[port] > 1:
+        try:
+            label = f'{port}-ipv{ipaddress.ip_address(host).version}'
+        except ValueError:
+            label = f'{port}-entry{index}'
+    candidate = label
+    serial = 2
+    while candidate in used:
+        candidate = f'{label}-{serial}'
+        serial += 1
+    used.add(candidate)
+    print(candidate)
 PYEOF
 )
-    mapfile -t QR_LINKS < "$LINKS_FILE"
+    if [ "${#QR_LABELS[@]}" -ne "${#QR_LINKS[@]}" ]; then
+        echo -e "${RED}❌ SS 链接格式无效，无法生成二维码${NC}"
+        return 1
+    fi
 
     local i GENERATED=0
     for i in "${!QR_LINKS[@]}"; do
         [ -n "${QR_LINKS[$i]}" ] || continue
-        [ -n "${QR_PORTS[$i]:-}" ] || {
-            echo -e "${YELLOW}⚠ SS 链接与用户数量不一致，请重新生成链接${NC}"
-            continue
-        }
-        if printf '%s' "${QR_LINKS[$i]}" | qrencode -o "$QR_DIR/ss-${QR_PORTS[$i]}.png" -s 6; then
+        if printf '%s' "${QR_LINKS[$i]}" | qrencode -o "$QR_DIR/ss-${QR_LABELS[$i]}.png" -s 6; then
             GENERATED=$((GENERATED + 1))
         else
-            echo -e "${YELLOW}⚠ 端口 ${QR_PORTS[$i]} 的二维码生成失败${NC}"
+            echo -e "${YELLOW}⚠ 入口 ${QR_LABELS[$i]} 的二维码生成失败${NC}"
         fi
     done
     if ! qrencode -o "$QR_DIR/clash-config.png" -s 4 < "$CLASH_CONFIG"; then
@@ -1977,8 +2206,19 @@ export_client_menu() {
             fi
             ;;
         2)
-            list_users
-            read -r -p "输入用户编号: " NUM
+            python3 - "$LINKS_FILE" << 'PYEOF'
+import sys
+from urllib.parse import unquote
+
+with open(sys.argv[1], encoding='utf-8') as f:
+    for index, line in enumerate((value.strip() for value in f), 1):
+        if not line:
+            continue
+        authority = line.split('@', 1)[1].split('#', 1)[0]
+        name = unquote(line.split('#', 1)[1]) if '#' in line else f'entry-{index}'
+        print(f'  {index}) {name}  {authority}')
+PYEOF
+            read -r -p "输入链接编号: " NUM
             if is_uint "$NUM" && [ "$NUM" -ge 1 ]; then
                 LINK=$(sed -n "${NUM}p" "$LINKS_FILE")
                 [ -n "$LINK" ] && printf '%s' "$LINK" | qrencode -t ANSIUTF8 || echo -e "${RED}无效编号${NC}"
@@ -2476,8 +2716,7 @@ PYEOF
 rebuild_links() {
     # 根据 config.json 重建所有 SS 链接（保持端口顺序，序号重排）
     HOST=$(get_server_host 2>/dev/null) || basic_config || return 1
-    local LINK_HOST DEFAULT_NAME
-    LINK_HOST=$(format_ss_host "$HOST")
+    local DEFAULT_NAME
     DEFAULT_NAME=$(default_link_name)
 
     local TMP_LINKS
@@ -2485,27 +2724,7 @@ rebuild_links() {
         echo -e "${RED}❌ 创建链接临时文件失败${NC}"
         return 1
     }
-    if ! python3 - "$CONFIG" "$TMP_LINKS" "$LINK_HOST" "$DEFAULT_NAME" << 'PYEOF'
-import json, base64
-import sys
-from urllib.parse import quote
-
-with open(sys.argv[1]) as f:
-    c = json.load(f)
-lines = []
-servers = c['servers']
-for i, s in enumerate(servers, 1):
-    userinfo = base64.b64encode(f"{s['method']}:{s['password']}".encode()).decode()
-    fallback = sys.argv[4] if len(servers) == 1 else f"{sys.argv[4]}-{i}"
-    name = s.get('name')
-    if not isinstance(name, str) or not name.strip():
-        name = fallback
-    lines.append(f"ss://{userinfo}@{sys.argv[3]}:{s['server_port']}#{quote(name.strip(), safe='')}")
-with open(sys.argv[2], 'w') as f:
-    if lines:
-        f.write('\n'.join(lines) + '\n')
-PYEOF
-    then
+    if ! write_links_file "$CONFIG" "$TMP_LINKS" "$HOST" "$DEFAULT_NAME"; then
         rm -f "$TMP_LINKS"
         echo -e "${RED}❌ 重建 SS 链接失败${NC}"
         return 1
@@ -2667,6 +2886,9 @@ with open('$CONFIG') as f:
     DEFAULT_NAME=$(default_link_name)
     FINAL_COUNT=$((EXIST_COUNT + ADD_COUNT))
     NEW_NAMES=()
+    NEW_ENTRY_HOSTS_JSON=()
+    echo "正在检测公网 IPv4 和 IPv6 地址..."
+    detect_public_ips
     for i in "${!NEW_PORTS[@]}"; do
         USER_NUM=$((EXIST_COUNT + i + 1))
         if [ "$FINAL_COUNT" -eq 1 ]; then
@@ -2683,11 +2905,13 @@ with open('$CONFIG') as f:
             fi
             echo -e "${RED}❌ 名称不能为空、不能包含控制字符，且最多 80 个字符${NC}"
         done
+        select_entry_hosts "端口 ${NEW_PORTS[$i]}" 0 || return 1
+        NEW_ENTRY_HOSTS_JSON+=("$(entry_hosts_json "${ENTRY_HOSTS[@]}")")
     done
 
     # 追加到 config.json
     NEW_PORTS_STR="${NEW_PORTS[*]}"
-    if ! python3 - "$CONFIG" "$METHOD" "$KEY_LEN" "$BIND_ADDRESS" "$ADD_COUNT" "${NEW_PORTS[@]}" "${NEW_NAMES[@]}" << 'PYEOF'
+    if ! python3 - "$CONFIG" "$METHOD" "$KEY_LEN" "$BIND_ADDRESS" "$ADD_COUNT" "${NEW_PORTS[@]}" "${NEW_NAMES[@]}" "${NEW_ENTRY_HOSTS_JSON[@]}" << 'PYEOF'
 import json, os, subprocess, tempfile
 import sys
 
@@ -2696,8 +2920,9 @@ count = int(count)
 key_len = int(key_len)
 new_ports = sys.argv[6:6 + count]
 new_names = sys.argv[6 + count:6 + count * 2]
-if len(new_ports) != count or len(new_names) != count:
-    raise SystemExit('port/name argument count mismatch')
+new_entry_hosts = [json.loads(value) for value in sys.argv[6 + count * 2:6 + count * 3]]
+if len(new_ports) != count or len(new_names) != count or len(new_entry_hosts) != count:
+    raise SystemExit('port/name/entry argument count mismatch')
 
 with open(config_file) as f:
     c = json.load(f)
@@ -2708,7 +2933,7 @@ def gen_pass():
         return raw
     return raw.replace('=', '')[:24]
 
-for p, name in zip(new_ports, new_names):
+for p, name, entry_hosts in zip(new_ports, new_names, new_entry_hosts):
     c['servers'].append({
         'server': bind_address,
         'server_port': int(p),
@@ -2716,6 +2941,7 @@ for p, name in zip(new_ports, new_names):
         'method': method,
         'mode': 'tcp_and_udp',
         'name': name,
+        'entry_hosts': entry_hosts,
     })
 
 fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
@@ -2827,6 +3053,75 @@ PYEOF
 
 rename_user() {
     with_state_lock rename_user_locked
+}
+
+configure_user_entries_locked() {
+    if ! check_installed; then
+        echo -e "${RED}请先安装 Shadowsocks-Rust${NC}"
+        return 1
+    fi
+    list_users
+    read -r -p "输入要修改连接入口的用户编号: " NUM
+    if ! is_uint "$NUM" || [ "$NUM" -lt 1 ]; then
+        echo -e "${RED}无效编号${NC}"
+        return 1
+    fi
+
+    USER_INFO=$(python3 - "$CONFIG" "$NUM" << 'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as f:
+    servers = json.load(f).get('servers', [])
+index = int(sys.argv[2]) - 1
+if not 0 <= index < len(servers):
+    raise SystemExit(1)
+server = servers[index]
+print(f"{server.get('name') or 'user'}|{server['server_port']}")
+PYEOF
+) || {
+        echo -e "${RED}无效编号${NC}"
+        return 1
+    }
+    USER_NAME=${USER_INFO%|*}
+    USER_PORT=${USER_INFO##*|}
+
+    echo "正在检测公网 IPv4 和 IPv6 地址..."
+    detect_public_ips
+    select_entry_hosts "用户 $USER_NAME（端口 $USER_PORT）" 0 || return 1
+    ENTRY_HOSTS_JSON=$(entry_hosts_json "${ENTRY_HOSTS[@]}") || return 1
+
+    if ! python3 - "$CONFIG" "$NUM" "$ENTRY_HOSTS_JSON" << 'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+config_file, number, entry_hosts_json = sys.argv[1:]
+with open(config_file, encoding='utf-8') as f:
+    config = json.load(f)
+index = int(number) - 1
+if not 0 <= index < len(config.get('servers', [])):
+    raise SystemExit(1)
+config['servers'][index]['entry_hosts'] = json.loads(entry_hosts_json)
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w', encoding='utf-8') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+os.replace(tmp, config_file)
+PYEOF
+    then
+        echo -e "${RED}❌ 修改用户连接入口失败${NC}"
+        return 1
+    fi
+    secure_data_files
+    rebuild_links || return 1
+    echo -e "${GREEN}✅ 用户 $USER_NAME 的连接入口已更新，端口仍为 $USER_PORT${NC}"
+    show_links
+}
+
+configure_user_entries() {
+    with_state_lock configure_user_entries_locked
 }
 
 # ========== 用户配额与到期策略 ==========
@@ -3139,6 +3434,7 @@ extract_and_validate_backup() {
     local DESTINATION=$2
     python3 - "$ARCHIVE" "$DESTINATION" << 'PYEOF'
 import datetime
+import ipaddress
 import json
 import os
 import re
@@ -3202,6 +3498,34 @@ for server in servers:
         raise SystemExit('invalid encryption method')
     if not isinstance(server.get('password'), str) or not server['password']:
         raise SystemExit('invalid password')
+    entry_hosts = server.get('entry_hosts')
+    if entry_hosts is not None:
+        if (
+            not isinstance(entry_hosts, list)
+            or not 1 <= len(entry_hosts) <= 2
+            or len(set(entry_hosts)) != len(entry_hosts)
+        ):
+            raise SystemExit('invalid entry hosts')
+        for host in entry_hosts:
+            if not isinstance(host, str) or not host or any(ch.isspace() for ch in host):
+                raise SystemExit('invalid entry host')
+            try:
+                ipaddress.ip_address(host)
+                continue
+            except ValueError:
+                pass
+            try:
+                ascii_host = host.rstrip('.').encode('idna').decode('ascii').lower()
+            except UnicodeError:
+                raise SystemExit('invalid entry host')
+            labels = ascii_host.split('.')
+            if not labels or any(
+                not label
+                or len(label) > 63
+                or not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?', label)
+                for label in labels
+            ):
+                raise SystemExit('invalid entry host')
     quota = server.get('quota_bytes')
     if quota is not None and (not isinstance(quota, int) or isinstance(quota, bool) or quota < 0):
         raise SystemExit('invalid traffic quota')
@@ -3750,7 +4074,7 @@ if changed:
 # 重新生成 runtime
 servers = [dict(s) for s in c['servers'] if not s.get('disabled', False)]
 for s in servers:
-    for field in ('disabled', 'acl', 'name', 'quota_bytes', 'expires_at', 'disabled_reason'):
+    for field in ('disabled', 'acl', 'name', 'entry_hosts', 'quota_bytes', 'expires_at', 'disabled_reason'):
         s.pop(field, None)
 
 runtime = {'servers': servers}
@@ -4335,6 +4659,7 @@ show_main_menu() {
         echo -e "     10)  重新生成所有用户"
         echo -e "     23)  修改用户名称"
         echo -e "     25)  设置用户配额/到期时间"
+        echo -e "     32)  修改用户连接入口"
         echo -e "  ${CYAN}  -- 导出与数据 --${NC}"
         echo -e "     24)  导出客户端配置和二维码"
         echo -e "     26)  备份配置/ACL/流量数据"
@@ -4360,10 +4685,10 @@ show_main_menu() {
         echo -e "  ${BLUE}-------------------------------------------------${NC}"
         echo -e "   ${RED}  0)  退出${NC}"
         echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-31]: " CHOICE
+        read -r -p "  请选择 [0-32]: " CHOICE
 
         # 未安装时拦截管理功能
-        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|2[0-9]|30)$ ]]; then
+        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|2[0-9]|30|32)$ ]]; then
             echo -e "${RED}⚠ 请先安装 Shadowsocks-Rust（选项 1）${NC}"
             sleep 2
             continue
@@ -4389,6 +4714,7 @@ show_main_menu() {
             28) upgrade_ssserver; read -r -p "按回车继续..." ;;
             29) health_check; read -r -p "按回车继续..." ;;
             30) configure_traffic_backend; read -r -p "按回车继续..." ;;
+            32) configure_user_entries; read -r -p "按回车继续..." ;;
             11) show_traffic;  read -r -p "按回车继续..." ;;
             12) reset_traffic; read -r -p "按回车继续..." ;;
             13) add_acl_domain; read -r -p "按回车继续..." ;;
