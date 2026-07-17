@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.5.7
+#   版本: V1.5.8
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.5.7"
+VERSION="V1.5.8"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -343,6 +343,50 @@ valid_ruleset_name() {
 
 valid_domain() {
     [[ "$1" =~ ^[A-Za-z0-9._*-]+$ ]]
+}
+
+normalize_link_name() {
+    python3 - "$1" << 'PYEOF'
+import sys
+import unicodedata
+
+name = sys.argv[1].strip()
+if not name or len(name) > 80 or any(unicodedata.category(ch).startswith('C') for ch in name):
+    raise SystemExit(1)
+print(name)
+PYEOF
+}
+
+default_link_name() {
+    local NAME
+    NAME=$(hostname 2>/dev/null || true)
+    [ -n "$NAME" ] || NAME=${HOST:-shadowsocks}
+    normalize_link_name "$NAME" 2>/dev/null || echo shadowsocks
+}
+
+encode_link_name() {
+    python3 - "$1" << 'PYEOF'
+import sys
+from urllib.parse import quote
+
+print(quote(sys.argv[1], safe=''))
+PYEOF
+}
+
+select_link_name_prefix() {
+    local DEFAULT_NAME INPUT_NAME NORMALIZED
+    DEFAULT_NAME=$(default_link_name)
+    while true; do
+        read -r -p "SS 链接名称 [默认 $DEFAULT_NAME]: " INPUT_NAME
+        INPUT_NAME=${INPUT_NAME:-$DEFAULT_NAME}
+        if NORMALIZED=$(normalize_link_name "$INPUT_NAME" 2>/dev/null); then
+            LINK_NAME_PREFIX=$NORMALIZED
+            NAME_LIST=()
+            echo -e "链接名称: ${GREEN}$LINK_NAME_PREFIX${NC}"
+            return 0
+        fi
+        echo -e "${RED}❌ 名称不能为空、不能包含控制字符，且最多 80 个字符${NC}"
+    done
 }
 
 normalize_server_host() {
@@ -1097,7 +1141,7 @@ gen_password() {
 
 generate_config() {
     echo -e "\n${YELLOW}>>> 生成配置文件和 SS 链接...${NC}"
-    local TMP_CONFIG TMP_LINKS BIND_ADDRESS LINK_HOST
+    local TMP_CONFIG TMP_LINKS BIND_ADDRESS LINK_HOST NAME NAME_JSON TAG
     HOST=$(normalize_server_host "$HOST" 2>/dev/null) || {
         echo -e "${RED}❌ 服务器地址无效${NC}"
         return 1
@@ -1125,19 +1169,45 @@ generate_config() {
     : > "$TMP_LINKS"
 
     TOTAL=${#PORT_LIST[@]}
+    [ -n "${LINK_NAME_PREFIX:-}" ] || LINK_NAME_PREFIX=$(default_link_name)
     for i in $(seq 0 $((TOTAL - 1))); do
         PORT=${PORT_LIST[$i]}
         PASS=$(gen_password)
         NUM=$((i + 1))
+        NAME=${NAME_LIST[$i]:-}
+        if [ -z "$NAME" ]; then
+            if [ "$TOTAL" -eq 1 ]; then
+                NAME=$LINK_NAME_PREFIX
+            else
+                NAME="${LINK_NAME_PREFIX}-${NUM}"
+            fi
+        fi
+        NAME=$(normalize_link_name "$NAME" 2>/dev/null) || {
+            rm -f "$TMP_CONFIG" "$TMP_LINKS"
+            echo -e "${RED}❌ SS 链接名称无效${NC}"
+            return 1
+        }
+        NAME_JSON=$(python3 - "$NAME" << 'PYEOF'
+import json
+import sys
+
+print(json.dumps(sys.argv[1], ensure_ascii=False))
+PYEOF
+)
+        TAG=$(encode_link_name "$NAME") || {
+            rm -f "$TMP_CONFIG" "$TMP_LINKS"
+            echo -e "${RED}❌ SS 链接名称编码失败${NC}"
+            return 1
+        }
 
         if [ $NUM -lt "$TOTAL" ]; then
-            echo "  {\"server\":\"$BIND_ADDRESS\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}," >> "$TMP_CONFIG"
+            echo "  {\"server\":\"$BIND_ADDRESS\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\",\"name\":$NAME_JSON}," >> "$TMP_CONFIG"
         else
-            echo "  {\"server\":\"$BIND_ADDRESS\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\"}" >> "$TMP_CONFIG"
+            echo "  {\"server\":\"$BIND_ADDRESS\",\"server_port\":$PORT,\"password\":\"$PASS\",\"method\":\"$METHOD\",\"mode\":\"tcp_and_udp\",\"name\":$NAME_JSON}" >> "$TMP_CONFIG"
         fi
 
         USERINFO=$(echo -n "$METHOD:$PASS" | base64 | tr -d '\n')
-        echo "ss://${USERINFO}@${LINK_HOST}:${PORT}#用户${NUM}" >> "$TMP_LINKS"
+        echo "ss://${USERINFO}@${LINK_HOST}:${PORT}#${TAG}" >> "$TMP_LINKS"
     done
 
     echo ']}' >> "$TMP_CONFIG" || return 1
@@ -1163,6 +1233,7 @@ servers = [dict(s) for s in config['servers'] if not s.get('disabled', False)]
 for s in servers:
     s.pop('disabled', None)
     s.pop('acl', None)  # 移除 server 块里的旧 acl 字段
+    s.pop('name', None)  # 链接名称仅供 volss 管理，不传给 ssserver
 
 runtime = {'servers': servers}
 
@@ -1347,6 +1418,7 @@ do_install_locked() {
     install_ssrust    || { read -r -p "按回车返回..."; return 1; }
     select_method     || { read -r -p "按回车返回..."; return 1; }
     basic_config      || { read -r -p "按回车返回..."; return 1; }
+    select_link_name_prefix || { read -r -p "按回车返回..."; return 1; }
     select_ports      || { read -r -p "按回车返回..."; return 1; }
     config_acl        || { read -r -p "按回车返回..."; return 1; }
     generate_config   || { read -r -p "按回车返回..."; return 1; }
@@ -1399,7 +1471,7 @@ list_users() {
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    当前用户列表${NC}"
     echo -e "${BLUE}  =================================================${NC}"
-    printf "  ${CYAN}%-4s %-8s %-36s %-6s${NC}\n" "编号" "端口" "加密方式" "状态"
+    printf "  ${CYAN}%-4s %-8s %-22s %-30s %-6s${NC}\n" "编号" "端口" "名称" "加密方式" "状态"
     echo -e "  ${BLUE}-------------------------------------------------${NC}"
 
     python3 << PYEOF
@@ -1410,7 +1482,10 @@ for i, s in enumerate(c['servers'], 1):
     status = '暂停' if s.get('disabled') else '正常'
     color  = '\033[0;31m' if s.get('disabled') else '\033[0;32m'
     reset  = '\033[0m'
-    print(f"  {i:<4} {s['server_port']:<8} {s['method']:<36} {color}{status}{reset}")
+    name = str(s.get('name') or '-')
+    if len(name) > 20:
+        name = name[:19] + '…'
+    print(f"  {i:<4} {s['server_port']:<8} {name:<22} {s['method']:<30} {color}{status}{reset}")
 PYEOF
 
     echo -e "  ${BLUE}=================================================${NC}"
@@ -1837,6 +1912,15 @@ print(' '.join(str(s['server_port']) for s in c['servers']))
 ")
     read -r -a PORT_LIST <<< "$PORT_STR"
 
+    mapfile -t NAME_LIST < <(python3 -c "
+import json
+with open('$CONFIG') as f:
+    c = json.load(f)
+for s in c['servers']:
+    print(s.get('name', ''))
+")
+    LINK_NAME_PREFIX=$(default_link_name)
+
     HOST=$(get_server_host 2>/dev/null) || basic_config || return 1
 
     USE_ACL_FLAG=$([ -f "$ACL_PATH" ] && echo true || echo false)
@@ -1850,31 +1934,32 @@ print(' '.join(str(s['server_port']) for s in c['servers']))
 # ========== 添加新用户 ==========
 rebuild_links() {
     # 根据 config.json 重建所有 SS 链接（保持端口顺序，序号重排）
-    METHOD=$(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-print(c['servers'][0]['method'] if c['servers'] else '')
-")
     HOST=$(get_server_host 2>/dev/null) || basic_config || return 1
-    local LINK_HOST
+    local LINK_HOST DEFAULT_NAME
     LINK_HOST=$(format_ss_host "$HOST")
+    DEFAULT_NAME=$(default_link_name)
 
     local TMP_LINKS
     TMP_LINKS=$(make_temp_for "$LINKS_FILE") || {
         echo -e "${RED}❌ 创建链接临时文件失败${NC}"
         return 1
     }
-    if ! python3 - "$CONFIG" "$TMP_LINKS" "$LINK_HOST" << 'PYEOF'
+    if ! python3 - "$CONFIG" "$TMP_LINKS" "$LINK_HOST" "$DEFAULT_NAME" << 'PYEOF'
 import json, base64
 import sys
+from urllib.parse import quote
 
 with open(sys.argv[1]) as f:
     c = json.load(f)
 lines = []
-for i, s in enumerate(c['servers'], 1):
+servers = c['servers']
+for i, s in enumerate(servers, 1):
     userinfo = base64.b64encode(f"{s['method']}:{s['password']}".encode()).decode()
-    lines.append(f"ss://{userinfo}@{sys.argv[3]}:{s['server_port']}#用户{i}")
+    fallback = sys.argv[4] if len(servers) == 1 else f"{sys.argv[4]}-{i}"
+    name = s.get('name')
+    if not isinstance(name, str) or not name.strip():
+        name = fallback
+    lines.append(f"ss://{userinfo}@{sys.argv[3]}:{s['server_port']}#{quote(name.strip(), safe='')}")
 with open(sys.argv[2], 'w') as f:
     if lines:
         f.write('\n'.join(lines) + '\n')
@@ -1895,6 +1980,51 @@ migrate_server_host_if_needed() {
     STORED_HOST=$(get_server_host 2>/dev/null) || return 0
     if [[ "$STORED_HOST" == *:* ]] && ! grep -Fq "@[$STORED_HOST]:" "$LINKS_FILE"; then
         rebuild_links
+    fi
+}
+
+migrate_link_names_if_needed() {
+    check_installed || return 0
+    local DEFAULT_NAME CHANGED
+    DEFAULT_NAME=$(default_link_name)
+    CHANGED=$(python3 - "$CONFIG" "$DEFAULT_NAME" << 'PYEOF'
+import json
+import os
+import sys
+import tempfile
+import unicodedata
+
+config_file, default_name = sys.argv[1:]
+with open(config_file) as f:
+    config = json.load(f)
+servers = config.get('servers', [])
+changed = False
+for i, server in enumerate(servers, 1):
+    name = server.get('name')
+    normalized = name.strip() if isinstance(name, str) else ''
+    valid = (
+        isinstance(name, str)
+        and 0 < len(normalized) <= 80
+        and not any(unicodedata.category(ch).startswith('C') for ch in normalized)
+    )
+    if not valid:
+        server['name'] = default_name if len(servers) == 1 else f'{default_name}-{i}'
+        changed = True
+    elif name != normalized:
+        server['name'] = normalized
+        changed = True
+if changed:
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+    os.replace(tmp, config_file)
+print('1' if changed else '0')
+PYEOF
+) || return 1
+    if [ "$CHANGED" = "1" ]; then
+        secure_data_files
+        rebuild_links || return 1
+        echo -e "${GREEN}✅ SS 链接名称已自动迁移${NC}"
     fi
 }
 
@@ -1988,17 +2118,48 @@ print(' '.join(str(s['server_port']) for s in c['servers']))
         done
     fi
 
+    EXIST_COUNT=$(python3 -c "
+import json
+with open('$CONFIG') as f:
+    print(len(json.load(f).get('servers', [])))
+")
+    DEFAULT_NAME=$(default_link_name)
+    FINAL_COUNT=$((EXIST_COUNT + ADD_COUNT))
+    NEW_NAMES=()
+    for i in "${!NEW_PORTS[@]}"; do
+        USER_NUM=$((EXIST_COUNT + i + 1))
+        if [ "$FINAL_COUNT" -eq 1 ]; then
+            SUGGESTED_NAME=$DEFAULT_NAME
+        else
+            SUGGESTED_NAME="${DEFAULT_NAME}-${USER_NUM}"
+        fi
+        while true; do
+            read -r -p "端口 ${NEW_PORTS[$i]} 的链接名称 [默认 $SUGGESTED_NAME]: " INPUT_NAME
+            INPUT_NAME=${INPUT_NAME:-$SUGGESTED_NAME}
+            if NORMALIZED_NAME=$(normalize_link_name "$INPUT_NAME" 2>/dev/null); then
+                NEW_NAMES+=("$NORMALIZED_NAME")
+                break
+            fi
+            echo -e "${RED}❌ 名称不能为空、不能包含控制字符，且最多 80 个字符${NC}"
+        done
+    done
+
     # 追加到 config.json
     NEW_PORTS_STR="${NEW_PORTS[*]}"
-    if ! python3 << PYEOF
+    if ! python3 - "$CONFIG" "$METHOD" "$KEY_LEN" "$BIND_ADDRESS" "$ADD_COUNT" "${NEW_PORTS[@]}" "${NEW_NAMES[@]}" << 'PYEOF'
 import json, os, subprocess, tempfile
+import sys
 
-with open('$CONFIG') as f:
+config_file, method, key_len, bind_address, count = sys.argv[1:6]
+count = int(count)
+key_len = int(key_len)
+new_ports = sys.argv[6:6 + count]
+new_names = sys.argv[6 + count:6 + count * 2]
+if len(new_ports) != count or len(new_names) != count:
+    raise SystemExit('port/name argument count mismatch')
+
+with open(config_file) as f:
     c = json.load(f)
-
-method = '$METHOD'
-key_len = $KEY_LEN
-new_ports = "$NEW_PORTS_STR".split()
 
 def gen_pass():
     raw = subprocess.check_output(['openssl', 'rand', '-base64', str(key_len if key_len > 0 else 32)], text=True).strip()
@@ -2006,19 +2167,19 @@ def gen_pass():
         return raw
     return raw.replace('=', '')[:24]
 
-for p in new_ports:
+for p, name in zip(new_ports, new_names):
     c['servers'].append({
-        'server': '$BIND_ADDRESS',
+        'server': bind_address,
         'server_port': int(p),
         'password': gen_pass(),
         'method': method,
-        'mode': 'tcp_and_udp'
+        'mode': 'tcp_and_udp',
+        'name': name,
     })
 
-config_file = '$CONFIG'
 fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
 with os.fdopen(fd, 'w') as f:
-    json.dump(c, f, indent=2)
+    json.dump(c, f, indent=2, ensure_ascii=False)
 os.replace(tmp, config_file)
 print(f"✅ 已添加 {len(new_ports)} 个新用户")
 PYEOF
@@ -2061,6 +2222,70 @@ regen_users() {
 
 add_user() {
     with_state_lock add_user_locked
+}
+
+rename_user_locked() {
+    list_users
+    read -r -p "输入要修改名称的用户编号: " NUM
+    if ! is_uint "$NUM" || [ "$NUM" -lt 1 ]; then
+        echo -e "${RED}无效编号${NC}"
+        return 1
+    fi
+
+    CURRENT_NAME=$(python3 - "$CONFIG" "$NUM" << 'PYEOF'
+import json
+import sys
+
+with open(sys.argv[1]) as f:
+    servers = json.load(f).get('servers', [])
+idx = int(sys.argv[2]) - 1
+if 0 <= idx < len(servers):
+    print(servers[idx].get('name', ''))
+PYEOF
+)
+    if [ -z "$CURRENT_NAME" ]; then
+        echo -e "${RED}无效编号${NC}"
+        return 1
+    fi
+
+    while true; do
+        read -r -p "新名称 [当前: $CURRENT_NAME]: " INPUT_NAME
+        INPUT_NAME=${INPUT_NAME:-$CURRENT_NAME}
+        if NEW_NAME=$(normalize_link_name "$INPUT_NAME" 2>/dev/null); then
+            break
+        fi
+        echo -e "${RED}❌ 名称不能为空、不能包含控制字符，且最多 80 个字符${NC}"
+    done
+
+    if ! python3 - "$CONFIG" "$NUM" "$NEW_NAME" << 'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+config_file, number, name = sys.argv[1:]
+with open(config_file) as f:
+    config = json.load(f)
+idx = int(number) - 1
+if not 0 <= idx < len(config.get('servers', [])):
+    raise SystemExit(1)
+config['servers'][idx]['name'] = name
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+os.replace(tmp, config_file)
+PYEOF
+    then
+        echo -e "${RED}❌ 修改用户名称失败${NC}"
+        return 1
+    fi
+    secure_data_files
+    rebuild_links || return 1
+    echo -e "${GREEN}✅ 用户名称已修改为: $NEW_NAME${NC}"
+}
+
+rename_user() {
+    with_state_lock rename_user_locked
 }
 
 # ========== 更新脚本 ==========
@@ -2170,6 +2395,7 @@ servers = [dict(s) for s in c['servers'] if not s.get('disabled', False)]
 for s in servers:
     s.pop('disabled', None)
     s.pop('acl', None)
+    s.pop('name', None)
 
 runtime = {'servers': servers}
 if os.path.exists(acl_path):
@@ -2750,6 +2976,7 @@ show_main_menu() {
         echo -e "      8)  恢复某个用户"
         echo -e "      9)  删除某个用户"
         echo -e "     10)  重新生成所有用户"
+        echo -e "     23)  修改用户名称"
         echo -e "  ${CYAN}  -- 流量统计 --${NC}"
         echo -e "     11)  查看流量统计"
         echo -e "     12)  重置流量统计"
@@ -2768,10 +2995,10 @@ show_main_menu() {
         echo -e "  ${BLUE}-------------------------------------------------${NC}"
         echo -e "   ${RED}  0)  退出${NC}"
         echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-22]: " CHOICE
+        read -r -p "  请选择 [0-23]: " CHOICE
 
         # 未安装时拦截管理功能
-        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|2[0-2])$ ]]; then
+        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|2[0-3])$ ]]; then
             echo -e "${RED}⚠ 请先安装 Shadowsocks-Rust（选项 1）${NC}"
             sleep 2
             continue
@@ -2788,6 +3015,7 @@ show_main_menu() {
             8)  enable_user;   read -r -p "按回车继续..." ;;
             9)  delete_user;   read -r -p "按回车继续..." ;;
             10) regen_users;   read -r -p "按回车继续..." ;;
+            23) rename_user;   read -r -p "按回车继续..." ;;
             11) show_traffic;  read -r -p "按回车继续..." ;;
             12) reset_traffic; read -r -p "按回车继续..." ;;
             13) add_acl_domain; read -r -p "按回车继续..." ;;
@@ -2949,6 +3177,7 @@ PYEOF
     fi
     secure_data_files
     with_state_lock migrate_server_host_if_needed
+    with_state_lock migrate_link_names_if_needed
     with_state_lock migrate_traffic_rules_if_needed
 fi
 

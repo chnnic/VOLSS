@@ -56,9 +56,89 @@ test_host_helpers() {
     KEY_LEN=16
     USE_ACL_FLAG=false
     PORT_LIST=(30001)
+    LINK_NAME_PREFIX="Hong Kong Node"
+    NAME_LIST=()
     generate_config >/dev/null || fail "generate IPv6 configuration"
-    assert_true "generate bracketed IPv6 link" grep -Fq '@[2001:db8::3]:30001#用户1' "$LINKS_FILE"
+    assert_true "generate bracketed IPv6 link" grep -Fq '@[2001:db8::3]:30001#Hong%20Kong%20Node' "$LINKS_FILE"
     assert_true "generate supported bind address" grep -Eq '"server":"(::|0\.0\.0\.0)"' "$CONFIG"
+    assert_eq "Hong Kong Node" "$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][0]['name'])")" "persist custom link name"
+    assert_eq "Node Name" "$(normalize_link_name '  Node Name  ')" "normalize link name"
+    if normalize_link_name $'bad\tname' >/dev/null 2>&1; then
+        fail "reject control characters in link name"
+    fi
+    TESTS=$((TESTS + 1))
+}
+
+test_link_name_management() {
+    CONFIG_DIR="$TMP_ROOT/names"
+    CONFIG="$CONFIG_DIR/config.json"
+    RUNTIME="$CONFIG_DIR/runtime.json"
+    LINKS_FILE="$CONFIG_DIR/links.txt"
+    SERVER_HOST_FILE="$CONFIG_DIR/server_host"
+    TRAFFIC_FILE="$CONFIG_DIR/traffic.json"
+    ACL_PATH="$CONFIG_DIR/blocklist.acl"
+    ACL_RULESET_DIR="$CONFIG_DIR/rulesets"
+    MANUAL_FILE="$CONFIG_DIR/manual.list"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' 'example.com' > "$SERVER_HOST_FILE"
+    printf '%s\n' '{"servers":[{"server_port":30001,"method":"aes-256-gcm","password":"one"},{"server_port":30002,"method":"aes-256-gcm","password":"two"}]}' > "$CONFIG"
+
+    hostname() { echo "test-host"; }
+    check_installed() { return 0; }
+    secure_data_files() { :; }
+    list_users() { :; }
+
+    assert_eq "test-host" "$(default_link_name)" "default link name uses hostname"
+    migrate_link_names_if_needed >/dev/null || fail "migrate missing link names"
+    assert_eq "test-host-1 test-host-2" "$(python3 -c "import json; print(' '.join(s['name'] for s in json.load(open('$CONFIG'))['servers']))")" "migrate names with hostname"
+    assert_true "rebuild migrated first link" grep -Fq '#test-host-1' "$LINKS_FILE"
+
+    rename_user_locked <<< $'2\n自定义 Node\n' >/dev/null || fail "rename user"
+    assert_eq "自定义 Node" "$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][1]['name'])")" "persist renamed user"
+    assert_true "encode renamed link fragment" grep -Fq '#%E8%87%AA%E5%AE%9A%E4%B9%89%20Node' "$LINKS_FILE"
+}
+
+test_runtime_omits_link_names() {
+    CONFIG_DIR="$TMP_ROOT/runtime-name"
+    CONFIG="$CONFIG_DIR/config.json"
+    RUNTIME="$CONFIG_DIR/runtime.json"
+    TRAFFIC_FILE="$CONFIG_DIR/traffic.json"
+    ACL_PATH="$CONFIG_DIR/blocklist.acl"
+    ACL_RULESET_DIR="$CONFIG_DIR/rulesets"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one","mode":"tcp_and_udp","name":"Node One"}]}' > "$CONFIG"
+    traffic_chains_installed() { return 1; }
+    svc_reload() { :; }
+    svc_restart() { :; }
+    secure_data_files() { :; }
+
+    apply_config >/dev/null || fail "build runtime with managed name"
+    assert_eq "0" "$(python3 -c "import json; print(int('name' in json.load(open('$RUNTIME'))['servers'][0]))")" "omit link name from runtime"
+}
+
+test_add_user_custom_name() {
+    CONFIG_DIR="$TMP_ROOT/add-name"
+    CONFIG="$CONFIG_DIR/config.json"
+    RUNTIME="$CONFIG_DIR/runtime.json"
+    LINKS_FILE="$CONFIG_DIR/links.txt"
+    SERVER_HOST_FILE="$CONFIG_DIR/server_host"
+    TRAFFIC_FILE="$CONFIG_DIR/traffic.json"
+    ACL_PATH="$CONFIG_DIR/blocklist.acl"
+    ACL_RULESET_DIR="$CONFIG_DIR/rulesets"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' 'example.com' > "$SERVER_HOST_FILE"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one","mode":"tcp_and_udp","name":"Existing"}]}' > "$CONFIG"
+
+    check_installed() { return 0; }
+    port_in_use() { return 1; }
+    add_traffic_rules_for_new_ports() { :; }
+    apply_config() { :; }
+    show_links() { :; }
+    secure_data_files() { :; }
+
+    add_user_locked <<< $'1\n2\n31000\nAdded Node\n' >/dev/null || fail "add user with custom name"
+    assert_eq "Added Node" "$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][1]['name'])")" "persist added user name"
+    assert_true "encode added user link name" grep -Fq ':31000#Added%20Node' "$LINKS_FILE"
 }
 
 test_port_selection() {
@@ -188,6 +268,9 @@ test_nonblocking_stop_hook() {
 
 test_host_helpers
 test_port_selection
+test_link_name_management
+test_runtime_omits_link_names
+test_add_user_custom_name
 test_acl_activation
 test_delete_user_state
 test_dual_stack_traffic
