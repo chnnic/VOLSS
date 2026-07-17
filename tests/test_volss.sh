@@ -106,7 +106,7 @@ test_runtime_omits_link_names() {
     ACL_PATH="$CONFIG_DIR/blocklist.acl"
     ACL_RULESET_DIR="$CONFIG_DIR/rulesets"
     mkdir -p "$CONFIG_DIR"
-    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one","mode":"tcp_and_udp","name":"Node One"}]}' > "$CONFIG"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one","mode":"tcp_and_udp","name":"Node One","quota_bytes":1073741824,"expires_at":"2030-01-01","disabled_reason":"quota"}]}' > "$CONFIG"
     traffic_chains_installed() { return 1; }
     svc_reload() { :; }
     svc_restart() { :; }
@@ -114,6 +114,242 @@ test_runtime_omits_link_names() {
 
     apply_config >/dev/null || fail "build runtime with managed name"
     assert_eq "0" "$(python3 -c "import json; print(int('name' in json.load(open('$RUNTIME'))['servers'][0]))")" "omit link name from runtime"
+    assert_eq "0" "$(python3 -c "import json; s=json.load(open('$RUNTIME'))['servers'][0]; print(int(any(k in s for k in ('quota_bytes','expires_at','disabled_reason'))))")" "omit policy metadata from runtime"
+}
+
+test_client_exports_and_qr() {
+    CONFIG_DIR="$TMP_ROOT/exports"
+    CONFIG="$CONFIG_DIR/config.json"
+    RUNTIME="$CONFIG_DIR/runtime.json"
+    LINKS_FILE="$CONFIG_DIR/links.txt"
+    SERVER_HOST_FILE="$CONFIG_DIR/server_host"
+    TRAFFIC_FILE="$CONFIG_DIR/traffic.json"
+    ACL_PATH="$CONFIG_DIR/blocklist.acl"
+    ACL_RULESET_DIR="$CONFIG_DIR/rulesets"
+    MANUAL_FILE="$CONFIG_DIR/manual.list"
+    EXPORT_DIR="$CONFIG_DIR/client"
+    CLASH_CONFIG="$EXPORT_DIR/clash.yaml"
+    MIHOMO_CONFIG="$EXPORT_DIR/mihomo.yaml"
+    SINGBOX_CONFIG="$EXPORT_DIR/sing-box.json"
+    QR_DIR="$CONFIG_DIR/qrcodes"
+    TRAFFIC_BACKEND_FILE="$CONFIG_DIR/traffic_backend"
+    NFT_RULES_FILE="$CONFIG_DIR/volss.nft"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' 'example.com' > "$SERVER_HOST_FILE"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one","name":"Node One"},{"server":"::","server_port":30002,"method":"aes-256-gcm","password":"two","name":"节点二"}]}' > "$CONFIG"
+
+    generate_client_configs || fail "generate client exports"
+    assert_eq "2" "$(grep -c 'udp: true' "$CLASH_CONFIG")" "Clash export enables UDP"
+    assert_eq "2" "$(grep -c 'udp: true' "$MIHOMO_CONFIG")" "Mihomo export enables UDP"
+    assert_eq "2" "$(python3 -c "import json; c=json.load(open('$SINGBOX_CONFIG')); print(sum(o.get('type') == 'shadowsocks' for o in c['outbounds']))")" "sing-box exports all users"
+
+    qrencode() {
+        local OUTPUT=""
+        while [ "$#" -gt 0 ]; do
+            case $1 in
+                -o) OUTPUT=$2; shift 2 ;;
+                -s|-t) shift 2 ;;
+                --) shift; break ;;
+                *) shift ;;
+            esac
+        done
+        [ -z "$OUTPUT" ] || printf 'png\n' > "$OUTPUT"
+    }
+    printf '%s\n' 'ss://dGVzdA==@example.com:30001#Node%20One' 'ss://dGVzdA==@example.com:30002#Node%20Two' > "$LINKS_FILE"
+    generate_qr_codes || fail "generate QR artifacts"
+    assert_true "generate SS QR image" test -f "$QR_DIR/ss-30001.png"
+    assert_true "generate Clash QR image" test -f "$QR_DIR/clash-config.png"
+}
+
+test_backup_validation() {
+    CONFIG_DIR="$TMP_ROOT/backup-data"
+    CONFIG="$CONFIG_DIR/config.json"
+    SERVER_HOST_FILE="$CONFIG_DIR/server_host"
+    TRAFFIC_FILE="$CONFIG_DIR/traffic.json"
+    MANUAL_FILE="$CONFIG_DIR/manual.list"
+    ACL_PATH="$CONFIG_DIR/blocklist.acl"
+    LINKS_FILE="$CONFIG_DIR/links.txt"
+    TRAFFIC_BACKEND_FILE="$CONFIG_DIR/traffic_backend"
+    ACL_RULESET_DIR="$CONFIG_DIR/rulesets"
+    mkdir -p "$ACL_RULESET_DIR"
+    printf '%s\n' '{"servers":[{"server_port":30001,"method":"aes-256-gcm","password":"one","expires_at":"2030-01-01"}]}' > "$CONFIG"
+    printf '%s\n' 'example.com' > "$SERVER_HOST_FILE"
+    printf '%s\n' '{"30001":{"tx":1,"rx":2}}' > "$TRAFFIC_FILE"
+    printf '%s\n' '||example.com' > "$ACL_RULESET_DIR/test.acl"
+
+    BACKUP="$TMP_ROOT/volss-backup.tar.gz"
+    EXTRACTED="$TMP_ROOT/backup-extracted"
+    mkdir -p "$EXTRACTED"
+    create_backup_archive "$BACKUP" || fail "create backup archive"
+    extract_and_validate_backup "$BACKUP" "$EXTRACTED" || fail "validate backup archive"
+    assert_true "backup includes config" test -f "$EXTRACTED/config.json"
+    assert_true "backup includes ACL rulesets" test -f "$EXTRACTED/rulesets/test.acl"
+
+    BAD_BACKUP="$TMP_ROOT/bad-backup.tar.gz"
+    python3 - "$BAD_BACKUP" << 'PYEOF'
+import io
+import tarfile
+import sys
+with tarfile.open(sys.argv[1], 'w:gz') as tar:
+    data = b'bad'
+    item = tarfile.TarInfo('volss-backup/unexpected')
+    item.size = len(data)
+    tar.addfile(item, io.BytesIO(data))
+PYEOF
+    if extract_and_validate_backup "$BAD_BACKUP" "$TMP_ROOT/bad-out" >/dev/null 2>&1; then
+        fail "reject unexpected backup members"
+    fi
+    TESTS=$((TESTS + 1))
+
+    migrate_link_names_if_needed() { :; }
+    rebuild_links() { :; }
+    apply_config() { :; }
+    rebuild_traffic_rules() { :; }
+    generate_client_configs() { :; }
+    secure_data_files() { :; }
+    printf '%s\n' '{"servers":[{"server_port":40001,"method":"aes-256-gcm","password":"changed"}]}' > "$CONFIG"
+    restore_backup_archive "$BACKUP" || fail "restore validated backup"
+    assert_eq "one" "$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][0]['password'])")" "restore user configuration"
+
+    printf '%s\n' '{"servers":[{"server_port":40002,"method":"aes-256-gcm","password":"rollback"}]}' > "$CONFIG"
+    apply_config() { return 1; }
+    if restore_backup_archive "$BACKUP" >/dev/null 2>&1; then
+        fail "report failed restored configuration apply"
+    fi
+    assert_eq "rollback" "$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][0]['password'])")" "rollback failed restore"
+}
+
+test_nftables_traffic() {
+    local FAKE_BIN="$TMP_ROOT/nft-bin"
+    local ORIGINAL_PATH=$PATH
+    mkdir -p "$FAKE_BIN"
+    cat > "$FAKE_BIN/nft" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "-j" ]; then
+    printf '%s\n' '{"nftables":[{"counter":{"family":"inet","table":"volss","name":"rx_30001","bytes":300}},{"counter":{"family":"inet","table":"volss","name":"tx_30001","bytes":400}}]}'
+elif [ "$1" = "list" ] && [ "$2" = "tables" ]; then
+    exit 0
+elif [ "$1" = "list" ] && [ "$2" = "table" ]; then
+    printf 'table inet volss { }\n'
+elif [ "$1" = "-f" ]; then
+    cp "$2" "$NFT_CAPTURE"
+fi
+exit 0
+EOF
+    chmod +x "$FAKE_BIN/nft"
+    PATH="$FAKE_BIN:$PATH"
+    export NFT_CAPTURE="$TMP_ROOT/nft-rules.txt"
+
+    CONFIG_DIR="$TMP_ROOT/nft-data"
+    CONFIG="$CONFIG_DIR/config.json"
+    TRAFFIC_FILE="$CONFIG_DIR/traffic.json"
+    TRAFFIC_BACKEND_FILE="$CONFIG_DIR/traffic_backend"
+    NFT_RULES_FILE="$CONFIG_DIR/volss.nft"
+    NFT_FAMILY=inet
+    NFT_TABLE=volss
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' '{"servers":[{"server_port":30001}]}' > "$CONFIG"
+    printf '%s\n' '{"30001":{"tx":10,"rx":20}}' > "$TRAFFIC_FILE"
+    printf '%s\n' 'nftables' > "$TRAFFIC_BACKEND_FILE"
+    nft_config_file() { echo "$CONFIG_DIR/nftables.conf"; }
+
+    save_traffic_locked || fail "save nftables traffic"
+    assert_eq "410" "$(python3 -c "import json; print(json.load(open('$TRAFFIC_FILE'))['30001']['tx'])")" "read nftables upload counter"
+    assert_eq "320" "$(python3 -c "import json; print(json.load(open('$TRAFFIC_FILE'))['30001']['rx'])")" "read nftables download counter"
+    rebuild_nft_traffic_rules "30001" || fail "build nftables dual-stack rules"
+    assert_true "nftables rules include TCP" grep -Fq 'tcp dport 30001 counter name rx_30001' "$NFT_CAPTURE"
+    assert_true "nftables rules include UDP" grep -Fq 'udp dport 30001 counter name rx_30001' "$NFT_CAPTURE"
+    PATH=$ORIGINAL_PATH
+    unset NFT_CAPTURE
+}
+
+test_user_policy_enforcement() {
+    CONFIG_DIR="$TMP_ROOT/policy"
+    CONFIG="$CONFIG_DIR/config.json"
+    TRAFFIC_FILE="$CONFIG_DIR/traffic.json"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' '{"servers":[{"server_port":30001,"name":"quota","quota_bytes":100},{"server_port":30002,"name":"expired","expires_at":"2020-01-01"},{"server_port":30003,"name":"manual","expires_at":"2020-01-01","disabled":true,"disabled_reason":"manual"},{"server_port":30004,"name":"resume","quota_bytes":1000,"disabled":true,"disabled_reason":"quota"}]}' > "$CONFIG"
+    printf '%s\n' '{"30001":{"tx":60,"rx":40},"30004":{"tx":1,"rx":1}}' > "$TRAFFIC_FILE"
+    POLICY_APPLIED=0
+    check_installed() { return 0; }
+    save_traffic_locked() { :; }
+    apply_config() { POLICY_APPLIED=$((POLICY_APPLIED + 1)); }
+    secure_data_files() { :; }
+
+    enforce_user_policies_locked >/dev/null || fail "enforce user policies"
+    assert_eq "quota expired manual none" "$(python3 -c "import json; c=json.load(open('$CONFIG')); print(' '.join(s.get('disabled_reason','none') for s in c['servers']))")" "apply quota and expiry policy reasons"
+    assert_eq "1 1 1 0" "$(python3 -c "import json; c=json.load(open('$CONFIG')); print(' '.join(str(int(s.get('disabled',False))) for s in c['servers']))")" "pause and resume policy users"
+    assert_eq "1" "$POLICY_APPLIED" "apply runtime after policy state change"
+}
+
+test_port_listener_helper() {
+    ss() {
+        printf 'tcp LISTEN 0 128 0.0.0.0:30001 0.0.0.0:*\n'
+    }
+    assert_true "detect exact TCP listener" port_has_listener tcp "" 30001
+    if port_has_listener tcp "" 3000; then
+        fail "listener helper accepts partial port"
+    fi
+    TESTS=$((TESTS + 1))
+}
+
+test_health_check() {
+    CONFIG_DIR="$TMP_ROOT/health"
+    CONFIG="$CONFIG_DIR/config.json"
+    RUNTIME="$CONFIG_DIR/runtime.json"
+    SS_BIN="$CONFIG_DIR/ssserver"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one","quota_bytes":1000,"expires_at":"2030-01-01"}]}' > "$CONFIG"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":30001,"method":"aes-256-gcm","password":"one"}]}' > "$RUNTIME"
+    cat > "$SS_BIN" << 'EOF'
+#!/usr/bin/env bash
+if [ "$1" = "--help" ]; then echo --check-config; fi
+exit 0
+EOF
+    chmod +x "$SS_BIN"
+    SYSTEM=alpine
+    check_installed() { return 0; }
+    check_svc_running() { return 0; }
+    port_has_listener() { return 0; }
+    get_server_host() { echo 203.0.113.1; }
+    traffic_backend() { echo iptables; }
+    traffic_chains_installed() { return 0; }
+    ipv6_firewall_available() { return 0; }
+
+    HEALTH_OUTPUT=$(health_check) || fail "health check reports valid service as failed"
+    assert_true "health check covers TCP" grep -Fq 'TCP 端口正在监听' <<< "$HEALTH_OUTPUT"
+    assert_true "health check covers UDP" grep -Fq 'UDP 端口正在监听' <<< "$HEALTH_OUTPUT"
+}
+
+test_ssserver_upgrade_preserves_config() {
+    CONFIG_DIR="$TMP_ROOT/upgrade"
+    CONFIG="$CONFIG_DIR/config.json"
+    SS_BIN="$CONFIG_DIR/ssserver"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' '{"servers":[{"server_port":30001,"password":"keep"}]}' > "$CONFIG"
+    cat > "$SS_BIN" << 'EOF'
+#!/usr/bin/env bash
+echo old-version
+EOF
+    chmod +x "$SS_BIN"
+    BEFORE=$(sha256_file "$CONFIG")
+    RESTARTS=0
+    check_installed() { return 0; }
+    check_svc_running() { return 0; }
+    save_traffic_locked() { :; }
+    svc_restart() { RESTARTS=$((RESTARTS + 1)); }
+    install_ssrust() {
+        cat > "$SS_BIN" << 'EOF'
+#!/usr/bin/env bash
+echo new-version
+EOF
+        chmod +x "$SS_BIN"
+    }
+
+    upgrade_ssserver_locked <<< $'y\n' >/dev/null || fail "upgrade ssserver independently"
+    assert_eq "$BEFORE" "$(sha256_file "$CONFIG")" "preserve config during ssserver upgrade"
+    assert_eq "new-version" "$("$SS_BIN" --version)" "install new ssserver binary"
+    assert_eq "1" "$RESTARTS" "restart running service after core upgrade"
 }
 
 test_add_user_custom_name() {
@@ -276,5 +512,12 @@ test_delete_user_state
 test_dual_stack_traffic
 test_install_failure_stops
 test_nonblocking_stop_hook
+test_client_exports_and_qr
+test_backup_validation
+test_nftables_traffic
+test_user_policy_enforcement
+test_port_listener_helper
+test_health_check
+test_ssserver_upgrade_preserves_config
 
 echo "PASS: $TESTS assertions"

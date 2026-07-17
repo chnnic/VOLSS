@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.5.8
+#   版本: V1.6.0
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.5.8"
+VERSION="V1.6.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -68,6 +68,15 @@ TRAFFIC_FILE="/etc/shadowsocks-rust/traffic.json"
 MANUAL_FILE="/etc/shadowsocks-rust/manual.list"
 SHORTCUT="/usr/local/bin/volss"
 ACL_RULESET_DIR="/etc/shadowsocks-rust/rulesets"
+EXPORT_DIR="/etc/shadowsocks-rust/exports"
+CLASH_CONFIG="/etc/shadowsocks-rust/exports/clash.yaml"
+MIHOMO_CONFIG="/etc/shadowsocks-rust/exports/mihomo.yaml"
+SINGBOX_CONFIG="/etc/shadowsocks-rust/exports/sing-box.json"
+QR_DIR="/etc/shadowsocks-rust/qrcodes"
+TRAFFIC_BACKEND_FILE="/etc/shadowsocks-rust/traffic_backend"
+NFT_RULES_FILE="/etc/shadowsocks-rust/volss.nft"
+NFT_FAMILY="inet"
+NFT_TABLE="volss"
 TRAFFIC_CHAIN="VOLSS_TRAFFIC"
 STATE_LOCK_DIR="/run/volss.lock"
 SS_USER="ssrust"
@@ -117,12 +126,15 @@ secure_runtime_owner() {
 
 secure_data_files() {
     local FILE
-    for FILE in "$CONFIG" "$RUNTIME" "$LINKS_FILE" "$SERVER_HOST_FILE" "$TRAFFIC_FILE" "$MANUAL_FILE" "$ACL_PATH"; do
+    for FILE in "$CONFIG" "$RUNTIME" "$LINKS_FILE" "$SERVER_HOST_FILE" "$TRAFFIC_FILE" "$MANUAL_FILE" "$ACL_PATH" "$CLASH_CONFIG" "$MIHOMO_CONFIG" "$SINGBOX_CONFIG" "$TRAFFIC_BACKEND_FILE" "$NFT_RULES_FILE"; do
         secure_file "$FILE"
     done
-    if [ -d "$ACL_RULESET_DIR" ]; then
-        find "$ACL_RULESET_DIR" -type f -name '*.acl' -exec chmod 600 {} \; 2>/dev/null || true
-    fi
+    local DIR
+    for DIR in "$ACL_RULESET_DIR" "$EXPORT_DIR" "$QR_DIR"; do
+        [ -d "$DIR" ] || continue
+        chmod 700 "$DIR" 2>/dev/null || true
+        find "$DIR" -type f -exec chmod 600 {} \; 2>/dev/null || true
+    done
     secure_runtime_owner
 }
 
@@ -541,7 +553,109 @@ verify_sha256() {
     [ "$ACTUAL" = "$EXPECTED" ]
 }
 
-persist_firewall_rules() {
+ipv6_firewall_available() {
+    command -v ip6tables >/dev/null 2>&1 && ip6tables -L -n >/dev/null 2>&1
+}
+
+firewall_tools() {
+    command -v iptables >/dev/null 2>&1 && iptables -L -n >/dev/null 2>&1 && echo iptables
+    ipv6_firewall_available && echo ip6tables
+}
+
+nft_available() {
+    command -v nft >/dev/null 2>&1 && nft list tables >/dev/null 2>&1
+}
+
+ensure_nftables_available() {
+    nft_available && return 0
+    echo -e "${YELLOW}>>> 正在安装 nftables...${NC}"
+    if [ "$SYSTEM" = "alpine" ]; then
+        apk add --no-cache nftables >/dev/null 2>&1 || return 1
+    else
+        DEBIAN_FRONTEND=noninteractive apt-get install -y nftables -qq || return 1
+    fi
+    nft_available
+}
+
+traffic_backend() {
+    local REQUESTED=${VOLSS_FIREWALL_BACKEND:-}
+    if [ -z "$REQUESTED" ] && [ -s "$TRAFFIC_BACKEND_FILE" ]; then
+        REQUESTED=$(head -n 1 "$TRAFFIC_BACKEND_FILE")
+    fi
+    case $REQUESTED in
+        nftables) nft_available && { echo nftables; return 0; } ;;
+        iptables) [ -n "$(firewall_tools)" ] && { echo iptables; return 0; } ;;
+    esac
+    if nft_available && nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+        echo nftables
+        return 0
+    fi
+    if command -v iptables >/dev/null 2>&1 && iptables -L "$TRAFFIC_CHAIN" -n >/dev/null 2>&1; then
+        echo iptables
+        return 0
+    fi
+    if nft_available; then
+        echo nftables
+        return 0
+    fi
+    if [ -n "$(firewall_tools)" ]; then
+        echo iptables
+        return 0
+    fi
+    return 1
+}
+
+set_traffic_backend() {
+    local BACKEND=$1
+    [ "$BACKEND" = "iptables" ] || [ "$BACKEND" = "nftables" ] || return 1
+    mkdir -p "$CONFIG_DIR" || return 1
+    local TMP_BACKEND
+    TMP_BACKEND=$(make_temp_for "$TRAFFIC_BACKEND_FILE") || return 1
+    printf '%s\n' "$BACKEND" > "$TMP_BACKEND" || {
+        rm -f "$TMP_BACKEND"
+        return 1
+    }
+    mv "$TMP_BACKEND" "$TRAFFIC_BACKEND_FILE" || return 1
+    secure_file "$TRAFFIC_BACKEND_FILE"
+}
+
+nft_config_file() {
+    if [ "$SYSTEM" = "alpine" ]; then
+        echo /etc/nftables.nft
+    else
+        echo /etc/nftables.conf
+    fi
+}
+
+persist_nft_rules() {
+    local NFT_CONFIG INCLUDE_LINE
+    mkdir -p "$(dirname "$NFT_RULES_FILE")" || return 1
+    nft list table "$NFT_FAMILY" "$NFT_TABLE" > "$NFT_RULES_FILE" 2>/dev/null || return 1
+    chmod 600 "$NFT_RULES_FILE"
+    NFT_CONFIG=$(nft_config_file)
+    touch "$NFT_CONFIG" || return 1
+    INCLUDE_LINE="include \"$NFT_RULES_FILE\""
+    grep -Fqx "$INCLUDE_LINE" "$NFT_CONFIG" 2>/dev/null || printf '\n%s\n' "$INCLUDE_LINE" >> "$NFT_CONFIG"
+    if [ "$SYSTEM" = "alpine" ]; then
+        rc-update add nftables default >/dev/null 2>&1 || true
+    else
+        systemctl enable nftables >/dev/null 2>&1 || true
+    fi
+}
+
+remove_nft_persistence() {
+    local NFT_CONFIG TMP_CONFIG
+    NFT_CONFIG=$(nft_config_file)
+    if [ -f "$NFT_CONFIG" ]; then
+        TMP_CONFIG=$(mktemp) || return 1
+        grep -Fvx "include \"$NFT_RULES_FILE\"" "$NFT_CONFIG" > "$TMP_CONFIG" || true
+        cat "$TMP_CONFIG" > "$NFT_CONFIG"
+        rm -f "$TMP_CONFIG"
+    fi
+    rm -f "$NFT_RULES_FILE"
+}
+
+persist_iptables_rules() {
     if [ "$SYSTEM" = "alpine" ]; then
         if [ ! -f /etc/init.d/iptables ]; then
             apk add --no-cache iptables >/dev/null 2>&1
@@ -562,13 +676,14 @@ persist_firewall_rules() {
     fi
 }
 
-ipv6_firewall_available() {
-    command -v ip6tables >/dev/null 2>&1 && ip6tables -L -n >/dev/null 2>&1
-}
-
-firewall_tools() {
-    command -v iptables >/dev/null 2>&1 && iptables -L -n >/dev/null 2>&1 && echo iptables
-    ipv6_firewall_available && echo ip6tables
+persist_firewall_rules() {
+    local BACKEND
+    BACKEND=$(traffic_backend 2>/dev/null || true)
+    if [ "$BACKEND" = "nftables" ]; then
+        persist_nft_rules
+    else
+        persist_iptables_rules
+    fi
 }
 
 config_ports() {
@@ -594,6 +709,42 @@ ensure_traffic_chain() {
             "$IPT" -I "$CHAIN" 1 -j "$TRAFFIC_CHAIN" || return 1
         done
     done
+}
+
+rebuild_nft_traffic_rules() {
+    local PORTS=$1
+    local TMP_RULES PORT
+    nft_available || return 1
+    TMP_RULES=$(mktemp /tmp/volss-nft.XXXXXX) || return 1
+    {
+        echo "table $NFT_FAMILY $NFT_TABLE {"
+        for PORT in $PORTS; do
+            echo "  counter rx_$PORT { }"
+            echo "  counter tx_$PORT { }"
+        done
+        echo "  chain input {"
+        echo "    type filter hook input priority -10; policy accept;"
+        for PORT in $PORTS; do
+            echo "    tcp dport $PORT counter name rx_$PORT"
+            echo "    udp dport $PORT counter name rx_$PORT"
+        done
+        echo "  }"
+        echo "  chain output {"
+        echo "    type filter hook output priority -10; policy accept;"
+        for PORT in $PORTS; do
+            echo "    tcp sport $PORT counter name tx_$PORT"
+            echo "    udp sport $PORT counter name tx_$PORT"
+        done
+        echo "  }"
+        echo "}"
+    } > "$TMP_RULES"
+    nft delete table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || true
+    if ! nft -f "$TMP_RULES"; then
+        rm -f "$TMP_RULES"
+        return 1
+    fi
+    rm -f "$TMP_RULES"
+    persist_nft_rules
 }
 
 remove_legacy_traffic_rules_for_ports() {
@@ -625,10 +776,17 @@ add_traffic_rules_for_ports() {
 add_traffic_rules_for_new_ports() {
     local PORTS="$1"
     [ -n "$PORTS" ] || return 0
+    if [ "$(traffic_backend 2>/dev/null || true)" = "nftables" ]; then
+        save_traffic_locked || return 1
+        rebuild_nft_traffic_rules "$(config_ports)" || return 1
+        set_traffic_backend nftables
+        return $?
+    fi
     ensure_traffic_chain || return 1
     remove_legacy_traffic_rules_for_ports "$PORTS"
     add_traffic_rules_for_ports "$PORTS" || return 1
     zero_traffic_counters_for_ports "$PORTS"
+    set_traffic_backend iptables || return 1
     persist_firewall_rules
 }
 
@@ -638,6 +796,24 @@ rebuild_traffic_rules() {
         cleanup_traffic_rules ""
         return 0
     fi
+    local BACKEND
+    BACKEND=$(traffic_backend 2>/dev/null || true)
+    if [ "$BACKEND" = "nftables" ]; then
+        if rebuild_nft_traffic_rules "$PORTS"; then
+            set_traffic_backend nftables
+            return $?
+        fi
+        if [ ! -s "$TRAFFIC_BACKEND_FILE" ] && [ -z "${VOLSS_FIREWALL_BACKEND:-}" ] && [ -n "$(firewall_tools)" ]; then
+            echo -e "${YELLOW}⚠ nftables 初始化失败，自动回退到 iptables/ip6tables${NC}"
+            nft delete table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || true
+            remove_nft_persistence >/dev/null 2>&1 || true
+            set_traffic_backend iptables || return 1
+            BACKEND=iptables
+        else
+            return 1
+        fi
+    fi
+    [ "$BACKEND" = "iptables" ] || return 1
     ensure_traffic_chain || return 1
     local IPT
     for IPT in $(firewall_tools); do
@@ -646,12 +822,21 @@ rebuild_traffic_rules() {
     remove_legacy_traffic_rules_for_ports "$PORTS"
     add_traffic_rules_for_ports "$PORTS" || return 1
     zero_traffic_counters_for_ports "$PORTS"
+    set_traffic_backend iptables || return 1
     persist_firewall_rules
 }
 
 cleanup_traffic_rules() {
     local PORTS="$1"
+    local BACKEND
+    BACKEND=$(traffic_backend 2>/dev/null || true)
+    if [ "$BACKEND" = "nftables" ]; then
+        nft delete table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || true
+        remove_nft_persistence
+        return 0
+    fi
     remove_legacy_traffic_rules_for_ports "$PORTS"
+    set_traffic_backend iptables || return 1
     local IPT CHAIN
     for IPT in $(firewall_tools); do
         "$IPT" -F "$TRAFFIC_CHAIN" 2>/dev/null || true
@@ -664,6 +849,12 @@ cleanup_traffic_rules() {
 }
 
 traffic_chains_installed() {
+    local BACKEND
+    BACKEND=$(traffic_backend 2>/dev/null || true)
+    if [ "$BACKEND" = "nftables" ]; then
+        nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1
+        return $?
+    fi
     local IPT FOUND=0
     for IPT in $(firewall_tools); do
         FOUND=1
@@ -674,7 +865,10 @@ traffic_chains_installed() {
 
 migrate_traffic_rules_if_needed() {
     check_installed || return 0
-    traffic_chains_installed && return 0
+    if traffic_chains_installed; then
+        [ -s "$TRAFFIC_BACKEND_FILE" ] || set_traffic_backend "$(traffic_backend)"
+        return $?
+    fi
     local PORTS
     PORTS=$(config_ports)
     [ -n "$PORTS" ] || return 0
@@ -682,9 +876,17 @@ migrate_traffic_rules_if_needed() {
     rebuild_traffic_rules "$PORTS"
 }
 
-# 只清零指定端口的 iptables 计数器（精确匹配，不影响其他统计）
+# 只清零指定端口的内核计数器（精确匹配，不影响其他统计）
 zero_traffic_counters_for_ports() {
     local PORTS="$1"
+    if [ "$(traffic_backend 2>/dev/null || true)" = "nftables" ]; then
+        local NFT_PORT
+        for NFT_PORT in $PORTS; do
+            nft reset counter "$NFT_FAMILY" "$NFT_TABLE" "rx_$NFT_PORT" >/dev/null 2>&1 || true
+            nft reset counter "$NFT_FAMILY" "$NFT_TABLE" "tx_$NFT_PORT" >/dev/null 2>&1 || true
+        done
+        return 0
+    fi
     local IPT CHAIN L PORT LINES
     for IPT in $(firewall_tools); do
         for CHAIN in "$TRAFFIC_CHAIN" INPUT OUTPUT; do
@@ -697,6 +899,47 @@ zero_traffic_counters_for_ports() {
             done
         done
     done
+}
+
+configure_traffic_backend_locked() {
+    local CURRENT_BACKEND CHOICE NEW_BACKEND PORTS
+    CURRENT_BACKEND=$(traffic_backend 2>/dev/null || echo none)
+    echo -e "当前流量统计后端: ${GREEN}$CURRENT_BACKEND${NC}"
+    echo "  1) nftables（inet 原生 IPv4/IPv6 双栈）"
+    echo "  2) iptables + ip6tables"
+    read -r -p "请选择 [1-2]: " CHOICE
+    case $CHOICE in
+        1) NEW_BACKEND=nftables; ensure_nftables_available || { echo -e "${RED}nftables 不可用${NC}"; return 1; } ;;
+        2) NEW_BACKEND=iptables; [ -n "$(firewall_tools)" ] || { echo -e "${RED}iptables 不可用${NC}"; return 1; } ;;
+        *) echo -e "${RED}无效选项${NC}"; return 1 ;;
+    esac
+    [ "$NEW_BACKEND" = "$CURRENT_BACKEND" ] && {
+        echo "当前已使用该后端"
+        return 0
+    }
+    save_traffic_locked || return 1
+    if [ "$CURRENT_BACKEND" = "nftables" ]; then
+        nft delete table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1 || true
+        remove_nft_persistence
+    elif [ "$CURRENT_BACKEND" = "iptables" ]; then
+        local IPT CHAIN
+        for IPT in $(firewall_tools); do
+            "$IPT" -F "$TRAFFIC_CHAIN" >/dev/null 2>&1 || true
+            for CHAIN in INPUT OUTPUT; do
+                while "$IPT" -D "$CHAIN" -j "$TRAFFIC_CHAIN" >/dev/null 2>&1; do :; done
+            done
+            "$IPT" -X "$TRAFFIC_CHAIN" >/dev/null 2>&1 || true
+        done
+        persist_iptables_rules
+    fi
+    set_traffic_backend "$NEW_BACKEND" || return 1
+    PORTS=$(config_ports)
+    rebuild_traffic_rules "$PORTS" || return 1
+    echo -e "${GREEN}✅ 已切换到 $NEW_BACKEND${NC}"
+}
+
+configure_traffic_backend() {
+    with_state_lock configure_traffic_backend_locked
 }
 
 # ========== 时间同步相关 ==========
@@ -834,7 +1077,7 @@ install_deps() {
             echo -e "${RED}❌ 更新 Alpine 软件索引失败${NC}"
             return 1
         }
-        apk add --no-cache curl wget openssl python3 iproute2 xz iptables net-tools bash coreutils || {
+        apk add --no-cache curl wget openssl python3 iproute2 xz iptables nftables qrencode net-tools bash coreutils || {
             echo -e "${RED}❌ 安装依赖失败${NC}"
             return 1
         }
@@ -844,7 +1087,7 @@ install_deps() {
             echo -e "${RED}❌ 更新 APT 软件索引失败${NC}"
             return 1
         }
-        apt-get install -y curl wget openssl python3 iproute2 xz-utils iptables-persistent -qq || {
+        apt-get install -y curl wget openssl python3 iproute2 xz-utils iptables-persistent nftables qrencode -qq || {
             echo -e "${RED}❌ 安装依赖失败${NC}"
             return 1
         }
@@ -950,12 +1193,29 @@ for asset in json.load(sys.stdin).get('assets', []):
         return 1
     fi
 
-    mv "$TMP_DIR/ssserver" "$SS_BIN" || {
+    INSTALL_TMP="${SS_BIN}.new.$$"
+    cp "$TMP_DIR/ssserver" "$INSTALL_TMP" || {
         rm -rf "$TMP_DIR"
         echo -e "${RED}❌ 安装 ssserver 文件失败${NC}"
         return 1
     }
-    chmod +x "$SS_BIN" || return 1
+    chmod +x "$INSTALL_TMP" || {
+        rm -f "$INSTALL_TMP"
+        rm -rf "$TMP_DIR"
+        return 1
+    }
+    if ! "$INSTALL_TMP" --version >/dev/null 2>&1; then
+        rm -f "$INSTALL_TMP"
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ 新版 ssserver 无法运行，已保留当前版本${NC}"
+        return 1
+    fi
+    mv "$INSTALL_TMP" "$SS_BIN" || {
+        rm -f "$INSTALL_TMP"
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ 替换 ssserver 文件失败${NC}"
+        return 1
+    }
     mkdir -p "$CONFIG_DIR" || return 1
     rm -rf "$TMP_DIR"
 
@@ -1231,9 +1491,8 @@ with open('$CONFIG', 'r') as f:
 # 过滤禁用用户
 servers = [dict(s) for s in config['servers'] if not s.get('disabled', False)]
 for s in servers:
-    s.pop('disabled', None)
-    s.pop('acl', None)  # 移除 server 块里的旧 acl 字段
-    s.pop('name', None)  # 链接名称仅供 volss 管理，不传给 ssserver
+    for field in ('disabled', 'acl', 'name', 'quota_bytes', 'expires_at', 'disabled_reason'):
+        s.pop(field, None)
 
 runtime = {'servers': servers}
 
@@ -1425,6 +1684,7 @@ do_install_locked() {
     create_service    || { read -r -p "按回车返回..."; return 1; }
     init_traffic      || { read -r -p "按回车返回..."; return 1; }
     install_shortcut  || { read -r -p "按回车返回..."; return 1; }
+    ensure_policy_scheduler || { read -r -p "按回车返回..."; return 1; }
 
     echo ""
     show_links
@@ -1447,6 +1707,12 @@ do_uninstall_locked() {
 
     svc_stop 2>/dev/null
     svc_disable
+    if [ "$SYSTEM" = "alpine" ]; then
+        rm -f /etc/periodic/15min/volss-policy
+    else
+        systemctl disable --now volss-policy.timer >/dev/null 2>&1 || true
+        rm -f /etc/systemd/system/volss-policy.service /etc/systemd/system/volss-policy.timer
+    fi
     rm -f "$SS_BIN" "$SERVICE" "$SHORTCUT" "$SCRIPT_INSTALL_PATH" "${SCRIPT_INSTALL_PATH}.bak"
     rm -rf /etc/shadowsocks-rust
     svc_reload
@@ -1471,7 +1737,7 @@ list_users() {
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    当前用户列表${NC}"
     echo -e "${BLUE}  =================================================${NC}"
-    printf "  ${CYAN}%-4s %-8s %-22s %-30s %-6s${NC}\n" "编号" "端口" "名称" "加密方式" "状态"
+    printf "  ${CYAN}%-4s %-7s %-18s %-10s %-12s %-10s${NC}\n" "编号" "端口" "名称" "配额(GB)" "到期日" "状态"
     echo -e "  ${BLUE}-------------------------------------------------${NC}"
 
     python3 << PYEOF
@@ -1483,9 +1749,19 @@ for i, s in enumerate(c['servers'], 1):
     color  = '\033[0;31m' if s.get('disabled') else '\033[0;32m'
     reset  = '\033[0m'
     name = str(s.get('name') or '-')
-    if len(name) > 20:
-        name = name[:19] + '…'
-    print(f"  {i:<4} {s['server_port']:<8} {name:<22} {s['method']:<30} {color}{status}{reset}")
+    if len(name) > 16:
+        name = name[:15] + '…'
+    quota = s.get('quota_bytes', 0)
+    quota_text = '-' if not quota else f'{quota / 1024 ** 3:g}'
+    expiry = s.get('expires_at', '-')
+    reason = s.get('disabled_reason')
+    if reason == 'quota':
+        status = '配额暂停'
+    elif reason == 'expired':
+        status = '到期暂停'
+    elif reason == 'manual':
+        status = '手动暂停'
+    print(f"  {i:<4} {s['server_port']:<7} {name:<18} {quota_text:<10} {expiry:<12} {color}{status:<10}{reset}")
 PYEOF
 
     echo -e "  ${BLUE}=================================================${NC}"
@@ -1500,12 +1776,226 @@ show_links() {
     echo -e "  链接已保存至: ${YELLOW}$LINKS_FILE${NC}"
 }
 
+generate_client_configs() {
+    local EXPORT_HOST
+    EXPORT_HOST=$(get_server_host 2>/dev/null) || {
+        echo -e "${RED}❌ 未找到服务器地址，无法导出客户端配置${NC}"
+        return 1
+    }
+    mkdir -p "$EXPORT_DIR" || return 1
+
+    if ! python3 - "$CONFIG" "$EXPORT_HOST" "$CLASH_CONFIG" "$MIHOMO_CONFIG" "$SINGBOX_CONFIG" << 'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+config_file, host, clash_file, mihomo_file, singbox_file = sys.argv[1:]
+with open(config_file, encoding='utf-8') as f:
+    config = json.load(f)
+servers = config.get('servers', [])
+if not servers:
+    raise SystemExit('no users to export')
+
+used_names = {'proxy'}
+users = []
+for index, server in enumerate(servers, 1):
+    base_name = str(server.get('name') or f'user-{index}').strip()
+    name = base_name
+    if name in used_names:
+        name = f"{base_name}-{server['server_port']}"
+    used_names.add(name)
+    users.append((name, server))
+
+def yaml_string(value):
+    return json.dumps(str(value), ensure_ascii=False)
+
+def build_clash():
+    lines = [
+        'mixed-port: 7890',
+        'allow-lan: false',
+        'mode: rule',
+        'log-level: info',
+        'proxies:',
+    ]
+    for name, server in users:
+        lines.extend([
+            f"  - name: {yaml_string(name)}",
+            '    type: ss',
+            f"    server: {yaml_string(host)}",
+            f"    port: {int(server['server_port'])}",
+            f"    cipher: {yaml_string(server['method'])}",
+            f"    password: {yaml_string(server['password'])}",
+            '    udp: true',
+        ])
+    lines.extend([
+        'proxy-groups:',
+        '  - name: PROXY',
+        '    type: select',
+        '    proxies:',
+    ])
+    lines.extend(f"      - {yaml_string(name)}" for name, _ in users)
+    lines.extend(['rules:', '  - MATCH,PROXY'])
+    return '\n'.join(lines) + '\n'
+
+tags = [name for name, _ in users]
+singbox = {
+    'log': {'level': 'info'},
+    'inbounds': [
+        {
+            'type': 'mixed',
+            'tag': 'mixed-in',
+            'listen': '127.0.0.1',
+            'listen_port': 2080,
+        },
+    ],
+    'outbounds': [
+        {
+            'type': 'selector',
+            'tag': 'proxy',
+            'outbounds': tags,
+            'default': tags[0],
+        },
+        *[
+            {
+                'type': 'shadowsocks',
+                'tag': name,
+                'server': host,
+                'server_port': int(server['server_port']),
+                'method': server['method'],
+                'password': server['password'],
+            }
+            for name, server in users
+        ],
+    ],
+}
+
+def atomic_write(path, content):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(path) + '.', dir=os.path.dirname(path), text=True)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+clash = build_clash()
+atomic_write(clash_file, clash)
+atomic_write(mihomo_file, clash)
+atomic_write(singbox_file, json.dumps(singbox, indent=2, ensure_ascii=False) + '\n')
+PYEOF
+    then
+        echo -e "${RED}❌ 生成客户端配置失败${NC}"
+        return 1
+    fi
+    secure_data_files
+}
+
+ensure_qrencode_available() {
+    command -v qrencode >/dev/null 2>&1 && return 0
+    echo -e "${YELLOW}>>> 正在安装 qrencode...${NC}"
+    if [ "$SYSTEM" = "alpine" ]; then
+        apk add --no-cache qrencode >/dev/null 2>&1 || return 1
+    else
+        DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode -qq || return 1
+    fi
+    command -v qrencode >/dev/null 2>&1
+}
+
+generate_qr_codes() {
+    ensure_qrencode_available || {
+        echo -e "${RED}❌ qrencode 安装失败${NC}"
+        return 1
+    }
+    [ -s "$LINKS_FILE" ] || rebuild_links || return 1
+    [ -s "$CLASH_CONFIG" ] || generate_client_configs || return 1
+    mkdir -p "$QR_DIR" || return 1
+    rm -f "$QR_DIR"/ss-*.png "$QR_DIR"/clash-config.png
+
+    local -a QR_PORTS QR_LINKS
+    mapfile -t QR_PORTS < <(python3 - "$CONFIG" << 'PYEOF'
+import json
+import sys
+with open(sys.argv[1]) as f:
+    for server in json.load(f).get('servers', []):
+        print(server['server_port'])
+PYEOF
+)
+    mapfile -t QR_LINKS < "$LINKS_FILE"
+
+    local i GENERATED=0
+    for i in "${!QR_LINKS[@]}"; do
+        [ -n "${QR_LINKS[$i]}" ] || continue
+        [ -n "${QR_PORTS[$i]:-}" ] || {
+            echo -e "${YELLOW}⚠ SS 链接与用户数量不一致，请重新生成链接${NC}"
+            continue
+        }
+        if printf '%s' "${QR_LINKS[$i]}" | qrencode -o "$QR_DIR/ss-${QR_PORTS[$i]}.png" -s 6; then
+            GENERATED=$((GENERATED + 1))
+        else
+            echo -e "${YELLOW}⚠ 端口 ${QR_PORTS[$i]} 的二维码生成失败${NC}"
+        fi
+    done
+    if ! qrencode -o "$QR_DIR/clash-config.png" -s 4 < "$CLASH_CONFIG"; then
+        rm -f "$QR_DIR/clash-config.png"
+        echo -e "${YELLOW}⚠ Clash 配置内容超过二维码容量，请直接使用 YAML 文件${NC}"
+    fi
+    secure_data_files
+    [ "$GENERATED" -gt 0 ]
+}
+
+export_client_menu() {
+    generate_client_configs || return 1
+    generate_qr_codes || echo -e "${YELLOW}⚠ 配置文件已生成，但二维码未完整生成${NC}"
+
+    echo -e "\n${GREEN}✅ 客户端配置已导出${NC}"
+    echo "  Clash:   $CLASH_CONFIG"
+    echo "  Mihomo:  $MIHOMO_CONFIG"
+    echo "  sing-box: $SINGBOX_CONFIG"
+    echo "  二维码:  $QR_DIR"
+    echo -e "\n  0) 不在终端显示二维码"
+    echo "  1) Clash 配置二维码"
+    echo "  2) 选择一个 SS 链接二维码"
+    read -r -p "请选择 [0-2，默认0]: " QR_CHOICE
+    QR_CHOICE=${QR_CHOICE:-0}
+    case $QR_CHOICE in
+        1)
+            if [ -f "$QR_DIR/clash-config.png" ]; then
+                qrencode -t ANSIUTF8 < "$CLASH_CONFIG"
+            else
+                echo -e "${YELLOW}Clash 配置过大，无法显示二维码${NC}"
+            fi
+            ;;
+        2)
+            list_users
+            read -r -p "输入用户编号: " NUM
+            if is_uint "$NUM" && [ "$NUM" -ge 1 ]; then
+                LINK=$(sed -n "${NUM}p" "$LINKS_FILE")
+                [ -n "$LINK" ] && printf '%s' "$LINK" | qrencode -t ANSIUTF8 || echo -e "${RED}无效编号${NC}"
+            else
+                echo -e "${RED}无效编号${NC}"
+            fi
+            ;;
+        0) ;;
+        *) echo -e "${RED}无效选项${NC}" ;;
+    esac
+}
+
 save_traffic_locked() {
-    if ! python3 << PYEOF
+    local BACKEND
+    BACKEND=$(traffic_backend 2>/dev/null || echo none)
+    if ! python3 - "$BACKEND" "$NFT_FAMILY" "$NFT_TABLE" << PYEOF
 import json, subprocess, os, tempfile
+import sys
 
 config_file = '$CONFIG'
 traffic_file = '$TRAFFIC_FILE'
+backend, nft_family, nft_table = sys.argv[1:]
 
 with open(config_file) as f:
     c = json.load(f)
@@ -1563,23 +2053,51 @@ traffic_chain = '$TRAFFIC_CHAIN'
 ports = [int(s['server_port']) for s in c['servers']]
 totals = {str(port): {'tx': 0, 'rx': 0} for port in ports}
 
-for tool in (tool for tool in ('iptables', 'ip6tables') if tool_available(tool)):
-    if chain_exists(tool, traffic_chain):
-        family_totals = collect_bytes(snapshot_and_zero(tool, traffic_chain), ports)
-    else:
-        output_totals = collect_bytes(snapshot_only(tool, 'OUTPUT'), ports)
-        input_totals = collect_bytes(snapshot_only(tool, 'INPUT'), ports)
-        family_totals = {}
+if backend == 'nftables':
+    try:
+        nft_output = subprocess.check_output(
+            ['nft', '-j', 'reset', 'counters', 'table', nft_family, nft_table],
+            text=True,
+        )
+        nft_data = json.loads(nft_output)
+
+        def counters(value):
+            if isinstance(value, dict):
+                counter = value.get('counter')
+                if isinstance(counter, dict) and 'name' in counter:
+                    yield counter
+                for child in value.values():
+                    yield from counters(child)
+            elif isinstance(value, list):
+                for child in value:
+                    yield from counters(child)
+
+        for counter in counters(nft_data):
+            name = str(counter.get('name', ''))
+            if name.startswith('rx_') or name.startswith('tx_'):
+                direction, port = name.split('_', 1)
+                if port in totals:
+                    totals[port][direction] += int(counter.get('bytes', 0))
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        pass
+elif backend == 'iptables':
+    for tool in (tool for tool in ('iptables', 'ip6tables') if tool_available(tool)):
+        if chain_exists(tool, traffic_chain):
+            family_totals = collect_bytes(snapshot_and_zero(tool, traffic_chain), ports)
+        else:
+            output_totals = collect_bytes(snapshot_only(tool, 'OUTPUT'), ports)
+            input_totals = collect_bytes(snapshot_only(tool, 'INPUT'), ports)
+            family_totals = {}
+            for port in ports:
+                key = str(port)
+                family_totals[key] = {
+                    'tx': output_totals.get(key, {}).get('tx', 0),
+                    'rx': input_totals.get(key, {}).get('rx', 0),
+                }
         for port in ports:
             key = str(port)
-            family_totals[key] = {
-                'tx': output_totals.get(key, {}).get('tx', 0),
-                'rx': input_totals.get(key, {}).get('rx', 0),
-            }
-    for port in ports:
-        key = str(port)
-        totals[key]['tx'] += family_totals.get(key, {}).get('tx', 0)
-        totals[key]['rx'] += family_totals.get(key, {}).get('rx', 0)
+            totals[key]['tx'] += family_totals.get(key, {}).get('tx', 0)
+            totals[key]['rx'] += family_totals.get(key, {}).get('rx', 0)
 
 for s in c['servers']:
     port = str(s['server_port'])
@@ -1598,14 +2116,14 @@ PYEOF
         echo -e "${RED}❌ 保存流量数据失败${NC}"
         return 1
     fi
-    if ! traffic_chains_installed; then
+    if [ "$BACKEND" = "iptables" ] && ! traffic_chains_installed; then
         PORTS=$(config_ports)
         zero_traffic_counters_for_ports "$PORTS"
     fi
     secure_data_files
 }
 
-# ========== 保存当前 iptables 计数到文件 ==========
+# ========== 保存当前防火墙计数到文件 ==========
 save_traffic() {
     with_state_lock save_traffic_locked
 }
@@ -1625,18 +2143,18 @@ save_traffic_if_unlocked() {
 }
 
 show_traffic() {
-    # 先同步当前 iptables 增量到历史文件，并清零计数器
+    # 先同步当前内核计数增量到历史文件，并执行配额策略。
     save_traffic || return 1
+    with_state_lock enforce_user_policies_locked 1 || return 1
 
     echo -e "\n${BLUE}  =================================================${NC}"
     echo -e "${BLUE}    流量统计  ${YELLOW}(单向流量，实际带宽消耗约为 x2)${NC}"
     echo -e "${BLUE}  =================================================${NC}"
-    printf "  ${CYAN}%-4s %-8s %-14s %-14s %-6s${NC}\n" "编号" "端口" "上行(GB)" "下行(GB)" "状态"
+    printf "  ${CYAN}%-4s %-7s %-12s %-12s %-18s %-10s${NC}\n" "编号" "端口" "上行(GB)" "下行(GB)" "已用/配额(GB)" "状态"
     echo -e "  ${BLUE}-------------------------------------------------${NC}"
 
     python3 << PYEOF
 import json, os
-from datetime import datetime
 
 with open('$CONFIG') as f:
     c = json.load(f)
@@ -1654,12 +2172,19 @@ for i, s in enumerate(c['servers'], 1):
 
     total_tx = history.get(key, {}).get('tx', 0) / 1024 / 1024 / 1024
     total_rx = history.get(key, {}).get('rx', 0) / 1024 / 1024 / 1024
+    total = total_tx + total_rx
+    quota = s.get('quota_bytes', 0) / 1024 / 1024 / 1024
+    usage = f'{total:.2f}/-' if quota <= 0 else f'{total:.2f}/{quota:g}'
     last_reset = history.get(key, {}).get('reset_time', '从未重置')
 
     status = '暂停' if s.get('disabled') else '正常'
     color  = '\033[0;31m' if s.get('disabled') else '\033[0;32m'
     reset  = '\033[0m'
-    print(f"  {i:<4} {port:<8} {total_tx:<14.2f} {total_rx:<14.2f} {color}{status}{reset}  重置: {last_reset}")
+    reason = s.get('disabled_reason')
+    if reason == 'quota': status = '配额暂停'
+    elif reason == 'expired': status = '到期暂停'
+    elif reason == 'manual': status = '手动暂停'
+    print(f"  {i:<4} {port:<7} {total_tx:<12.2f} {total_rx:<12.2f} {usage:<18} {color}{status:<10}{reset}  重置: {last_reset}")
 PYEOF
 
     echo -e "  ${BLUE}=================================================${NC}"
@@ -1696,9 +2221,10 @@ traffic_file = '$TRAFFIC_FILE'
 fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(traffic_file) + '.', dir=os.path.dirname(traffic_file), text=True)
 with os.fdopen(fd, 'w') as f:
     json.dump(history, f, indent=2)
-os.replace(tmp, traffic_file)
+        os.replace(tmp, traffic_file)
 PYEOF
         secure_data_files
+        enforce_user_policies_locked 1 || return 1
         echo -e "${GREEN}✅ 所有用户流量已重置${NC}"
         return
     fi
@@ -1737,6 +2263,7 @@ with os.fdopen(fd, 'w') as f:
 os.replace(tmp, traffic_file)
 PYEOF
     secure_data_files
+    enforce_user_policies_locked 1 || return 1
 
     echo -e "${GREEN}✅ 端口 $PORT 流量已重置${NC}"
 }
@@ -1767,6 +2294,7 @@ with open('$CONFIG') as f:
 for s in c['servers']:
     if s['server_port'] == $PORT:
         s['disabled'] = True
+        s['disabled_reason'] = 'manual'
         break
 config_file = '$CONFIG'
 fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
@@ -1805,6 +2333,7 @@ with open('$CONFIG') as f:
 for s in c['servers']:
     if s['server_port'] == $PORT:
         s.pop('disabled', None)
+        s.pop('disabled_reason', None)
         break
 config_file = '$CONFIG'
 fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
@@ -1814,6 +2343,7 @@ os.replace(tmp, config_file)
 PYEOF
 
     apply_config || return 1
+    enforce_user_policies_locked || return 1
     echo -e "${GREEN}✅ 端口 $PORT 已恢复${NC}"
 }
 
@@ -1903,31 +2433,37 @@ print(c['servers'][0]['method'] if c.get('servers') else '')
         *) KEY_LEN=0 ;;
     esac
 
-    # 保留原有端口列表（读入 bash 数组）
-    PORT_STR=$(python3 -c "
+    if ! python3 - "$CONFIG" "$KEY_LEN" << 'PYEOF'
 import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-print(' '.join(str(s['server_port']) for s in c['servers']))
-")
-    read -r -a PORT_LIST <<< "$PORT_STR"
+import os
+import subprocess
+import sys
+import tempfile
 
-    mapfile -t NAME_LIST < <(python3 -c "
-import json
-with open('$CONFIG') as f:
-    c = json.load(f)
-for s in c['servers']:
-    print(s.get('name', ''))
-")
-    LINK_NAME_PREFIX=$(default_link_name)
+config_file = sys.argv[1]
+key_len = int(sys.argv[2])
+with open(config_file, encoding='utf-8') as f:
+    config = json.load(f)
 
-    HOST=$(get_server_host 2>/dev/null) || basic_config || return 1
+for server in config.get('servers', []):
+    raw = subprocess.check_output(
+        ['openssl', 'rand', '-base64', str(key_len if key_len > 0 else 32)],
+        text=True,
+    ).strip()
+    server['password'] = raw if key_len > 0 else raw.replace('=', '')[:24]
 
-    USE_ACL_FLAG=$([ -f "$ACL_PATH" ] && echo true || echo false)
-
-    generate_config || return 1
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w', encoding='utf-8') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+os.replace(tmp, config_file)
+PYEOF
+    then
+        echo -e "${RED}❌ 重新生成用户密码失败${NC}"
+        return 1
+    fi
+    rebuild_links || return 1
     apply_config || return 1
-    init_traffic || return 1
     show_links
 }
 
@@ -2288,6 +2824,822 @@ rename_user() {
     with_state_lock rename_user_locked
 }
 
+# ========== 用户配额与到期策略 ==========
+validate_expiry_date() {
+    python3 - "$1" << 'PYEOF' >/dev/null 2>&1
+import datetime
+import sys
+
+datetime.datetime.strptime(sys.argv[1], '%Y-%m-%d')
+PYEOF
+}
+
+enforce_user_policies_locked() {
+    check_installed || return 0
+    if [ "${1:-0}" != "1" ]; then
+        save_traffic_locked || return 1
+    fi
+    local RESULT POLICY_CHANGED
+    RESULT=$(python3 - "$CONFIG" "$TRAFFIC_FILE" << 'PYEOF'
+import datetime
+import json
+import os
+import sys
+import tempfile
+
+config_file, traffic_file = sys.argv[1:]
+with open(config_file, encoding='utf-8') as f:
+    config = json.load(f)
+try:
+    with open(traffic_file) as f:
+        traffic = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    traffic = {}
+
+today = datetime.date.today()
+changed = False
+events = []
+for index, server in enumerate(config.get('servers', []), 1):
+    port = str(server['server_port'])
+    usage = traffic.get(port, {})
+    total = int(usage.get('tx', 0)) + int(usage.get('rx', 0))
+    quota = server.get('quota_bytes')
+    quota_exceeded = isinstance(quota, int) and not isinstance(quota, bool) and quota > 0 and total >= quota
+    expiry = server.get('expires_at')
+    expired = False
+    if isinstance(expiry, str):
+        try:
+            expired = today > datetime.datetime.strptime(expiry, '%Y-%m-%d').date()
+        except ValueError:
+            pass
+    policy_reason = 'expired' if expired else ('quota' if quota_exceeded else None)
+    old_reason = server.get('disabled_reason')
+    name = str(server.get('name') or f'user-{index}')
+    if policy_reason:
+        if old_reason != 'manual' and (not server.get('disabled') or old_reason != policy_reason):
+            server['disabled'] = True
+            server['disabled_reason'] = policy_reason
+            changed = True
+            events.append(f"{name}: {'已到期' if policy_reason == 'expired' else '已达到流量配额'}，自动暂停")
+    elif old_reason in ('quota', 'expired'):
+        server.pop('disabled', None)
+        server.pop('disabled_reason', None)
+        changed = True
+        events.append(f'{name}: 限制已解除，自动恢复')
+
+if changed:
+    fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+        f.write('\n')
+    os.replace(tmp, config_file)
+print(json.dumps({'changed': changed, 'events': events}, ensure_ascii=False))
+PYEOF
+) || {
+        echo -e "${RED}❌ 检查用户策略失败${NC}"
+        return 1
+    }
+    POLICY_CHANGED=$(printf '%s' "$RESULT" | python3 -c "import json,sys; print(int(json.load(sys.stdin)['changed']))")
+    printf '%s' "$RESULT" | python3 -c "import json,sys; [print('  ' + event) for event in json.load(sys.stdin)['events']]"
+    if [ "$POLICY_CHANGED" = "1" ]; then
+        secure_data_files
+        apply_config || return 1
+    fi
+}
+
+enforce_user_policies() {
+    with_state_lock enforce_user_policies_locked
+}
+
+configure_user_policy_locked() {
+    list_users
+    read -r -p "输入要设置的用户编号: " NUM
+    if ! is_uint "$NUM" || [ "$NUM" -lt 1 ]; then
+        echo -e "${RED}无效编号${NC}"
+        return 1
+    fi
+    local CURRENT QUOTA_BYTES EXPIRES_AT NAME INPUT_QUOTA INPUT_EXPIRY NEW_QUOTA NEW_EXPIRY CURRENT_QUOTA
+    CURRENT=$(python3 - "$CONFIG" "$NUM" << 'PYEOF'
+import json
+import sys
+with open(sys.argv[1]) as f:
+    servers = json.load(f).get('servers', [])
+index = int(sys.argv[2]) - 1
+if not 0 <= index < len(servers):
+    raise SystemExit(1)
+server = servers[index]
+print(server.get('quota_bytes', 0))
+print(server.get('expires_at', ''))
+print(server.get('name', ''))
+PYEOF
+) || {
+        echo -e "${RED}无效编号${NC}"
+        return 1
+    }
+    QUOTA_BYTES=$(printf '%s\n' "$CURRENT" | sed -n '1p')
+    EXPIRES_AT=$(printf '%s\n' "$CURRENT" | sed -n '2p')
+    NAME=$(printf '%s\n' "$CURRENT" | sed -n '3p')
+    CURRENT_QUOTA=$(python3 - "$QUOTA_BYTES" << 'PYEOF'
+import sys
+value = int(sys.argv[1])
+print('不限' if value <= 0 else f'{value / 1024 ** 3:g}')
+PYEOF
+)
+    echo -e "用户: ${GREEN}$NAME${NC}"
+    echo "当前配额: $CURRENT_QUOTA GB；到期日: ${EXPIRES_AT:-不限}"
+    read -r -p "新流量配额 GB [回车保持，0=不限]: " INPUT_QUOTA
+    read -r -p "新到期日 YYYY-MM-DD [回车保持，0=不限]: " INPUT_EXPIRY
+
+    NEW_QUOTA=$QUOTA_BYTES
+    if [ -n "$INPUT_QUOTA" ]; then
+        NEW_QUOTA=$(python3 - "$INPUT_QUOTA" << 'PYEOF'
+from decimal import Decimal, InvalidOperation
+import sys
+try:
+    value = Decimal(sys.argv[1])
+except InvalidOperation:
+    raise SystemExit(1)
+if not value.is_finite() or value < 0:
+    raise SystemExit(1)
+print(int(value * (1024 ** 3)))
+PYEOF
+) || {
+            echo -e "${RED}❌ 流量配额必须是大于或等于 0 的数字${NC}"
+            return 1
+        }
+    fi
+    NEW_EXPIRY=$EXPIRES_AT
+    if [ "$INPUT_EXPIRY" = "0" ]; then
+        NEW_EXPIRY=""
+    elif [ -n "$INPUT_EXPIRY" ]; then
+        validate_expiry_date "$INPUT_EXPIRY" || {
+            echo -e "${RED}❌ 到期日格式或日期无效${NC}"
+            return 1
+        }
+        NEW_EXPIRY=$INPUT_EXPIRY
+    fi
+
+    if ! python3 - "$CONFIG" "$NUM" "$NEW_QUOTA" "$NEW_EXPIRY" << 'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+config_file, number, quota, expiry = sys.argv[1:]
+with open(config_file, encoding='utf-8') as f:
+    config = json.load(f)
+index = int(number) - 1
+if not 0 <= index < len(config.get('servers', [])):
+    raise SystemExit(1)
+server = config['servers'][index]
+quota = int(quota)
+if quota > 0:
+    server['quota_bytes'] = quota
+else:
+    server.pop('quota_bytes', None)
+if expiry:
+    server['expires_at'] = expiry
+else:
+    server.pop('expires_at', None)
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w', encoding='utf-8') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+os.replace(tmp, config_file)
+PYEOF
+    then
+        echo -e "${RED}❌ 保存用户策略失败${NC}"
+        return 1
+    fi
+    secure_data_files
+    enforce_user_policies_locked || return 1
+    echo -e "${GREEN}✅ 用户配额与到期时间已更新${NC}"
+}
+
+configure_user_policy() {
+    with_state_lock configure_user_policy_locked
+}
+
+ensure_policy_scheduler() {
+    check_installed || return 0
+    [ -f "$SCRIPT_INSTALL_PATH" ] || return 0
+    if [ "$SYSTEM" = "alpine" ]; then
+        mkdir -p /etc/periodic/15min || return 1
+        cat > /etc/periodic/15min/volss-policy << EOF
+#!/bin/sh
+/bin/bash $SCRIPT_INSTALL_PATH --enforce-policies >/dev/null 2>&1
+EOF
+        chmod 700 /etc/periodic/15min/volss-policy
+        rc-service crond start >/dev/null 2>&1 || true
+        rc-update add crond default >/dev/null 2>&1 || true
+    else
+        cat > /etc/systemd/system/volss-policy.service << EOF
+[Unit]
+Description=VOLSS user quota and expiry enforcement
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/bash $SCRIPT_INSTALL_PATH --enforce-policies
+EOF
+        cat > /etc/systemd/system/volss-policy.timer << 'EOF'
+[Unit]
+Description=Check VOLSS user quotas and expiry dates
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
+        systemctl enable --now volss-policy.timer >/dev/null 2>&1 || return 1
+    fi
+}
+
+# ========== 备份与恢复 ==========
+create_backup_archive() {
+    local DESTINATION=$1
+    local DEST_DIR DEST_BASE TMP_DIR STAGE TMP_ARCHIVE SOURCE NAME
+    DEST_DIR=$(dirname "$DESTINATION")
+    DEST_BASE=$(basename "$DESTINATION")
+    mkdir -p "$DEST_DIR" || return 1
+    TMP_DIR=$(mktemp -d /tmp/volss-backup.XXXXXX) || return 1
+    STAGE="$TMP_DIR/volss-backup"
+    mkdir -p "$STAGE" || {
+        rm -rf "$TMP_DIR"
+        return 1
+    }
+
+    while IFS='|' read -r SOURCE NAME; do
+        [ -f "$SOURCE" ] || continue
+        cp "$SOURCE" "$STAGE/$NAME" || {
+            rm -rf "$TMP_DIR"
+            return 1
+        }
+    done << EOF
+$CONFIG|config.json
+$SERVER_HOST_FILE|server_host
+$TRAFFIC_FILE|traffic.json
+$MANUAL_FILE|manual.list
+$ACL_PATH|blocklist.acl
+$LINKS_FILE|ss_links.txt
+$TRAFFIC_BACKEND_FILE|traffic_backend
+EOF
+    if [ -d "$ACL_RULESET_DIR" ]; then
+        cp -a "$ACL_RULESET_DIR" "$STAGE/rulesets" || {
+            rm -rf "$TMP_DIR"
+            return 1
+        }
+    fi
+    python3 - "$STAGE/manifest.json" "$VERSION" << 'PYEOF'
+import json
+import socket
+import sys
+from datetime import datetime, timezone
+
+path, version = sys.argv[1:]
+with open(path, 'w', encoding='utf-8') as f:
+    json.dump({
+        'format': 1,
+        'created_at': datetime.now(timezone.utc).isoformat(),
+        'hostname': socket.gethostname(),
+        'volss_version': version,
+    }, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+PYEOF
+
+    TMP_ARCHIVE=$(mktemp "$DEST_DIR/.${DEST_BASE}.XXXXXX") || {
+        rm -rf "$TMP_DIR"
+        return 1
+    }
+    if ! tar -czf "$TMP_ARCHIVE" -C "$TMP_DIR" volss-backup; then
+        rm -f "$TMP_ARCHIVE"
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+    chmod 600 "$TMP_ARCHIVE"
+    mv "$TMP_ARCHIVE" "$DESTINATION" || {
+        rm -f "$TMP_ARCHIVE"
+        rm -rf "$TMP_DIR"
+        return 1
+    }
+    rm -rf "$TMP_DIR"
+}
+
+extract_and_validate_backup() {
+    local ARCHIVE=$1
+    local DESTINATION=$2
+    python3 - "$ARCHIVE" "$DESTINATION" << 'PYEOF'
+import datetime
+import json
+import os
+import re
+import sys
+import tarfile
+
+archive, destination = sys.argv[1:]
+allowed_files = {
+    'volss-backup/manifest.json',
+    'volss-backup/config.json',
+    'volss-backup/server_host',
+    'volss-backup/traffic.json',
+    'volss-backup/manual.list',
+    'volss-backup/blocklist.acl',
+    'volss-backup/ss_links.txt',
+    'volss-backup/traffic_backend',
+}
+ruleset_pattern = re.compile(r'^volss-backup/rulesets/[A-Za-z0-9_-]+\.acl$')
+total_size = 0
+with tarfile.open(archive, 'r:gz') as tar:
+    members = []
+    for member in tar.getmembers():
+        name = member.name.rstrip('/')
+        if name in ('volss-backup', 'volss-backup/rulesets') and member.isdir():
+            continue
+        if member.issym() or member.islnk() or not member.isfile():
+            raise SystemExit(f'unsupported archive member: {member.name}')
+        if name not in allowed_files and not ruleset_pattern.fullmatch(name):
+            raise SystemExit(f'unexpected archive member: {member.name}')
+        total_size += member.size
+        if total_size > 100 * 1024 * 1024:
+            raise SystemExit('backup is too large')
+        members.append(member)
+    if not any(member.name == 'volss-backup/config.json' for member in members):
+        raise SystemExit('config.json is missing')
+    for member in members:
+        relative = member.name[len('volss-backup/'):]
+        output = os.path.join(destination, relative)
+        os.makedirs(os.path.dirname(output), exist_ok=True)
+        source = tar.extractfile(member)
+        if source is None:
+            raise SystemExit(f'cannot read {member.name}')
+        with source, open(output, 'wb') as target:
+            target.write(source.read())
+
+config_path = os.path.join(destination, 'config.json')
+with open(config_path, encoding='utf-8') as f:
+    config = json.load(f)
+servers = config.get('servers')
+if not isinstance(servers, list):
+    raise SystemExit('servers must be a list')
+ports = set()
+for server in servers:
+    if not isinstance(server, dict):
+        raise SystemExit('invalid server entry')
+    port = server.get('server_port')
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535 or port in ports:
+        raise SystemExit('invalid or duplicate server port')
+    ports.add(port)
+    if not isinstance(server.get('method'), str) or not server['method']:
+        raise SystemExit('invalid encryption method')
+    if not isinstance(server.get('password'), str) or not server['password']:
+        raise SystemExit('invalid password')
+    quota = server.get('quota_bytes')
+    if quota is not None and (not isinstance(quota, int) or isinstance(quota, bool) or quota < 0):
+        raise SystemExit('invalid traffic quota')
+    expiry = server.get('expires_at')
+    if expiry is not None and (not isinstance(expiry, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', expiry)):
+        raise SystemExit('invalid expiry date')
+    if expiry is not None:
+        try:
+            datetime.datetime.strptime(expiry, '%Y-%m-%d')
+        except ValueError:
+            raise SystemExit('invalid expiry date')
+
+traffic_path = os.path.join(destination, 'traffic.json')
+if os.path.exists(traffic_path):
+    with open(traffic_path) as f:
+        traffic = json.load(f)
+    if not isinstance(traffic, dict):
+        raise SystemExit('invalid traffic data')
+    for port, counters in traffic.items():
+        if not str(port).isdigit() or not isinstance(counters, dict):
+            raise SystemExit('invalid traffic entry')
+        for field in ('tx', 'rx'):
+            value = counters.get(field, 0)
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise SystemExit('invalid traffic counter')
+PYEOF
+}
+
+restore_backup_archive() {
+    local ARCHIVE=$1
+    [ -f "$ARCHIVE" ] || {
+        echo -e "${RED}❌ 备份文件不存在${NC}"
+        return 1
+    }
+    local TMP_DIR EXTRACTED ROLLBACK_DIR HOST_VALUE FILE
+    TMP_DIR=$(mktemp -d /tmp/volss-restore.XXXXXX) || return 1
+    EXTRACTED="$TMP_DIR/extracted"
+    ROLLBACK_DIR="$TMP_DIR/current"
+    mkdir -p "$EXTRACTED" "$ROLLBACK_DIR" || {
+        rm -rf "$TMP_DIR"
+        return 1
+    }
+    if ! extract_and_validate_backup "$ARCHIVE" "$EXTRACTED"; then
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ 备份格式或内容校验失败${NC}"
+        return 1
+    fi
+    if [ ! -s "$EXTRACTED/server_host" ]; then
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ 备份中缺少服务器地址${NC}"
+        return 1
+    fi
+    HOST_VALUE=$(normalize_server_host "$(head -n 1 "$EXTRACTED/server_host")" 2>/dev/null) || {
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ 备份中的服务器地址无效${NC}"
+        return 1
+    }
+
+    mkdir -p "$CONFIG_DIR" || {
+        rm -rf "$TMP_DIR"
+        return 1
+    }
+    cp -a "$CONFIG_DIR/." "$ROLLBACK_DIR/" 2>/dev/null || true
+
+    rm -f "$CONFIG" "$RUNTIME" "$LINKS_FILE" "$SERVER_HOST_FILE" "$TRAFFIC_FILE" "$MANUAL_FILE" "$ACL_PATH" "$TRAFFIC_BACKEND_FILE" "$NFT_RULES_FILE"
+    rm -rf "$ACL_RULESET_DIR"
+    while IFS='|' read -r FILE TARGET; do
+        [ -f "$EXTRACTED/$FILE" ] || continue
+        cp "$EXTRACTED/$FILE" "$TARGET" || {
+            rm -rf "$CONFIG_DIR"
+            mkdir -p "$CONFIG_DIR"
+            cp -a "$ROLLBACK_DIR/." "$CONFIG_DIR/"
+            rm -rf "$TMP_DIR"
+            return 1
+        }
+    done << EOF
+config.json|$CONFIG
+server_host|$SERVER_HOST_FILE
+traffic.json|$TRAFFIC_FILE
+manual.list|$MANUAL_FILE
+blocklist.acl|$ACL_PATH
+ss_links.txt|$LINKS_FILE
+traffic_backend|$TRAFFIC_BACKEND_FILE
+EOF
+    if [ -d "$EXTRACTED/rulesets" ]; then
+        if ! cp -a "$EXTRACTED/rulesets" "$ACL_RULESET_DIR"; then
+            rm -rf "$CONFIG_DIR"
+            mkdir -p "$CONFIG_DIR"
+            cp -a "$ROLLBACK_DIR/." "$CONFIG_DIR/"
+            rm -rf "$TMP_DIR"
+            return 1
+        fi
+    fi
+    printf '%s\n' "$HOST_VALUE" > "$SERVER_HOST_FILE"
+
+    if ! python3 - "$CONFIG" "$ACL_PATH" << 'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+config_file, acl_path = sys.argv[1:]
+with open(config_file, encoding='utf-8') as f:
+    config = json.load(f)
+if os.path.exists(acl_path):
+    config['acl'] = acl_path
+else:
+    config.pop('acl', None)
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w', encoding='utf-8') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+os.replace(tmp, config_file)
+PYEOF
+    then
+        rm -rf "$CONFIG_DIR"
+        mkdir -p "$CONFIG_DIR"
+        cp -a "$ROLLBACK_DIR/." "$CONFIG_DIR/"
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+
+    secure_data_files
+    if ! migrate_link_names_if_needed || ! rebuild_links || ! apply_config || ! rebuild_traffic_rules "$(config_ports)"; then
+        echo -e "${RED}❌ 恢复后应用配置失败，正在回滚${NC}"
+        rm -rf "$CONFIG_DIR"
+        mkdir -p "$CONFIG_DIR"
+        cp -a "$ROLLBACK_DIR/." "$CONFIG_DIR/"
+        secure_data_files
+        apply_config >/dev/null 2>&1 || true
+        rebuild_traffic_rules "$(config_ports)" >/dev/null 2>&1 || true
+        rm -rf "$TMP_DIR"
+        return 1
+    fi
+    generate_client_configs >/dev/null 2>&1 || true
+    rm -rf "$TMP_DIR"
+}
+
+backup_data_locked() {
+    check_installed || {
+        echo -e "${RED}请先安装 Shadowsocks-Rust${NC}"
+        return 1
+    }
+    save_traffic_locked || return 1
+    local DEFAULT_BACKUP BACKUP_PATH
+    DEFAULT_BACKUP="${HOME:-/root}/volss-backup-$(date '+%Y%m%d-%H%M%S').tar.gz"
+    read -r -p "备份文件路径 [默认 $DEFAULT_BACKUP]: " BACKUP_PATH
+    BACKUP_PATH=${BACKUP_PATH:-$DEFAULT_BACKUP}
+    if create_backup_archive "$BACKUP_PATH"; then
+        echo -e "${GREEN}✅ 备份完成: $BACKUP_PATH${NC}"
+    else
+        echo -e "${RED}❌ 创建备份失败${NC}"
+        return 1
+    fi
+}
+
+restore_data_locked() {
+    local BACKUP_PATH SAFETY_BACKUP
+    read -r -p "输入备份文件路径: " BACKUP_PATH
+    [ -f "$BACKUP_PATH" ] || {
+        echo -e "${RED}❌ 备份文件不存在${NC}"
+        return 1
+    }
+    read -r -p "恢复将覆盖当前配置，确认继续？[y/N]: " CONFIRM
+    [[ "$CONFIRM" =~ ^[Yy]$ ]] || return 0
+    save_traffic_locked || return 1
+    SAFETY_BACKUP="${HOME:-/root}/volss-before-restore-$(date '+%Y%m%d-%H%M%S').tar.gz"
+    create_backup_archive "$SAFETY_BACKUP" || {
+        echo -e "${RED}❌ 无法创建恢复前保护备份，已取消${NC}"
+        return 1
+    }
+    if restore_backup_archive "$BACKUP_PATH"; then
+        echo -e "${GREEN}✅ 数据恢复完成${NC}"
+        echo "  恢复前备份: $SAFETY_BACKUP"
+    else
+        return 1
+    fi
+}
+
+backup_data() {
+    with_state_lock backup_data_locked
+}
+
+restore_data() {
+    with_state_lock restore_data_locked
+}
+
+# ========== 独立升级 ssserver ==========
+upgrade_ssserver_locked() {
+    check_installed || {
+        echo -e "${RED}请先安装 Shadowsocks-Rust${NC}"
+        return 1
+    }
+    local CURRENT_VERSION NEW_VERSION BACKUP_BIN WAS_RUNNING=0
+    CURRENT_VERSION=$("$SS_BIN" --version 2>&1 | head -n 1)
+    echo -e "当前版本: ${CYAN}${CURRENT_VERSION:-未知}${NC}"
+    read -r -p "升级到 GitHub 最新稳定版？现有用户配置不会改变 [y/N]: " CONFIRM
+    [[ "$CONFIRM" =~ ^[Yy]$ ]] || return 0
+    check_svc_running && WAS_RUNNING=1
+    save_traffic_locked || return 1
+    BACKUP_BIN=$(mktemp /tmp/ssserver-backup.XXXXXX) || return 1
+    cp -p "$SS_BIN" "$BACKUP_BIN" || {
+        rm -f "$BACKUP_BIN"
+        return 1
+    }
+    if ! install_ssrust; then
+        rm -f "$BACKUP_BIN"
+        return 1
+    fi
+    NEW_VERSION=$("$SS_BIN" --version 2>&1 | head -n 1)
+    if [ "$WAS_RUNNING" -eq 1 ] && ! svc_restart; then
+        if ! cp -p "$BACKUP_BIN" "${SS_BIN}.rollback.$$" || ! mv "${SS_BIN}.rollback.$$" "$SS_BIN"; then
+            rm -f "${SS_BIN}.rollback.$$" "$BACKUP_BIN"
+            echo -e "${RED}❌ 新版服务启动失败，且自动回滚二进制失败${NC}"
+            return 1
+        fi
+        svc_restart >/dev/null 2>&1 || true
+        rm -f "$BACKUP_BIN"
+        echo -e "${RED}❌ 新版服务启动失败，已回滚到原版本${NC}"
+        return 1
+    fi
+    rm -f "$BACKUP_BIN"
+    echo -e "${GREEN}✅ ssserver 升级完成${NC}"
+    echo "  ${CURRENT_VERSION:-未知} -> ${NEW_VERSION:-未知}"
+}
+
+upgrade_ssserver() {
+    with_state_lock upgrade_ssserver_locked
+}
+
+# ========== 健康检查 ==========
+health_ok() {
+    HEALTH_OK=$((HEALTH_OK + 1))
+    echo -e "  ${GREEN}✅ $*${NC}"
+}
+
+health_warn() {
+    HEALTH_WARN=$((HEALTH_WARN + 1))
+    echo -e "  ${YELLOW}⚠ $*${NC}"
+}
+
+health_fail() {
+    HEALTH_FAIL=$((HEALTH_FAIL + 1))
+    echo -e "  ${RED}❌ $*${NC}"
+}
+
+port_has_listener() {
+    local PROTOCOL=$1
+    local FAMILY=$2
+    local PORT=$3
+    local SS_ARGS="-H -ln"
+    case $PROTOCOL in
+        tcp) SS_ARGS="${SS_ARGS}t" ;;
+        udp) SS_ARGS="${SS_ARGS}u" ;;
+        *) return 1 ;;
+    esac
+    [ -n "$FAMILY" ] && SS_ARGS="${SS_ARGS}${FAMILY}"
+    # shellcheck disable=SC2086
+    ss $SS_ARGS 2>/dev/null | awk -v port="$PORT" '
+        {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ (":" port "$")) found = 1
+            }
+        }
+        END { exit !found }
+    '
+}
+
+health_check() {
+    HEALTH_OK=0
+    HEALTH_WARN=0
+    HEALTH_FAIL=0
+    echo -e "\n${BLUE}  =================================================${NC}"
+    echo -e "${BLUE}    Shadowsocks-Rust 健康检查${NC}"
+    echo -e "${BLUE}  =================================================${NC}"
+
+    if ! check_installed; then
+        health_fail "Shadowsocks-Rust 尚未安装"
+        return 1
+    fi
+
+    if python3 - "$CONFIG" << 'PYEOF' >/dev/null 2>&1
+import datetime
+import json
+import re
+import sys
+
+with open(sys.argv[1]) as f:
+    config = json.load(f)
+servers = config.get('servers')
+if not isinstance(servers, list):
+    raise SystemExit(1)
+ports = set()
+for server in servers:
+    if not isinstance(server, dict):
+        raise SystemExit(1)
+    port = server.get('server_port')
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535 or port in ports:
+        raise SystemExit(1)
+    ports.add(port)
+    if not server.get('method') or not server.get('password'):
+        raise SystemExit(1)
+    quota = server.get('quota_bytes')
+    if quota is not None and (not isinstance(quota, int) or isinstance(quota, bool) or quota < 0):
+        raise SystemExit(1)
+    expiry = server.get('expires_at')
+    if expiry is not None:
+        if not isinstance(expiry, str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}', expiry):
+            raise SystemExit(1)
+        datetime.datetime.strptime(expiry, '%Y-%m-%d')
+PYEOF
+    then
+        health_ok "管理配置 JSON 有效"
+    else
+        health_fail "管理配置 JSON 无效"
+    fi
+
+    if [ -s "$RUNTIME" ]; then
+        if "$SS_BIN" --help 2>&1 | grep -q -- '--check-config'; then
+            if "$SS_BIN" -c "$RUNTIME" --check-config >/dev/null 2>&1; then
+                health_ok "ssserver 运行配置校验通过"
+            else
+                health_fail "ssserver 运行配置校验失败"
+            fi
+        elif python3 -m json.tool "$RUNTIME" >/dev/null 2>&1; then
+            health_warn "当前 ssserver 不支持 --check-config，仅完成 JSON 校验"
+        else
+            health_fail "runtime.json 无法解析"
+        fi
+    else
+        health_fail "runtime.json 不存在或为空"
+    fi
+
+    if check_svc_running; then
+        health_ok "服务正在运行"
+    else
+        health_fail "服务未运行"
+    fi
+
+    local -a ENABLED_PORTS
+    mapfile -t ENABLED_PORTS < <(python3 - "$CONFIG" << 'PYEOF'
+import json
+import sys
+with open(sys.argv[1]) as f:
+    for server in json.load(f).get('servers', []):
+        if not server.get('disabled', False):
+            print(server['server_port'])
+PYEOF
+)
+    local PORT TCP_MISSING=0 UDP_MISSING=0 HAS_IPV4=0 HAS_IPV6=0
+    for PORT in "${ENABLED_PORTS[@]}"; do
+        port_has_listener tcp "" "$PORT" || TCP_MISSING=$((TCP_MISSING + 1))
+        port_has_listener udp "" "$PORT" || UDP_MISSING=$((UDP_MISSING + 1))
+        if port_has_listener tcp 4 "$PORT" || port_has_listener udp 4 "$PORT"; then HAS_IPV4=1; fi
+        if port_has_listener tcp 6 "$PORT" || port_has_listener udp 6 "$PORT"; then HAS_IPV6=1; fi
+    done
+    if [ "${#ENABLED_PORTS[@]}" -eq 0 ]; then
+        health_warn "没有启用的用户端口"
+    else
+        if [ "$TCP_MISSING" -eq 0 ]; then
+            health_ok "全部 ${#ENABLED_PORTS[@]} 个 TCP 端口正在监听"
+        else
+            health_fail "$TCP_MISSING 个 TCP 端口未监听"
+        fi
+        if [ "$UDP_MISSING" -eq 0 ]; then
+            health_ok "全部 ${#ENABLED_PORTS[@]} 个 UDP 端口正在监听"
+        else
+            health_fail "$UDP_MISSING 个 UDP 端口未监听"
+        fi
+        if [ "$HAS_IPV4" -eq 1 ]; then
+            health_ok "检测到 IPv4 监听"
+        elif [ "$HAS_IPV6" -eq 1 ] && [ "$(cat /proc/sys/net/ipv6/bindv6only 2>/dev/null || echo 1)" = "0" ]; then
+            health_ok "IPv6 通配监听兼容 IPv4 映射连接"
+        else
+            health_warn "未检测到 IPv4 监听"
+        fi
+        if [ "$HAS_IPV6" -eq 1 ]; then
+            health_ok "检测到 IPv6 监听"
+        else
+            health_warn "未检测到 IPv6 监听"
+        fi
+    fi
+
+    local STORED_HOST
+    STORED_HOST=$(get_server_host 2>/dev/null || true)
+    if [ -z "$STORED_HOST" ]; then
+        health_fail "服务器地址未配置"
+    elif normalize_server_host "$STORED_HOST" >/dev/null 2>&1; then
+        if [[ "$STORED_HOST" == *:* ]] || [[ "$STORED_HOST" =~ ^[0-9.]+$ ]] || getent ahosts "$STORED_HOST" >/dev/null 2>&1; then
+            health_ok "服务器地址有效: $STORED_HOST"
+        else
+            health_warn "服务器域名当前无法解析: $STORED_HOST"
+        fi
+    else
+        health_fail "服务器地址格式无效"
+    fi
+
+    local BACKEND
+    BACKEND=$(traffic_backend 2>/dev/null || echo none)
+    case $BACKEND in
+        nftables)
+            if nft list table "$NFT_FAMILY" "$NFT_TABLE" >/dev/null 2>&1; then
+                health_ok "nftables 双栈流量统计表已加载"
+            else
+                health_warn "nftables 流量统计表未加载"
+            fi
+            ;;
+        iptables)
+            if traffic_chains_installed; then
+                if ipv6_firewall_available; then
+                    health_ok "iptables/ip6tables 双栈流量统计链已加载"
+                else
+                    health_warn "仅检测到 IPv4 iptables 流量统计"
+                fi
+            else
+                health_warn "iptables 流量统计链不完整"
+            fi
+            ;;
+        *) health_warn "没有可用的流量统计防火墙后端" ;;
+    esac
+
+    local LOG_OUTPUT ERROR_COUNT
+    if [ "$SYSTEM" = "alpine" ]; then
+        LOG_OUTPUT=$(tail -n 50 /var/log/shadowsocks-rust.log 2>/dev/null || true)
+    else
+        LOG_OUTPUT=$(journalctl -u shadowsocks-rust -n 50 --no-pager 2>/dev/null || true)
+    fi
+    if [ -z "$LOG_OUTPUT" ]; then
+        health_warn "没有可读取的最近服务日志"
+    else
+        ERROR_COUNT=$(printf '%s\n' "$LOG_OUTPUT" | grep -Eic '(^|[^a-z])(error|failed|panic|fatal)([^a-z]|$)' || true)
+        if [ "$ERROR_COUNT" -eq 0 ]; then
+            health_ok "最近 50 行服务日志未发现错误"
+        else
+            health_warn "最近服务日志包含 $ERROR_COUNT 条错误信息"
+        fi
+    fi
+
+    echo -e "  ${BLUE}-------------------------------------------------${NC}"
+    echo -e "  通过: ${GREEN}$HEALTH_OK${NC}  警告: ${YELLOW}$HEALTH_WARN${NC}  失败: ${RED}$HEALTH_FAIL${NC}"
+    [ "$HEALTH_FAIL" -eq 0 ]
+}
+
 # ========== 更新脚本 ==========
 do_update() {
     REMOTE_PATH="chnnic/VOLSS/refs/heads/main/volss.sh"
@@ -2393,9 +3745,8 @@ if changed:
 # 重新生成 runtime
 servers = [dict(s) for s in c['servers'] if not s.get('disabled', False)]
 for s in servers:
-    s.pop('disabled', None)
-    s.pop('acl', None)
-    s.pop('name', None)
+    for field in ('disabled', 'acl', 'name', 'quota_bytes', 'expires_at', 'disabled_reason'):
+        s.pop(field, None)
 
 runtime = {'servers': servers}
 if os.path.exists(acl_path):
@@ -2977,9 +4328,15 @@ show_main_menu() {
         echo -e "      9)  删除某个用户"
         echo -e "     10)  重新生成所有用户"
         echo -e "     23)  修改用户名称"
+        echo -e "     25)  设置用户配额/到期时间"
+        echo -e "  ${CYAN}  -- 导出与数据 --${NC}"
+        echo -e "     24)  导出客户端配置和二维码"
+        echo -e "     26)  备份配置/ACL/流量数据"
+        echo -e "     27)  恢复配置/ACL/流量数据"
         echo -e "  ${CYAN}  -- 流量统计 --${NC}"
         echo -e "     11)  查看流量统计"
         echo -e "     12)  重置流量统计"
+        echo -e "     30)  切换流量统计后端"
         echo -e "  ${CYAN}  -- ACL 黑名单 --${NC}"
         echo -e "     13)  手动添加屏蔽域名"
         echo -e "     14)  手动删除屏蔽域名"
@@ -2992,13 +4349,15 @@ show_main_menu() {
         echo -e "     20)  重启服务"
         echo -e "     21)  查看实时日志"
         echo -e "     22)  时间同步"
+        echo -e "     28)  单独升级 ssserver"
+        echo -e "     29)  系统健康检查"
         echo -e "  ${BLUE}-------------------------------------------------${NC}"
         echo -e "   ${RED}  0)  退出${NC}"
         echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-23]: " CHOICE
+        read -r -p "  请选择 [0-30]: " CHOICE
 
         # 未安装时拦截管理功能
-        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|2[0-3])$ ]]; then
+        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|2[0-9]|30)$ ]]; then
             echo -e "${RED}⚠ 请先安装 Shadowsocks-Rust（选项 1）${NC}"
             sleep 2
             continue
@@ -3016,6 +4375,13 @@ show_main_menu() {
             9)  delete_user;   read -r -p "按回车继续..." ;;
             10) regen_users;   read -r -p "按回车继续..." ;;
             23) rename_user;   read -r -p "按回车继续..." ;;
+            24) export_client_menu; read -r -p "按回车继续..." ;;
+            25) configure_user_policy; read -r -p "按回车继续..." ;;
+            26) backup_data; read -r -p "按回车继续..." ;;
+            27) restore_data; read -r -p "按回车继续..." ;;
+            28) upgrade_ssserver; read -r -p "按回车继续..." ;;
+            29) health_check; read -r -p "按回车继续..." ;;
+            30) configure_traffic_backend; read -r -p "按回车继续..." ;;
             11) show_traffic;  read -r -p "按回车继续..." ;;
             12) reset_traffic; read -r -p "按回车继续..." ;;
             13) add_acl_domain; read -r -p "按回车继续..." ;;
@@ -3095,7 +4461,7 @@ fi
 check_root
 
 # 自检：快捷命令不存在或指向错误时自动修复
-if [ "$1" != "--save-traffic" ] && [ "$1" != "--save-traffic-if-unlocked" ]; then
+if [ "$1" != "--save-traffic" ] && [ "$1" != "--save-traffic-if-unlocked" ] && [ "$1" != "--enforce-policies" ]; then
     if [ ! -f "$SHORTCUT" ] || ! grep -q "volss" "$SHORTCUT" 2>/dev/null; then
         CURRENT_SCRIPT=$(cd "$(dirname "$0")" && pwd)/$(basename "$0")
         if [ "$CURRENT_SCRIPT" != "$SCRIPT_INSTALL_PATH" ] && [ -f "$CURRENT_SCRIPT" ]; then
@@ -3179,12 +4545,15 @@ PYEOF
     with_state_lock migrate_server_host_if_needed
     with_state_lock migrate_link_names_if_needed
     with_state_lock migrate_traffic_rules_if_needed
+    ensure_policy_scheduler
+    with_state_lock enforce_user_policies_locked
 fi
 
 case "$1" in
     --menu)                     show_main_menu ;;
     --save-traffic)             save_traffic ;;
     --save-traffic-if-unlocked) save_traffic_if_unlocked ;;
+    --enforce-policies)         enforce_user_policies ;;
     --version)                  echo -e "Shadowsocks-Rust 管理脚本 ${GREEN}$VERSION${NC}" ;;
     *)                          show_main_menu ;;
 esac
