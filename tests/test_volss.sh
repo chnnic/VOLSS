@@ -29,6 +29,10 @@ assert_true() {
     "$@" || fail "$LABEL"
 }
 
+strip_ansi() {
+    sed $'s/\033\[[0-9;]*m//g'
+}
+
 test_host_helpers() {
     assert_eq "2001:db8::1" "$(normalize_server_host '[2001:0db8::1]')" "normalize IPv6"
     assert_eq "example.com" "$(normalize_server_host 'Example.COM.')" "normalize hostname"
@@ -401,15 +405,42 @@ test_install_shortcut() {
 
 test_main_menu_layout() {
     local OUTPUT
-    OUTPUT=$(render_main_menu "已安装" "运行中" "已同步")
+    OUTPUT=$(render_main_menu "已安装" "运行中" "已同步" | strip_ansi)
+    assert_true "main menu shows VOLSS brand" grep -Fq 'VOLSS  Shadowsocks-Rust 管理' <<< "$OUTPUT"
+    assert_true "main menu shows navigation heading" grep -Fq '功能导航' <<< "$OUTPUT"
     assert_true "main menu starts with install category" grep -Fq '1) 安装与更新' <<< "$OUTPUT"
     assert_true "main menu groups user management" grep -Fq '2) 用户管理' <<< "$OUTPUT"
     assert_true "main menu groups client exports" grep -Fq '3) 链接与客户端导出' <<< "$OUTPUT"
     assert_true "main menu ends with backup category" grep -Fq '7) 备份与恢复' <<< "$OUTPUT"
-    assert_eq "7" "$(grep -Ec '^    [1-7]\)' <<< "$OUTPUT")" "main menu uses consecutive category numbers"
+    assert_eq "7" "$(grep -Ec '^ +[1-7]\)' <<< "$OUTPUT")" "main menu uses consecutive category numbers"
     assert_true "main menu keeps zero as exit" grep -Fq '0) 退出' <<< "$OUTPUT"
     if grep -Eq '^ +([89]|[1-9][0-9]+)\)' <<< "$OUTPUT"; then
         fail "main menu exposes legacy high-numbered actions"
+    fi
+    TESTS=$((TESTS + 1))
+}
+
+test_submenu_layouts() {
+    local MENU OUTPUT
+    clear() { :; }
+    for MENU in show_install_menu show_user_menu show_link_menu show_traffic_menu show_acl_menu show_service_menu show_data_menu; do
+        OUTPUT=$("$MENU" <<< $'0\n' | strip_ansi) || fail "$MENU returns to homepage"
+        assert_true "$MENU uses shared VOLSS banner" grep -Fq 'VOLSS  Shadowsocks-Rust 管理' <<< "$OUTPUT"
+        assert_true "$MENU separates return action" grep -Fq -- '-------------------------------------------------' <<< "$OUTPUT"
+        assert_true "$MENU has homepage return" grep -Fq '0) 返回首页' <<< "$OUTPUT"
+    done
+}
+
+test_ruleset_menu_layout() {
+    local OUTPUT
+    ACL_RULESET_DIR="$TMP_ROOT/menu-rulesets"
+    mkdir -p "$ACL_RULESET_DIR"
+    OUTPUT=$(manage_rulesets_locked <<< $'0\n' | strip_ansi) || fail "return from ruleset menu"
+    assert_true "ruleset menu opens built-in browser" grep -Fq '1) 浏览/安装内置规则集' <<< "$OUTPUT"
+    assert_true "ruleset menu keeps maintenance actions short" grep -Fq '6) 查看当前生效规则统计' <<< "$OUTPUT"
+    assert_true "ruleset menu returns to ACL category" grep -Fq '0) 返回 ACL 黑名单' <<< "$OUTPUT"
+    if grep -Eq '^ +(1[1-9]|[2-9][0-9]+)\)' <<< "$OUTPUT"; then
+        fail "ruleset maintenance menu exposes high-numbered actions"
     fi
     TESTS=$((TESTS + 1))
 }
@@ -422,6 +453,21 @@ test_user_submenu_routing() {
 
     show_user_menu <<< $'1\n0\n' >/dev/null || fail "return from user submenu"
     assert_eq "list-users" "$SUBMENU_ACTION" "user submenu routes consecutive option 1"
+}
+
+test_ruleset_browser_routing() {
+    RULESET_ACTION=""
+    RULESET_REBUILDS=0
+    ACL_RULESET_DIR="$TMP_ROOT/browser-rulesets"
+    mkdir -p "$ACL_RULESET_DIR"
+    show_submenu_header() { :; }
+    pause_menu() { :; }
+    download_ruleset() { RULESET_ACTION=$1; }
+    rebuild_acl() { RULESET_REBUILDS=$((RULESET_REBUILDS + 1)); }
+
+    browse_builtin_rulesets <<< $'1\n0\n' >/dev/null || fail "return from built-in ruleset browser"
+    assert_eq "ads" "$RULESET_ACTION" "built-in browser routes option 1 to ads ruleset"
+    assert_eq "1" "$RULESET_REBUILDS" "built-in browser reapplies ACL after download"
 }
 
 test_add_user_custom_name() {
@@ -623,6 +669,9 @@ test_health_check
 test_ssserver_upgrade_preserves_config
 test_install_shortcut
 test_main_menu_layout
+test_submenu_layouts
+test_ruleset_menu_layout
 test_user_submenu_routing
+test_ruleset_browser_routing
 
 echo "PASS: $TESTS assertions"

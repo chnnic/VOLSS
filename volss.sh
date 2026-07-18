@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.6.3
+#   版本: V1.6.4
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.6.3"
+VERSION="V1.6.4"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -323,14 +323,74 @@ check_installed() {
     [ -f "$SS_BIN" ] && [ -f "$CONFIG" ]
 }
 
+# ========== 终端界面 ==========
+ui_border() {
+    echo -e "  ${BLUE}=================================================${NC}"
+}
+
+ui_rule() {
+    echo -e "  ${BLUE}-------------------------------------------------${NC}"
+}
+
+ui_section() {
+    echo ""
+    echo -e "  ${CYAN}$1${NC}"
+    ui_rule
+}
+
+ui_menu_item() {
+    local NUMBER=$1
+    local LABEL=$2
+    local TONE=${3:-normal}
+    local COLOR=$GREEN
+    case $TONE in
+        danger) COLOR=$RED ;;
+        warning) COLOR=$YELLOW ;;
+        back) COLOR=$CYAN ;;
+    esac
+    printf "    %b%2s)%b %b\n" "$COLOR" "$NUMBER" "$NC" "$LABEL"
+}
+
+ui_menu_footer() {
+    local LABEL=${1:-返回上一级}
+    local TONE=${2:-back}
+    ui_rule
+    ui_menu_item 0 "$LABEL" "$TONE"
+    ui_border
+}
+
+ui_choice_header() {
+    ui_section "$1"
+}
+
+ui_choice_footer() {
+    ui_rule
+}
+
+ui_read_choice() {
+    local VARIABLE=$1
+    local RANGE=$2
+    local DEFAULT=${3:-}
+    if [ -n "$DEFAULT" ]; then
+        printf '  %b请选择%b [%s，默认 %s]: ' "$CYAN" "$NC" "$RANGE" "$DEFAULT"
+    else
+        printf '  %b请选择%b [%s]: ' "$CYAN" "$NC" "$RANGE"
+    fi
+    if ! IFS= read -r "${VARIABLE?}"; then
+        printf -v "$VARIABLE" '%s' "${DEFAULT:-0}"
+    fi
+    if [ -n "$DEFAULT" ] && [ -z "${!VARIABLE}" ]; then
+        printf -v "$VARIABLE" '%s' "$DEFAULT"
+    fi
+}
+
 # ========== 打印 Banner ==========
 print_banner() {
     clear
-    echo -e "${BLUE}  =================================================${NC}"
-    echo -e "${BLUE}    Shadowsocks-Rust 管理脚本${NC}"
-    echo -e "${BLUE}    版本: ${VERSION}    快捷命令: volss${NC}"
-    echo -e "${BLUE}  =================================================${NC}"
-    echo ""
+    ui_border
+    echo -e "    ${CYAN}VOLSS${NC}  Shadowsocks-Rust 管理"
+    echo -e "    ${YELLOW}${VERSION}${NC}  |  快捷命令: ${GREEN}volss${NC}"
+    ui_border
 }
 
 # ========== 检查端口是否被占用 ==========
@@ -512,17 +572,17 @@ select_entry_hosts() {
     fi
 
     while true; do
-        echo -e "\n${YELLOW}>>> $CONTEXT 的连接入口${NC}"
-        echo -e "  1) IPv4  ${DETECTED_IPV4:-${RED}未检测到${NC}}"
-        echo -e "  2) IPv6  ${DETECTED_IPV6:-${RED}未检测到${NC}}"
+        ui_choice_header "$CONTEXT / 连接入口"
+        ui_menu_item 1 "IPv4  ${DETECTED_IPV4:-${RED}未检测到${NC}}"
+        ui_menu_item 2 "IPv6  ${DETECTED_IPV6:-${RED}未检测到${NC}}"
         if [ -n "${DETECTED_IPV4:-}" ] && [ -n "${DETECTED_IPV6:-}" ]; then
-            echo -e "  3) IPv4 + IPv6（生成两个入口，共用一个端口）"
+            ui_menu_item 3 "IPv4 + IPv6（两个入口，共用一个端口）"
         else
-            echo -e "  3) IPv4 + IPv6 ${RED}（需要同时检测到双栈地址）${NC}"
+            ui_menu_item 3 "IPv4 + IPv6 ${RED}（需要双栈地址）${NC}" warning
         fi
-        echo "  4) 手动输入域名或 IP"
-        read -r -p "请选择 [1-4，默认$DEFAULT_CHOICE]: " INPUT_CHOICE
-        INPUT_CHOICE=${INPUT_CHOICE:-$DEFAULT_CHOICE}
+        ui_menu_item 4 "手动输入域名或 IP"
+        ui_choice_footer
+        ui_read_choice INPUT_CHOICE "1-4" "$DEFAULT_CHOICE"
         case $INPUT_CHOICE in
             1)
                 [ -n "${DETECTED_IPV4:-}" ] || {
@@ -546,7 +606,8 @@ select_entry_hosts() {
                 ENTRY_HOSTS=("$DETECTED_IPV4" "$DETECTED_IPV6")
                 ;;
             4)
-                read -r -p "输入服务器域名或 IP: " INPUT_HOST
+                printf '  %b服务器域名或 IP%b: ' "$CYAN" "$NC"
+                read -r INPUT_HOST
                 if ! NORMALIZED=$(normalize_server_host "$INPUT_HOST" 2>/dev/null); then
                     echo -e "${RED}❌ 域名或 IP 格式无效${NC}"
                     continue
@@ -1026,10 +1087,13 @@ zero_traffic_counters_for_ports() {
 configure_traffic_backend_locked() {
     local CURRENT_BACKEND CHOICE NEW_BACKEND PORTS
     CURRENT_BACKEND=$(traffic_backend 2>/dev/null || echo none)
-    echo -e "当前流量统计后端: ${GREEN}$CURRENT_BACKEND${NC}"
-    echo "  1) nftables（inet 原生 IPv4/IPv6 双栈）"
-    echo "  2) iptables + ip6tables"
-    read -r -p "请选择 [1-2]: " CHOICE
+    ui_choice_header "切换流量统计后端"
+    echo -e "    当前使用: ${GREEN}$CURRENT_BACKEND${NC}"
+    echo ""
+    ui_menu_item 1 "nftables（inet 原生 IPv4/IPv6 双栈）"
+    ui_menu_item 2 "iptables + ip6tables"
+    ui_choice_footer
+    ui_read_choice CHOICE "1-2"
     case $CHOICE in
         1) NEW_BACKEND=nftables; ensure_nftables_available || { echo -e "${RED}nftables 不可用${NC}"; return 1; } ;;
         2) NEW_BACKEND=iptables; [ -n "$(firewall_tools)" ] || { echo -e "${RED}iptables 不可用${NC}"; return 1; } ;;
@@ -1345,13 +1409,14 @@ for asset in json.load(sys.stdin).get('assets', []):
 }
 
 select_method() {
-    echo -e "\n${YELLOW}>>> 选择加密方式：${NC}"
-    echo "  1) 2022-blake3-aes-128-gcm        (推荐，密钥16字节)"
-    echo "  2) 2022-blake3-aes-256-gcm        (强加密，密钥32字节)"
-    echo "  3) 2022-blake3-chacha20-poly1305   (ARM推荐，密钥32字节)"
-    echo "  4) aes-256-gcm                    (传统，兼容性好)"
-    echo "  5) chacha20-ietf-poly1305         (传统，兼容性好)"
-    read -r -p "请选择 [1-5，默认1]: " METHOD_CHOICE
+    ui_choice_header "安装配置 / 加密方式"
+    ui_menu_item 1 "2022-blake3-aes-128-gcm（推荐，16 字节密钥）"
+    ui_menu_item 2 "2022-blake3-aes-256-gcm（强加密，32 字节密钥）"
+    ui_menu_item 3 "2022-blake3-chacha20-poly1305（ARM 推荐）"
+    ui_menu_item 4 "aes-256-gcm（传统，兼容性好）"
+    ui_menu_item 5 "chacha20-ietf-poly1305（传统，兼容性好）"
+    ui_choice_footer
+    ui_read_choice METHOD_CHOICE "1-5" 1
 
     case $METHOD_CHOICE in
         2) METHOD="2022-blake3-aes-256-gcm";        KEY_LEN=32 ;;
@@ -1366,11 +1431,11 @@ select_method() {
 
 # ========== 端口分配 ==========
 select_ports() {
-    echo -e "\n${YELLOW}>>> 端口分配方式：${NC}"
-    echo "  1) 顺序端口（从指定端口开始，自动跳过占用端口）"
-    echo "  2) 随机端口（在指定范围内随机分配）"
-    read -r -p "请选择 [1-2，默认1]: " PORT_MODE
-    PORT_MODE=${PORT_MODE:-1}
+    ui_choice_header "安装配置 / 端口分配"
+    ui_menu_item 1 "顺序端口（从起始端口顺延，自动跳过占用）"
+    ui_menu_item 2 "随机端口（在指定范围内随机分配）"
+    ui_choice_footer
+    ui_read_choice PORT_MODE "1-2" 1
 
     read -r -p "生成用户数量 [默认 10，最多 50]: " USER_COUNT
     USER_COUNT=${USER_COUNT:-10}
@@ -2192,11 +2257,11 @@ export_client_menu() {
     echo "  Mihomo:  $MIHOMO_CONFIG"
     echo "  sing-box: $SINGBOX_CONFIG"
     echo "  二维码:  $QR_DIR"
-    echo -e "\n  0) 不在终端显示二维码"
-    echo "  1) Clash 配置二维码"
-    echo "  2) 选择一个 SS 链接二维码"
-    read -r -p "请选择 [0-2，默认0]: " QR_CHOICE
-    QR_CHOICE=${QR_CHOICE:-0}
+    ui_choice_header "终端二维码预览"
+    ui_menu_item 1 "显示 Clash 配置二维码"
+    ui_menu_item 2 "选择一个 SS 链接二维码"
+    ui_menu_footer "不显示，返回"
+    ui_read_choice QR_CHOICE "0-2" 0
     case $QR_CHOICE in
         1)
             if [ -f "$QR_DIR/clash-config.png" ]; then
@@ -2218,7 +2283,8 @@ with open(sys.argv[1], encoding='utf-8') as f:
         name = unquote(line.split('#', 1)[1]) if '#' in line else f'entry-{index}'
         print(f'  {index}) {name}  {authority}')
 PYEOF
-            read -r -p "输入链接编号: " NUM
+            printf '  %b链接编号%b: ' "$CYAN" "$NC"
+            read -r NUM
             if is_uint "$NUM" && [ "$NUM" -ge 1 ]; then
                 LINK=$(sed -n "${NUM}p" "$LINKS_FILE")
                 [ -n "$LINK" ] && printf '%s' "$LINK" | qrencode -t ANSIUTF8 || echo -e "${RED}无效编号${NC}"
@@ -2812,7 +2878,8 @@ with open('$CONFIG') as f:
 print(c['servers'][0].get('server', '') if c.get('servers') else '')
 " 2>/dev/null)
     [ -n "$BIND_ADDRESS" ] || BIND_ADDRESS=$(server_bind_address)
-    echo -e "${YELLOW}>>> 添加新用户（加密方式: ${GREEN}$METHOD${YELLOW}）${NC}"
+    ui_choice_header "添加用户 / 基本设置"
+    echo -e "    加密方式: ${GREEN}$METHOD${NC}"
 
     read -r -p "新增用户数量 [默认 1]: " ADD_COUNT
     ADD_COUNT=${ADD_COUNT:-1}
@@ -2820,10 +2887,11 @@ print(c['servers'][0].get('server', '') if c.get('servers') else '')
         echo -e "${RED}❌ 数量必须是正整数${NC}"; return
     fi
 
-    echo -e "\n  1) 自动分配端口（从现有最大端口+1 顺延，跳过占用）"
-    echo -e "  2) 手动指定端口"
-    read -r -p "请选择 [1-2，默认1]: " ADD_MODE
-    ADD_MODE=${ADD_MODE:-1}
+    ui_choice_header "添加用户 / 端口分配"
+    ui_menu_item 1 "自动分配（从现有最大端口顺延）"
+    ui_menu_item 2 "手动指定端口"
+    ui_choice_footer
+    ui_read_choice ADD_MODE "1-2" 1
     if [ "$ADD_MODE" != "1" ] && [ "$ADD_MODE" != "2" ]; then
         echo -e "${RED}❌ 无效的端口分配方式${NC}"
         return 1
@@ -4241,6 +4309,7 @@ RULESET_URLS=(
     ["bt"]="BT下载|https://raw.githubusercontent.com/blocklistproject/Lists/master/torrent.txt,https://raw.githubusercontent.com/blocklistproject/Lists/master/piracy.txt"
     ["finance"]="金融理财|https://raw.githubusercontent.com/blocklistproject/Lists/master/fraud.txt,https://raw.githubusercontent.com/blocklistproject/Lists/master/phishing.txt"
 )
+RULESET_KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt" "finance")
 
 # GitHub 镜像列表，下载失败时自动切换
 GITHUB_MIRRORS=("https://raw.githubusercontent.com")
@@ -4417,191 +4486,205 @@ PYEOF
     fi
 }
 
-# 显示规则集菜单
-manage_rulesets_locked() {
-    init_ruleset_dir
-
+# 规则集操作拆分为短编号菜单，避免安装项和维护项混用 1-15。
+browse_builtin_rulesets() {
+    local CHOICE IDX KEY DESC URL COUNT STATUS i
     while true; do
-        echo -e "\n${BLUE}  =================================================${NC}"
-        echo -e "${BLUE}    ACL 规则集管理${NC}"
-        echo -e "${BLUE}  =================================================${NC}"
-
-        # 显示所有可用规则集和安装状态
-        local i=1
-        local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt" "finance")
-        for KEY in "${KEYS[@]}"; do
+        show_submenu_header "ACL 规则集 / 浏览内置规则"
+        i=1
+        for KEY in "${RULESET_KEYS[@]}"; do
             IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
             if [ -f "$ACL_RULESET_DIR/${KEY}.acl" ]; then
                 COUNT=$(wc -l < "$ACL_RULESET_DIR/${KEY}.acl")
-                STATUS="${GREEN}● 已安装 ($COUNT 条)${NC}"
+                STATUS="${GREEN}已安装 ($COUNT 条)${NC}"
             else
-                STATUS="${RED}○ 未安装${NC}"
+                STATUS="${YELLOW}未安装${NC}"
             fi
-            # 中文字符占2列宽，手动补空格对齐
-            # 用字节数和字符数的差值计算中文字符数（UTF-8 中文占3字节，差值/2=中文数）
-            DESC_LEN=${#DESC}
-            DESC_BYTES=$(printf '%s' "$DESC" | wc -c)
-            CN_CHARS=$(( (DESC_BYTES - DESC_LEN) / 2 ))
-            PAD=$((10 - DESC_LEN - CN_CHARS))
-            [ "$PAD" -lt 0 ] && PAD=0
-            SPACES=$(printf '%*s' "$PAD" '')
-            printf "  \033[0;32m%2d)\033[0m %-12s %s%s %b\n" "$i" "$KEY" "$DESC" "$SPACES" "$STATUS"
-            i=$((i+1))
+            printf "    ${GREEN}%2d)${NC} %-10s %-12s %b\n" "$i" "$KEY" "$DESC" "$STATUS"
+            i=$((i + 1))
         done
+        ui_menu_footer "返回规则集管理"
+        ui_read_choice CHOICE "0-${#RULESET_KEYS[@]}"
+        [ "$CHOICE" = "0" ] && return
+        if ! is_uint "$CHOICE" || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "${#RULESET_KEYS[@]}" ]; then
+            echo -e "${RED}无效选项${NC}"
+            sleep 1
+            continue
+        fi
 
-        echo -e "  ${BLUE}-------------------------------------------------${NC}"
-        echo -e "  ${GREEN}11)${NC} 安装全部规则集"
-        echo -e "  ${GREEN}12)${NC} 卸载某个规则集"
-        echo -e "  ${GREEN}13)${NC} 更新已安装规则集"
-        echo -e "  ${GREEN}14)${NC} 添加自定义规则集 URL"
-        echo -e "  ${GREEN}15)${NC} 查看当前生效规则数量"
-        echo -e "  ${RED} 0)${NC} 返回主菜单"
-        echo -e "${BLUE}  =================================================${NC}"
-        read -r -p "  请选择: " CHOICE
+        IDX=$((CHOICE - 1))
+        KEY=${RULESET_KEYS[$IDX]}
+        IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
+        if [ -f "$ACL_RULESET_DIR/${KEY}.acl" ]; then
+            printf "  ${YELLOW}%s 已安装，重新下载更新？[y/N]: ${NC}" "$DESC"
+            read -r CONFIRM
+            [[ "$CONFIRM" =~ ^[Yy]$ ]] || continue
+        fi
+        if download_ruleset "$KEY" "$URL"; then
+            rebuild_acl || echo -e "${RED}❌ 规则已下载，但应用 ACL 失败${NC}"
+        fi
+        pause_menu
+    done
+}
 
+install_all_rulesets() {
+    local KEY DESC URL OK=0 FAIL=0
+    local FAILED_RULESETS=()
+    echo -e "${YELLOW}>>> 安装全部规则集...${NC}"
+    for KEY in "${RULESET_KEYS[@]}"; do
+        IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
+        if download_ruleset "$KEY" "$URL"; then
+            OK=$((OK + 1))
+        else
+            FAIL=$((FAIL + 1))
+            FAILED_RULESETS+=("$KEY")
+        fi
+    done
+    if [ "$OK" -gt 0 ] && ! rebuild_acl; then
+        echo -e "${RED}❌ 规则集已下载，但应用 ACL 失败${NC}"
+        FAIL=$((FAIL + 1))
+    fi
+    if [ "$FAIL" -eq 0 ]; then
+        echo -e "${GREEN}✅ 全部规则集安装完成（成功 $OK 个）${NC}"
+    elif [ "$OK" -gt 0 ]; then
+        echo -e "${YELLOW}⚠ 规则集部分安装完成：成功 $OK 个，失败 $FAIL 个（${FAILED_RULESETS[*]}）${NC}"
+    else
+        echo -e "${RED}❌ 没有规则集安装成功，请检查网络或源地址${NC}"
+    fi
+}
+
+uninstall_ruleset() {
+    local INSTALLED_ARR=()
+    local f i CHOICE IDX DEL_NAME
+    for f in "$ACL_RULESET_DIR"/*.acl; do
+        [ -f "$f" ] || continue
+        INSTALLED_ARR+=("$(basename "$f" .acl)")
+    done
+    if [ ${#INSTALLED_ARR[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有已安装的规则集${NC}"
+        return
+    fi
+
+    ui_choice_header "卸载规则集"
+    for i in "${!INSTALLED_ARR[@]}"; do
+        ui_menu_item "$((i + 1))" "${INSTALLED_ARR[$i]}" danger
+    done
+    ui_menu_footer "取消"
+    ui_read_choice CHOICE "0-${#INSTALLED_ARR[@]}"
+    [ "$CHOICE" = "0" ] && return
+    if ! is_uint "$CHOICE" || [ "$CHOICE" -lt 1 ] || [ "$CHOICE" -gt "${#INSTALLED_ARR[@]}" ]; then
+        echo -e "${RED}无效编号${NC}"
+        return 1
+    fi
+    IDX=$((CHOICE - 1))
+    DEL_NAME=${INSTALLED_ARR[$IDX]}
+    rm -f "$ACL_RULESET_DIR/${DEL_NAME}.acl"
+    if rebuild_acl; then
+        echo -e "${GREEN}✅ 已卸载: $DEL_NAME${NC}"
+    else
+        echo -e "${RED}❌ 规则集文件已删除，但应用 ACL 失败${NC}"
+    fi
+}
+
+update_installed_rulesets() {
+    local RULESET_FILE KEY DESC URL OK=0 FAIL=0 SKIP=0
+    local FAILED_RULESETS=()
+    local SKIPPED_RULESETS=()
+    echo -e "${YELLOW}>>> 更新已安装规则集...${NC}"
+    for RULESET_FILE in "$ACL_RULESET_DIR"/*.acl; do
+        [ -f "$RULESET_FILE" ] || continue
+        KEY=$(basename "$RULESET_FILE" .acl)
+        if [ -n "${RULESET_URLS[$KEY]:-}" ]; then
+            IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
+            if download_ruleset "$KEY" "$URL"; then
+                OK=$((OK + 1))
+            else
+                FAIL=$((FAIL + 1))
+                FAILED_RULESETS+=("$KEY")
+            fi
+        else
+            SKIP=$((SKIP + 1))
+            SKIPPED_RULESETS+=("$KEY")
+        fi
+    done
+    if [ "$OK" -gt 0 ] && ! rebuild_acl; then
+        echo -e "${RED}❌ 规则集已更新，但应用 ACL 失败${NC}"
+        FAIL=$((FAIL + 1))
+    fi
+    if [ "$OK" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$SKIP" -eq 0 ]; then
+        echo -e "${YELLOW}没有已安装的规则集${NC}"
+    elif [ "$FAIL" -eq 0 ]; then
+        echo -e "${GREEN}✅ 更新完成（成功 $OK 个）${NC}"
+    elif [ "$OK" -gt 0 ]; then
+        echo -e "${YELLOW}⚠ 规则集部分更新完成：成功 $OK 个，失败 $FAIL 个（${FAILED_RULESETS[*]}，已保留旧规则）${NC}"
+    else
+        echo -e "${RED}❌ 已安装规则集更新失败（${FAILED_RULESETS[*]}，已保留旧规则）${NC}"
+    fi
+    [ "$SKIP" -gt 0 ] && echo -e "${YELLOW}⚠ 已跳过自定义规则集（未保存 URL）: ${SKIPPED_RULESETS[*]}${NC}"
+}
+
+add_custom_ruleset() {
+    local CUSTOM_NAME CUSTOM_URL
+    printf '  %b规则集名称%b（英文，如 mylist）: ' "$CYAN" "$NC"
+    read -r CUSTOM_NAME
+    printf '  %b规则集 URL%b: ' "$CYAN" "$NC"
+    read -r CUSTOM_URL
+    if ! valid_ruleset_name "$CUSTOM_NAME"; then
+        echo -e "${RED}规则集名称只能包含英文、数字、下划线和中划线${NC}"
+    elif [[ ! "$CUSTOM_URL" =~ ^https?:// ]]; then
+        echo -e "${RED}规则集 URL 必须以 http:// 或 https:// 开头${NC}"
+    else
+        RULESET_URLS["$CUSTOM_NAME"]="自定义|$CUSTOM_URL"
+        if download_ruleset "$CUSTOM_NAME" "$CUSTOM_URL"; then
+            rebuild_acl || echo -e "${RED}❌ 规则已下载，但应用 ACL 失败${NC}"
+        fi
+    fi
+}
+
+show_ruleset_stats() {
+    local TOTAL RULESET_FILE NAME COUNT MANUAL
+    ui_choice_header "当前生效规则统计"
+    if [ -f "$ACL_PATH" ]; then
+        TOTAL=$(grep -c "^||" "$ACL_PATH" 2>/dev/null || true)
+        echo -e "    总规则数: ${GREEN}$TOTAL 条${NC}"
+        echo ""
+        for RULESET_FILE in "$ACL_RULESET_DIR"/*.acl; do
+            [ -f "$RULESET_FILE" ] || continue
+            NAME=$(basename "$RULESET_FILE" .acl)
+            COUNT=$(wc -l < "$RULESET_FILE")
+            printf "    %-15s %s 条\n" "$NAME" "$COUNT"
+        done
+        MANUAL=$(manual_domain_count)
+        [ "$MANUAL" -gt 0 ] && printf "    %-15s %s 条\n" "手动添加" "$MANUAL"
+    else
+        echo "    未配置 ACL"
+    fi
+    ui_choice_footer
+}
+
+manage_rulesets_locked() {
+    local CHOICE
+    init_ruleset_dir
+    while true; do
+        show_submenu_header "ACL 规则集管理"
+        ui_menu_item 1 "浏览/安装内置规则集"
+        ui_menu_item 2 "安装全部内置规则集"
+        ui_menu_item 3 "卸载规则集" danger
+        ui_menu_item 4 "更新已安装规则集"
+        ui_menu_item 5 "添加自定义规则集 URL"
+        ui_menu_item 6 "查看当前生效规则统计"
+        ui_menu_footer "返回 ACL 黑名单"
+        ui_read_choice CHOICE "0-6"
         case $CHOICE in
-            [1-9]|10)
-                local IDX=$((CHOICE-1))
-                local KEY="${KEYS[$IDX]}"
-                IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
-                if [ -f "$ACL_RULESET_DIR/${KEY}.acl" ]; then
-                    echo -e "${YELLOW}$DESC 已安装，重新下载更新？[y/N]${NC}"
-                    read -r -p "" CONFIRM
-                    [[ ! "$CONFIRM" =~ ^[Yy]$ ]] && continue
-                fi
-                if download_ruleset "$KEY" "$URL"; then
-                    rebuild_acl || echo -e "${RED}❌ 规则已下载，但应用 ACL 失败${NC}"
-                fi
-                ;;
-            11)
-                echo -e "${YELLOW}>>> 安装全部规则集...${NC}"
-                local KEYS=("ads" "adult" "gambling" "malware" "scam" "tracking" "crypto" "dating" "bt" "finance")
-                local OK=0 FAIL=0
-                local FAILED_RULESETS=()
-                for KEY in "${KEYS[@]}"; do
-                    IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
-                    if download_ruleset "$KEY" "$URL"; then
-                        OK=$((OK + 1))
-                    else
-                        FAIL=$((FAIL + 1))
-                        FAILED_RULESETS+=("$KEY")
-                    fi
-                done
-                if [ "$OK" -gt 0 ] && ! rebuild_acl; then
-                    echo -e "${RED}❌ 规则集已下载，但应用 ACL 失败${NC}"
-                    FAIL=$((FAIL + 1))
-                fi
-                if [ "$FAIL" -eq 0 ]; then
-                    echo -e "${GREEN}✅ 全部规则集安装完成（成功 $OK 个）${NC}"
-                elif [ "$OK" -gt 0 ]; then
-                    echo -e "${YELLOW}⚠ 规则集部分安装完成：成功 $OK 个，失败 $FAIL 个（${FAILED_RULESETS[*]}）${NC}"
-                else
-                    echo -e "${RED}❌ 没有规则集安装成功，请检查网络或源地址${NC}"
-                fi
-                ;;
-            12)
-                echo -e "\n已安装的规则集："
-                INSTALLED_ARR=()
-                for f in "$ACL_RULESET_DIR"/*.acl; do
-                    [ -f "$f" ] || continue
-                    INSTALLED_ARR+=("$(basename "$f" .acl)")
-                done
-                if [ ${#INSTALLED_ARR[@]} -eq 0 ]; then
-                    echo -e "${YELLOW}没有已安装的规则集${NC}"
-                else
-                    for i in "${!INSTALLED_ARR[@]}"; do
-                        echo "  $((i+1))) ${INSTALLED_ARR[$i]}"
-                    done
-                    read -r -p "输入要卸载的编号: " DEL_IDX
-                    IDX=$((DEL_IDX - 1))
-                    if [ $IDX -ge 0 ] && [ $IDX -lt ${#INSTALLED_ARR[@]} ]; then
-                        DEL_NAME="${INSTALLED_ARR[$IDX]}"
-                        rm -f "$ACL_RULESET_DIR/${DEL_NAME}.acl"
-                        if rebuild_acl; then
-                            echo -e "${GREEN}✅ 已卸载: $DEL_NAME${NC}"
-                        else
-                            echo -e "${RED}❌ 规则集文件已删除，但应用 ACL 失败${NC}"
-                        fi
-                    else
-                        echo -e "${RED}无效编号${NC}"
-                    fi
-                fi
-                ;;
-            13)
-                echo -e "${YELLOW}>>> 更新已安装规则集...${NC}"
-                local OK=0 FAIL=0 SKIP=0
-                local FAILED_RULESETS=()
-                local SKIPPED_RULESETS=()
-                for RULESET_FILE in "$ACL_RULESET_DIR"/*.acl; do
-                    [ -f "$RULESET_FILE" ] || continue
-                    KEY=$(basename "$RULESET_FILE" .acl)
-                    if [ -n "${RULESET_URLS[$KEY]}" ]; then
-                        IFS='|' read -r DESC URL <<< "${RULESET_URLS[$KEY]}"
-                        if download_ruleset "$KEY" "$URL"; then
-                            OK=$((OK + 1))
-                        else
-                            FAIL=$((FAIL + 1))
-                            FAILED_RULESETS+=("$KEY")
-                        fi
-                    else
-                        SKIP=$((SKIP + 1))
-                        SKIPPED_RULESETS+=("$KEY")
-                    fi
-                done
-                if [ "$OK" -gt 0 ] && ! rebuild_acl; then
-                    echo -e "${RED}❌ 规则集已更新，但应用 ACL 失败${NC}"
-                    FAIL=$((FAIL + 1))
-                fi
-                if [ "$OK" -eq 0 ] && [ "$FAIL" -eq 0 ] && [ "$SKIP" -eq 0 ]; then
-                    echo -e "${YELLOW}没有已安装的规则集${NC}"
-                elif [ "$FAIL" -eq 0 ]; then
-                    echo -e "${GREEN}✅ 更新完成（成功 $OK 个）${NC}"
-                elif [ "$OK" -gt 0 ]; then
-                    echo -e "${YELLOW}⚠ 规则集部分更新完成：成功 $OK 个，失败 $FAIL 个（${FAILED_RULESETS[*]}，已保留旧规则）${NC}"
-                else
-                    echo -e "${RED}❌ 已安装规则集更新失败（${FAILED_RULESETS[*]}，已保留旧规则）${NC}"
-                fi
-                [ "$SKIP" -gt 0 ] && echo -e "${YELLOW}⚠ 已跳过自定义规则集（未保存 URL，暂不能自动更新）: ${SKIPPED_RULESETS[*]}${NC}"
-                ;;
-            14)
-                read -r -p "规则集名称 (英文，如 mylist): " CUSTOM_NAME
-                read -r -p "规则集 URL: " CUSTOM_URL
-                if ! valid_ruleset_name "$CUSTOM_NAME"; then
-                    echo -e "${RED}规则集名称只能包含英文、数字、下划线和中划线${NC}"
-                elif [[ ! "$CUSTOM_URL" =~ ^https?:// ]]; then
-                    echo -e "${RED}规则集 URL 必须以 http:// 或 https:// 开头${NC}"
-                elif [ -n "$CUSTOM_NAME" ] && [ -n "$CUSTOM_URL" ]; then
-                    RULESET_URLS["$CUSTOM_NAME"]="自定义|$CUSTOM_URL"
-                    if download_ruleset "$CUSTOM_NAME" "$CUSTOM_URL"; then
-                        rebuild_acl || echo -e "${RED}❌ 规则已下载，但应用 ACL 失败${NC}"
-                    fi
-                fi
-                ;;
-            15)
-                echo -e "\n${BLUE}  =================================================${NC}"
-                echo -e "${BLUE}    当前生效规则统计${NC}"
-                echo -e "${BLUE}  =================================================${NC}"
-                if [ -f "$ACL_PATH" ]; then
-                    TOTAL=$(grep -c "^||" "$ACL_PATH")
-                    echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}"
-                    echo ""
-                    for RULESET_FILE in "$ACL_RULESET_DIR"/*.acl; do
-                        [ -f "$RULESET_FILE" ] || continue
-                        NAME=$(basename "$RULESET_FILE" .acl)
-                        COUNT=$(wc -l < "$RULESET_FILE")
-                        printf "  %-15s %s 条\n" "$NAME" "$COUNT"
-                    done
-                    MANUAL=$(manual_domain_count)
-                    [ "$MANUAL" -gt 0 ] && printf "  %-15s %s 条\n" "手动添加" "$MANUAL"
-                else
-                    echo -e "  未配置 ACL"
-                fi
-                echo -e "${BLUE}  =================================================${NC}"
-                ;;
+            1) browse_builtin_rulesets ;;
+            2) install_all_rulesets; pause_menu ;;
+            3) uninstall_ruleset; pause_menu ;;
+            4) update_installed_rulesets; pause_menu ;;
+            5) add_custom_ruleset; pause_menu ;;
+            6) show_ruleset_stats; pause_menu ;;
             0) return ;;
-            *) echo -e "${RED}无效选项${NC}" ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
         esac
-        read -r -p "按回车继续..."
     done
 }
 
@@ -4620,8 +4703,7 @@ pause_menu() {
 
 show_submenu_header() {
     print_banner
-    echo -e "  ${CYAN}$1${NC}"
-    echo -e "  ${BLUE}-------------------------------------------------${NC}"
+    ui_section "$1"
 }
 
 open_installed_menu() {
@@ -4680,14 +4762,13 @@ show_acl_list() {
 show_install_menu() {
     while true; do
         show_submenu_header "安装与更新"
-        echo "    1) 安装/重新安装 Shadowsocks-Rust"
-        echo "    2) 单独升级 ssserver"
-        echo "    3) 更新 VOLSS 脚本"
-        echo "    4) 安装/修复 volss 快捷命令"
-        echo -e "    ${RED}5) 卸载 Shadowsocks-Rust${NC}"
-        echo "    0) 返回首页"
-        echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-5]: " CHOICE
+        ui_menu_item 1 "安装/重新安装 Shadowsocks-Rust"
+        ui_menu_item 2 "单独升级 ssserver"
+        ui_menu_item 3 "更新 VOLSS 脚本"
+        ui_menu_item 4 "安装/修复 volss 快捷命令"
+        ui_menu_item 5 "卸载 Shadowsocks-Rust" danger
+        ui_menu_footer "返回首页"
+        ui_read_choice CHOICE "0-5"
         case $CHOICE in
             1) do_install ;;
             2) upgrade_ssserver; pause_menu ;;
@@ -4703,18 +4784,17 @@ show_install_menu() {
 show_user_menu() {
     while true; do
         show_submenu_header "用户管理"
-        echo "    1) 查看用户列表"
-        echo "    2) 添加新用户"
-        echo "    3) 修改用户名称"
-        echo "    4) 修改用户连接入口"
-        echo "    5) 设置流量配额/到期时间"
-        echo "    6) 暂停用户"
-        echo "    7) 恢复用户"
-        echo -e "    ${RED}8) 删除用户${NC}"
-        echo -e "    ${YELLOW}9) 重新生成所有用户密码${NC}"
-        echo "    0) 返回首页"
-        echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-9]: " CHOICE
+        ui_menu_item 1 "查看用户列表"
+        ui_menu_item 2 "添加新用户"
+        ui_menu_item 3 "修改用户名称"
+        ui_menu_item 4 "修改用户连接入口"
+        ui_menu_item 5 "设置流量配额/到期时间"
+        ui_menu_item 6 "暂停用户" warning
+        ui_menu_item 7 "恢复用户"
+        ui_menu_item 8 "删除用户" danger
+        ui_menu_item 9 "重新生成所有用户密码" warning
+        ui_menu_footer "返回首页"
+        ui_read_choice CHOICE "0-9"
         case $CHOICE in
             1) list_users; pause_menu ;;
             2) add_user; pause_menu ;;
@@ -4734,11 +4814,10 @@ show_user_menu() {
 show_link_menu() {
     while true; do
         show_submenu_header "链接与客户端导出"
-        echo "    1) 查看所有 SS 链接"
-        echo "    2) 导出 Clash/Mihomo/sing-box 和二维码"
-        echo "    0) 返回首页"
-        echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-2]: " CHOICE
+        ui_menu_item 1 "查看所有 SS 链接"
+        ui_menu_item 2 "导出 Clash/Mihomo/sing-box 和二维码"
+        ui_menu_footer "返回首页"
+        ui_read_choice CHOICE "0-2"
         case $CHOICE in
             1) show_links; pause_menu ;;
             2) export_client_menu; pause_menu ;;
@@ -4751,12 +4830,11 @@ show_link_menu() {
 show_traffic_menu() {
     while true; do
         show_submenu_header "流量统计"
-        echo "    1) 查看流量统计"
-        echo "    2) 重置流量统计"
-        echo "    3) 切换统计后端"
-        echo "    0) 返回首页"
-        echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-3]: " CHOICE
+        ui_menu_item 1 "查看流量统计"
+        ui_menu_item 2 "重置流量统计" warning
+        ui_menu_item 3 "切换统计后端"
+        ui_menu_footer "返回首页"
+        ui_read_choice CHOICE "0-3"
         case $CHOICE in
             1) show_traffic; pause_menu ;;
             2) reset_traffic; pause_menu ;;
@@ -4770,13 +4848,12 @@ show_traffic_menu() {
 show_acl_menu() {
     while true; do
         show_submenu_header "ACL 黑名单"
-        echo "    1) 手动添加屏蔽域名"
-        echo "    2) 手动删除屏蔽域名"
-        echo "    3) 查看黑名单"
-        echo "    4) 规则集管理"
-        echo "    0) 返回首页"
-        echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-4]: " CHOICE
+        ui_menu_item 1 "手动添加屏蔽域名"
+        ui_menu_item 2 "手动删除屏蔽域名" warning
+        ui_menu_item 3 "查看黑名单"
+        ui_menu_item 4 "规则集管理"
+        ui_menu_footer "返回首页"
+        ui_read_choice CHOICE "0-4"
         case $CHOICE in
             1) add_acl_domain; pause_menu ;;
             2) del_acl_domain; pause_menu ;;
@@ -4791,16 +4868,15 @@ show_acl_menu() {
 show_service_menu() {
     while true; do
         show_submenu_header "服务与诊断"
-        echo "    1) 查看服务状态"
-        echo "    2) 启动服务"
-        echo "    3) 停止服务"
-        echo "    4) 重启服务"
-        echo "    5) 查看实时日志"
-        echo "    6) 时间同步"
-        echo "    7) 系统健康检查"
-        echo "    0) 返回首页"
-        echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-7]: " CHOICE
+        ui_menu_item 1 "查看服务状态"
+        ui_menu_item 2 "启动服务"
+        ui_menu_item 3 "停止服务" warning
+        ui_menu_item 4 "重启服务" warning
+        ui_menu_item 5 "查看实时日志"
+        ui_menu_item 6 "时间同步"
+        ui_menu_item 7 "系统健康检查"
+        ui_menu_footer "返回首页"
+        ui_read_choice CHOICE "0-7"
         case $CHOICE in
             1) svc_status; pause_menu ;;
             2) svc_start && echo -e "${GREEN}✅ 服务已启动${NC}"; pause_menu ;;
@@ -4827,11 +4903,10 @@ show_service_menu() {
 show_data_menu() {
     while true; do
         show_submenu_header "备份与恢复"
-        echo "    1) 备份配置/ACL/流量数据"
-        echo "    2) 恢复配置/ACL/流量数据"
-        echo "    0) 返回首页"
-        echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-2]: " CHOICE
+        ui_menu_item 1 "备份配置/ACL/流量数据"
+        ui_menu_item 2 "恢复配置/ACL/流量数据" warning
+        ui_menu_footer "返回首页"
+        ui_read_choice CHOICE "0-2"
         case $CHOICE in
             1) backup_data; pause_menu ;;
             2) restore_data; pause_menu ;;
@@ -4845,21 +4920,21 @@ render_main_menu() {
     local INSTALL_STATUS=$1
     local SERVICE_STATUS=$2
     local CLOCK_STATUS=$3
-    echo -e "  ${BLUE}=================================================${NC}"
-    echo -e "    Shadowsocks-Rust 管理脚本    ${VERSION}    volss"
-    echo -e "  ${BLUE}=================================================${NC}"
+    ui_border
+    echo -e "    ${CYAN}VOLSS${NC}  Shadowsocks-Rust 管理"
+    echo -e "    ${YELLOW}${VERSION}${NC}  |  快捷命令: ${GREEN}volss${NC}"
+    ui_border
     printf "    安装: %-20b 服务: %-20b\n" "$INSTALL_STATUS" "$SERVICE_STATUS"
     printf "    时间: %b\n" "$CLOCK_STATUS"
-    echo -e "  ${BLUE}-------------------------------------------------${NC}"
-    echo "    1) 安装与更新"
-    echo "    2) 用户管理"
-    echo "    3) 链接与客户端导出"
-    echo "    4) 流量统计"
-    echo "    5) ACL 黑名单"
-    echo "    6) 服务与诊断"
-    echo "    7) 备份与恢复"
-    echo -e "    ${RED}0) 退出${NC}"
-    echo -e "  ${BLUE}=================================================${NC}"
+    ui_section "功能导航"
+    ui_menu_item 1 "安装与更新"
+    ui_menu_item 2 "用户管理"
+    ui_menu_item 3 "链接与客户端导出"
+    ui_menu_item 4 "流量统计"
+    ui_menu_item 5 "ACL 黑名单"
+    ui_menu_item 6 "服务与诊断"
+    ui_menu_item 7 "备份与恢复"
+    ui_menu_footer "退出" danger
 }
 
 show_main_menu() {
@@ -4887,7 +4962,7 @@ show_main_menu() {
         TIME_STATUS=$(format_time_diff "$TIME_DIFF")
 
         render_main_menu "$SS_STATUS" "$SVC_LABEL" "$TIME_STATUS"
-        read -r -p "  请选择 [0-7]: " CHOICE
+        ui_read_choice CHOICE "0-7"
 
         case $CHOICE in
             1) show_install_menu ;;
