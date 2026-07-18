@@ -406,7 +406,9 @@ test_install_shortcut() {
 test_main_menu_layout() {
     local OUTPUT
     OUTPUT=$(render_main_menu "已安装" "运行中" "已同步" | strip_ansi)
-    assert_true "main menu shows VOLSS brand" grep -Fq 'VOLSS  Shadowsocks-Rust 管理' <<< "$OUTPUT"
+    assert_true "main menu shows large VOLSS brand" grep -Fq '██╗   ██╗ ██████╗ ██╗     ███████╗███████╗' <<< "$OUTPUT"
+    assert_true "main menu shows script subtitle" grep -Fq 'Shadowsocks-Rust 管理脚本' <<< "$OUTPUT"
+    assert_true "main menu shows timestamp" grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' <<< "$OUTPUT"
     assert_true "main menu shows navigation heading" grep -Fq '功能导航' <<< "$OUTPUT"
     assert_true "main menu starts with install category" grep -Fq '1) 安装与更新' <<< "$OUTPUT"
     assert_true "main menu groups user management" grep -Fq '2) 用户管理' <<< "$OUTPUT"
@@ -425,7 +427,7 @@ test_submenu_layouts() {
     clear() { :; }
     for MENU in show_install_menu show_user_menu show_link_menu show_traffic_menu show_acl_menu show_service_menu show_data_menu; do
         OUTPUT=$("$MENU" <<< $'0\n' | strip_ansi) || fail "$MENU returns to homepage"
-        assert_true "$MENU uses shared VOLSS banner" grep -Fq 'VOLSS  Shadowsocks-Rust 管理' <<< "$OUTPUT"
+        assert_true "$MENU uses shared VOLSS banner" grep -Fq 'Shadowsocks-Rust 管理脚本' <<< "$OUTPUT"
         assert_true "$MENU separates return action" grep -Fq -- '-------------------------------------------------' <<< "$OUTPUT"
         assert_true "$MENU has homepage return" grep -Fq '0) 返回首页' <<< "$OUTPUT"
     done

@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.6.4
+#   版本: V1.6.5
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.6.4"
+VERSION="V1.6.5"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -385,12 +385,25 @@ ui_read_choice() {
 }
 
 # ========== 打印 Banner ==========
+render_brand_header() {
+    local CURRENT_TIME
+    CURRENT_TIME=$(date '+%Y-%m-%d %H:%M:%S')
+    printf '%b' "$CYAN"
+    cat << 'EOF'
+  ██╗   ██╗ ██████╗ ██╗     ███████╗███████╗
+  ██║   ██║██╔═══██╗██║     ██╔════╝██╔════╝
+  ██║   ██║██║   ██║██║     ███████╗███████╗
+  ╚██╗ ██╔╝██║   ██║██║     ╚════██║╚════██║
+   ╚████╔╝ ╚██████╔╝███████╗███████║███████║
+    ╚═══╝   ╚═════╝ ╚══════╝╚══════╝╚══════╝
+EOF
+    echo -e "${NC}  Shadowsocks-Rust 管理脚本"
+    echo -e "  ${YELLOW}${VERSION}${NC}  |  ${CURRENT_TIME}  |  ${GREEN}volss${NC}"
+}
+
 print_banner() {
     clear
-    ui_border
-    echo -e "    ${CYAN}VOLSS${NC}  Shadowsocks-Rust 管理"
-    echo -e "    ${YELLOW}${VERSION}${NC}  |  快捷命令: ${GREEN}volss${NC}"
-    ui_border
+    render_brand_header
 }
 
 # ========== 检查端口是否被占用 ==========
@@ -4920,10 +4933,8 @@ render_main_menu() {
     local INSTALL_STATUS=$1
     local SERVICE_STATUS=$2
     local CLOCK_STATUS=$3
-    ui_border
-    echo -e "    ${CYAN}VOLSS${NC}  Shadowsocks-Rust 管理"
-    echo -e "    ${YELLOW}${VERSION}${NC}  |  快捷命令: ${GREEN}volss${NC}"
-    ui_border
+    render_brand_header
+    echo ""
     printf "    安装: %-20b 服务: %-20b\n" "$INSTALL_STATUS" "$SERVICE_STATUS"
     printf "    时间: %b\n" "$CLOCK_STATUS"
     ui_section "功能导航"
