@@ -399,6 +399,31 @@ test_install_shortcut() {
     assert_eq "$BEFORE" "$(sha256_file "$SHORTCUT")" "do not overwrite another program"
 }
 
+test_main_menu_layout() {
+    local OUTPUT
+    OUTPUT=$(render_main_menu "已安装" "运行中" "已同步")
+    assert_true "main menu starts with install category" grep -Fq '1) 安装与更新' <<< "$OUTPUT"
+    assert_true "main menu groups user management" grep -Fq '2) 用户管理' <<< "$OUTPUT"
+    assert_true "main menu groups client exports" grep -Fq '3) 链接与客户端导出' <<< "$OUTPUT"
+    assert_true "main menu ends with backup category" grep -Fq '7) 备份与恢复' <<< "$OUTPUT"
+    assert_eq "7" "$(grep -Ec '^    [1-7]\)' <<< "$OUTPUT")" "main menu uses consecutive category numbers"
+    assert_true "main menu keeps zero as exit" grep -Fq '0) 退出' <<< "$OUTPUT"
+    if grep -Eq '^ +([89]|[1-9][0-9]+)\)' <<< "$OUTPUT"; then
+        fail "main menu exposes legacy high-numbered actions"
+    fi
+    TESTS=$((TESTS + 1))
+}
+
+test_user_submenu_routing() {
+    SUBMENU_ACTION=""
+    show_submenu_header() { :; }
+    pause_menu() { :; }
+    list_users() { SUBMENU_ACTION="list-users"; }
+
+    show_user_menu <<< $'1\n0\n' >/dev/null || fail "return from user submenu"
+    assert_eq "list-users" "$SUBMENU_ACTION" "user submenu routes consecutive option 1"
+}
+
 test_add_user_custom_name() {
     CONFIG_DIR="$TMP_ROOT/add-name"
     CONFIG="$CONFIG_DIR/config.json"
@@ -597,5 +622,7 @@ test_port_listener_helper
 test_health_check
 test_ssserver_upgrade_preserves_config
 test_install_shortcut
+test_main_menu_layout
+test_user_submenu_routing
 
 echo "PASS: $TESTS assertions"

@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.6.2
+#   版本: V1.6.3
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.6.2"
+VERSION="V1.6.3"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -4614,9 +4614,257 @@ manage_rulesets() {
 #   主菜单
 # =============================================
 
+pause_menu() {
+    read -r -p "按回车继续..."
+}
+
+show_submenu_header() {
+    print_banner
+    echo -e "  ${CYAN}$1${NC}"
+    echo -e "  ${BLUE}-------------------------------------------------${NC}"
+}
+
+open_installed_menu() {
+    local MENU_FUNCTION=$1
+    if ! check_installed; then
+        echo -e "${RED}⚠ 请先进入「安装与更新」安装 Shadowsocks-Rust${NC}"
+        sleep 2
+        return
+    fi
+    "$MENU_FUNCTION"
+}
+
+show_acl_list() {
+    echo -e "\n${BLUE}  =================================================${NC}"
+    echo -e "${BLUE}    ACL 黑名单${NC}"
+    echo -e "${BLUE}  =================================================${NC}"
+    if [ ! -f "$ACL_PATH" ]; then
+        echo "  未配置 ACL"
+        echo -e "${BLUE}  =================================================${NC}"
+        return
+    fi
+
+    local TOTAL MANUAL_COUNT RULESET_COUNT FOUND=0 NAME COUNT i
+    TOTAL=$(grep -c "^||" "$ACL_PATH" 2>/dev/null || true)
+    MANUAL_COUNT=$(manual_domain_count)
+    RULESET_COUNT=$((TOTAL - MANUAL_COUNT))
+    [ "$RULESET_COUNT" -lt 0 ] && RULESET_COUNT=0
+    echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}（手动: $MANUAL_COUNT 条，规则集: $RULESET_COUNT 条）"
+
+    echo -e "\n  ${CYAN}── 手动添加 ($MANUAL_COUNT 条) ──${NC}"
+    if [ -s "$MANUAL_FILE" ]; then
+        i=1
+        while IFS= read -r line; do
+            [ -z "$line" ] && continue
+            echo "    $i) $line"
+            i=$((i + 1))
+        done < "$MANUAL_FILE"
+    else
+        echo "  （无）"
+    fi
+
+    echo -e "\n  ${CYAN}── 已安装规则集 ──${NC}"
+    if [ -d "$ACL_RULESET_DIR" ]; then
+        for f in "$ACL_RULESET_DIR"/*.acl; do
+            [ -f "$f" ] || continue
+            NAME=$(basename "$f" .acl)
+            COUNT=$(wc -l < "$f")
+            echo -e "  ${GREEN}●${NC} $NAME ($COUNT 条)"
+            FOUND=1
+        done
+    fi
+    [ "$FOUND" -eq 0 ] && echo "  （未安装任何规则集）"
+    echo -e "${BLUE}  =================================================${NC}"
+}
+
+show_install_menu() {
+    while true; do
+        show_submenu_header "安装与更新"
+        echo "    1) 安装/重新安装 Shadowsocks-Rust"
+        echo "    2) 单独升级 ssserver"
+        echo "    3) 更新 VOLSS 脚本"
+        echo "    4) 安装/修复 volss 快捷命令"
+        echo -e "    ${RED}5) 卸载 Shadowsocks-Rust${NC}"
+        echo "    0) 返回首页"
+        echo -e "  ${BLUE}=================================================${NC}"
+        read -r -p "  请选择 [0-5]: " CHOICE
+        case $CHOICE in
+            1) do_install ;;
+            2) upgrade_ssserver; pause_menu ;;
+            3) do_update; pause_menu ;;
+            4) install_shortcut; pause_menu ;;
+            5) do_uninstall; pause_menu ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+show_user_menu() {
+    while true; do
+        show_submenu_header "用户管理"
+        echo "    1) 查看用户列表"
+        echo "    2) 添加新用户"
+        echo "    3) 修改用户名称"
+        echo "    4) 修改用户连接入口"
+        echo "    5) 设置流量配额/到期时间"
+        echo "    6) 暂停用户"
+        echo "    7) 恢复用户"
+        echo -e "    ${RED}8) 删除用户${NC}"
+        echo -e "    ${YELLOW}9) 重新生成所有用户密码${NC}"
+        echo "    0) 返回首页"
+        echo -e "  ${BLUE}=================================================${NC}"
+        read -r -p "  请选择 [0-9]: " CHOICE
+        case $CHOICE in
+            1) list_users; pause_menu ;;
+            2) add_user; pause_menu ;;
+            3) rename_user; pause_menu ;;
+            4) configure_user_entries; pause_menu ;;
+            5) configure_user_policy; pause_menu ;;
+            6) disable_user; pause_menu ;;
+            7) enable_user; pause_menu ;;
+            8) delete_user; pause_menu ;;
+            9) regen_users; pause_menu ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+show_link_menu() {
+    while true; do
+        show_submenu_header "链接与客户端导出"
+        echo "    1) 查看所有 SS 链接"
+        echo "    2) 导出 Clash/Mihomo/sing-box 和二维码"
+        echo "    0) 返回首页"
+        echo -e "  ${BLUE}=================================================${NC}"
+        read -r -p "  请选择 [0-2]: " CHOICE
+        case $CHOICE in
+            1) show_links; pause_menu ;;
+            2) export_client_menu; pause_menu ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+show_traffic_menu() {
+    while true; do
+        show_submenu_header "流量统计"
+        echo "    1) 查看流量统计"
+        echo "    2) 重置流量统计"
+        echo "    3) 切换统计后端"
+        echo "    0) 返回首页"
+        echo -e "  ${BLUE}=================================================${NC}"
+        read -r -p "  请选择 [0-3]: " CHOICE
+        case $CHOICE in
+            1) show_traffic; pause_menu ;;
+            2) reset_traffic; pause_menu ;;
+            3) configure_traffic_backend; pause_menu ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+show_acl_menu() {
+    while true; do
+        show_submenu_header "ACL 黑名单"
+        echo "    1) 手动添加屏蔽域名"
+        echo "    2) 手动删除屏蔽域名"
+        echo "    3) 查看黑名单"
+        echo "    4) 规则集管理"
+        echo "    0) 返回首页"
+        echo -e "  ${BLUE}=================================================${NC}"
+        read -r -p "  请选择 [0-4]: " CHOICE
+        case $CHOICE in
+            1) add_acl_domain; pause_menu ;;
+            2) del_acl_domain; pause_menu ;;
+            3) show_acl_list; pause_menu ;;
+            4) manage_rulesets ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+show_service_menu() {
+    while true; do
+        show_submenu_header "服务与诊断"
+        echo "    1) 查看服务状态"
+        echo "    2) 启动服务"
+        echo "    3) 停止服务"
+        echo "    4) 重启服务"
+        echo "    5) 查看实时日志"
+        echo "    6) 时间同步"
+        echo "    7) 系统健康检查"
+        echo "    0) 返回首页"
+        echo -e "  ${BLUE}=================================================${NC}"
+        read -r -p "  请选择 [0-7]: " CHOICE
+        case $CHOICE in
+            1) svc_status; pause_menu ;;
+            2) svc_start && echo -e "${GREEN}✅ 服务已启动${NC}"; pause_menu ;;
+            3) svc_stop && echo -e "${YELLOW}⏹ 服务已停止${NC}"; pause_menu ;;
+            4) svc_restart && echo -e "${GREEN}🔄 服务已重启${NC}"; pause_menu ;;
+            5)
+                echo -e "${YELLOW}按 Ctrl+C 退出日志${NC}"
+                svc_log
+                pause_menu
+                ;;
+            6)
+                do_time_sync
+                TIME_DIFF=$(get_time_diff)
+                LAST_TIME_CHECK=$(date +%s)
+                pause_menu
+                ;;
+            7) health_check; pause_menu ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+show_data_menu() {
+    while true; do
+        show_submenu_header "备份与恢复"
+        echo "    1) 备份配置/ACL/流量数据"
+        echo "    2) 恢复配置/ACL/流量数据"
+        echo "    0) 返回首页"
+        echo -e "  ${BLUE}=================================================${NC}"
+        read -r -p "  请选择 [0-2]: " CHOICE
+        case $CHOICE in
+            1) backup_data; pause_menu ;;
+            2) restore_data; pause_menu ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+render_main_menu() {
+    local INSTALL_STATUS=$1
+    local SERVICE_STATUS=$2
+    local CLOCK_STATUS=$3
+    echo -e "  ${BLUE}=================================================${NC}"
+    echo -e "    Shadowsocks-Rust 管理脚本    ${VERSION}    volss"
+    echo -e "  ${BLUE}=================================================${NC}"
+    printf "    安装: %-20b 服务: %-20b\n" "$INSTALL_STATUS" "$SERVICE_STATUS"
+    printf "    时间: %b\n" "$CLOCK_STATUS"
+    echo -e "  ${BLUE}-------------------------------------------------${NC}"
+    echo "    1) 安装与更新"
+    echo "    2) 用户管理"
+    echo "    3) 链接与客户端导出"
+    echo "    4) 流量统计"
+    echo "    5) ACL 黑名单"
+    echo "    6) 服务与诊断"
+    echo "    7) 备份与恢复"
+    echo -e "    ${RED}0) 退出${NC}"
+    echo -e "  ${BLUE}=================================================${NC}"
+}
+
 show_main_menu() {
     while true; do
-        print_banner
+        clear
 
         # 状态检测
         if check_installed; then
@@ -4638,143 +4886,17 @@ show_main_menu() {
         fi
         TIME_STATUS=$(format_time_diff "$TIME_DIFF")
 
-        echo -e "  ${BLUE}=================================================${NC}"
-        echo -e "    Shadowsocks-Rust 管理脚本    ${VERSION}    快捷命令: volss"
-        echo -e "  ${BLUE}=================================================${NC}"
-        printf "    安装: %-20b 服务: %-20b\n" "$SS_STATUS" "$SVC_LABEL"
-        printf "    时间: %b\n" "$TIME_STATUS"
-        echo -e "  ${BLUE}-------------------------------------------------${NC}"
-        echo -e "  ${CYAN}  -- 安装管理 --${NC}"
-        echo -e "      1)  安装 Shadowsocks-Rust"
-        echo -e "      2)  卸载 Shadowsocks-Rust"
-        echo -e "      3)  更新脚本"
-        echo -e "     31)  安装/修复 volss 快捷命令"
-        echo -e "  ${CYAN}  -- 用户管理 --${NC}"
-        echo -e "      4)  查看用户列表"
-        echo -e "      5)  查看所有 SS 链接"
-        echo -e "      6)  添加新用户"
-        echo -e "      7)  暂停某个用户"
-        echo -e "      8)  恢复某个用户"
-        echo -e "      9)  删除某个用户"
-        echo -e "     10)  重新生成所有用户"
-        echo -e "     23)  修改用户名称"
-        echo -e "     25)  设置用户配额/到期时间"
-        echo -e "     32)  修改用户连接入口"
-        echo -e "  ${CYAN}  -- 导出与数据 --${NC}"
-        echo -e "     24)  导出客户端配置和二维码"
-        echo -e "     26)  备份配置/ACL/流量数据"
-        echo -e "     27)  恢复配置/ACL/流量数据"
-        echo -e "  ${CYAN}  -- 流量统计 --${NC}"
-        echo -e "     11)  查看流量统计"
-        echo -e "     12)  重置流量统计"
-        echo -e "     30)  切换流量统计后端"
-        echo -e "  ${CYAN}  -- ACL 黑名单 --${NC}"
-        echo -e "     13)  手动添加屏蔽域名"
-        echo -e "     14)  手动删除屏蔽域名"
-        echo -e "     15)  查看黑名单列表"
-        echo -e "     16)  规则集管理（广告/色情/赌博/BT等）"
-        echo -e "  ${CYAN}  -- 服务管理 --${NC}"
-        echo -e "     17)  查看服务状态"
-        echo -e "     18)  启动服务"
-        echo -e "     19)  停止服务"
-        echo -e "     20)  重启服务"
-        echo -e "     21)  查看实时日志"
-        echo -e "     22)  时间同步"
-        echo -e "     28)  单独升级 ssserver"
-        echo -e "     29)  系统健康检查"
-        echo -e "  ${BLUE}-------------------------------------------------${NC}"
-        echo -e "   ${RED}  0)  退出${NC}"
-        echo -e "  ${BLUE}=================================================${NC}"
-        read -r -p "  请选择 [0-32]: " CHOICE
-
-        # 未安装时拦截管理功能
-        if ! check_installed && [[ "$CHOICE" =~ ^([4-9]|1[0-9]|2[0-9]|30|32)$ ]]; then
-            echo -e "${RED}⚠ 请先安装 Shadowsocks-Rust（选项 1）${NC}"
-            sleep 2
-            continue
-        fi
+        render_main_menu "$SS_STATUS" "$SVC_LABEL" "$TIME_STATUS"
+        read -r -p "  请选择 [0-7]: " CHOICE
 
         case $CHOICE in
-            1)  do_install ;;
-            2)  do_uninstall ;;
-            3)  do_update ;;
-            31) install_shortcut; read -r -p "按回车继续..." ;;
-            4)  list_users;    read -r -p "按回车继续..." ;;
-            5)  show_links;    read -r -p "按回车继续..." ;;
-            6)  add_user;      read -r -p "按回车继续..." ;;
-            7)  disable_user;  read -r -p "按回车继续..." ;;
-            8)  enable_user;   read -r -p "按回车继续..." ;;
-            9)  delete_user;   read -r -p "按回车继续..." ;;
-            10) regen_users;   read -r -p "按回车继续..." ;;
-            23) rename_user;   read -r -p "按回车继续..." ;;
-            24) export_client_menu; read -r -p "按回车继续..." ;;
-            25) configure_user_policy; read -r -p "按回车继续..." ;;
-            26) backup_data; read -r -p "按回车继续..." ;;
-            27) restore_data; read -r -p "按回车继续..." ;;
-            28) upgrade_ssserver; read -r -p "按回车继续..." ;;
-            29) health_check; read -r -p "按回车继续..." ;;
-            30) configure_traffic_backend; read -r -p "按回车继续..." ;;
-            32) configure_user_entries; read -r -p "按回车继续..." ;;
-            11) show_traffic;  read -r -p "按回车继续..." ;;
-            12) reset_traffic; read -r -p "按回车继续..." ;;
-            13) add_acl_domain; read -r -p "按回车继续..." ;;
-            14) del_acl_domain; read -r -p "按回车继续..." ;;
-            15)
-                echo -e "\n${BLUE}  =================================================${NC}"
-                echo -e "${BLUE}    ACL 黑名单${NC}"
-                echo -e "${BLUE}  =================================================${NC}"
-                if [ -f "$ACL_PATH" ]; then
-                    TOTAL=$(grep -c "^||" "$ACL_PATH")
-                    MANUAL_COUNT=$(manual_domain_count)
-                    RULESET_COUNT=$((TOTAL - MANUAL_COUNT))
-                    [ "$RULESET_COUNT" -lt 0 ] && RULESET_COUNT=0
-                    echo -e "  总规则数: ${GREEN}$TOTAL 条${NC}（手动: $MANUAL_COUNT 条，规则集: $RULESET_COUNT 条）"
-
-                    echo -e "\n  ${CYAN}── 手动添加 ($MANUAL_COUNT 条) ──${NC}"
-                    if [ -f "$MANUAL_FILE" ] && [ -s "$MANUAL_FILE" ]; then
-                        i=1
-                        while IFS= read -r line; do
-                            [ -z "$line" ] && continue
-                            echo "    $i) $line"
-                            i=$((i+1))
-                        done < "$MANUAL_FILE"
-                    else
-                        echo "  （无）"
-                    fi
-
-                    echo -e "\n  ${CYAN}── 已安装规则集 ──${NC}"
-                    FOUND=0
-                    if [ -d "$ACL_RULESET_DIR" ]; then
-                        for f in "$ACL_RULESET_DIR"/*.acl; do
-                            [ -f "$f" ] || continue
-                            NAME=$(basename "$f" .acl)
-                            COUNT=$(wc -l < "$f")
-                            echo -e "  ${GREEN}●${NC} $NAME ($COUNT 条)  ${YELLOW}[查看详情请进入选项 16]${NC}"
-                            FOUND=1
-                        done
-                    fi
-                    [ "$FOUND" -eq 0 ] && echo "  （未安装任何规则集，请选择选项 16 安装）"
-                else
-                    echo "  未配置 ACL"
-                fi
-                read -r -p "按回车继续..."
-                ;;
-            16) manage_rulesets ;;
-            17) svc_status; read -r -p "按回车继续..." ;;
-            18) svc_start   && echo -e "${GREEN}✅ 服务已启动${NC}"; read -r -p "按回车继续..." ;;
-            19) svc_stop    && echo -e "${YELLOW}⏹ 服务已停止${NC}"; read -r -p "按回车继续..." ;;
-            20) svc_restart && echo -e "${GREEN}🔄 服务已重启${NC}"; read -r -p "按回车继续..." ;;
-            21)
-                echo -e "${YELLOW}按 Ctrl+C 退出日志${NC}"
-                svc_log
-                ;;
-            22)
-                do_time_sync
-                # 刷新时间差缓存
-                TIME_DIFF=$(get_time_diff)
-                LAST_TIME_CHECK=$(date +%s)
-                read -r -p "按回车继续..."
-                ;;
+            1) show_install_menu ;;
+            2) open_installed_menu show_user_menu ;;
+            3) open_installed_menu show_link_menu ;;
+            4) open_installed_menu show_traffic_menu ;;
+            5) open_installed_menu show_acl_menu ;;
+            6) open_installed_menu show_service_menu ;;
+            7) open_installed_menu show_data_menu ;;
             0)
                 echo -e "${GREEN}再见！${NC}"
                 exit 0
