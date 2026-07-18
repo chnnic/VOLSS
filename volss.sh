@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.6.5
+#   版本: V1.6.6
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.6.5"
+VERSION="V1.6.6"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -332,6 +332,10 @@ ui_rule() {
     echo -e "  ${BLUE}-------------------------------------------------${NC}"
 }
 
+ui_home_rule() {
+    echo -e "${BLUE}────────────────────────────────────────────────────────────${NC}"
+}
+
 ui_section() {
     echo ""
     echo -e "  ${CYAN}$1${NC}"
@@ -381,6 +385,15 @@ ui_read_choice() {
     fi
     if [ -n "$DEFAULT" ] && [ -z "${!VARIABLE}" ]; then
         printf -v "$VARIABLE" '%s' "$DEFAULT"
+    fi
+}
+
+ui_read_home_choice() {
+    local VARIABLE=$1
+    local RANGE=$2
+    printf '\n%b[?]%b 请选择 [%s]: ' "$CYAN" "$NC" "$RANGE"
+    if ! IFS= read -r "${VARIABLE?}"; then
+        printf -v "$VARIABLE" '%s' 0
     fi
 }
 
@@ -4930,22 +4943,34 @@ show_data_menu() {
 }
 
 render_main_menu() {
-    local INSTALL_STATUS=$1
-    local SERVICE_STATUS=$2
-    local CLOCK_STATUS=$3
+    local SERVICE_STATUS=$1
+    local CORE_VERSION=$2
+    local NODE_SUMMARY=$3
+    local CLOCK_STATUS=$4
     render_brand_header
     echo ""
-    printf "    安装: %-20b 服务: %-20b\n" "$INSTALL_STATUS" "$SERVICE_STATUS"
-    printf "    时间: %b\n" "$CLOCK_STATUS"
-    ui_section "功能导航"
+    printf "  状态: %b\n" "$SERVICE_STATUS"
+    printf "  核心: %s\n" "$CORE_VERSION"
+    printf "  节点: %s\n" "$NODE_SUMMARY"
+    printf "  时钟: %b\n" "$CLOCK_STATUS"
+    echo ""
+    ui_home_rule
+    echo -e "  ${CYAN}📦 系统管理${NC}"
     ui_menu_item 1 "安装与更新"
-    ui_menu_item 2 "用户管理"
-    ui_menu_item 3 "链接与客户端导出"
-    ui_menu_item 4 "流量统计"
-    ui_menu_item 5 "ACL 黑名单"
-    ui_menu_item 6 "服务与诊断"
+    ui_menu_item 2 "服务与诊断"
+    echo ""
+    echo -e "  ${CYAN}👥 用户与节点${NC}"
+    ui_menu_item 3 "用户管理"
+    ui_menu_item 4 "链接与客户端导出"
+    echo ""
+    echo -e "  ${CYAN}📊 流量与规则${NC}"
+    ui_menu_item 5 "流量统计"
+    ui_menu_item 6 "ACL 黑名单"
+    echo ""
+    echo -e "  ${CYAN}💾 数据维护${NC}"
     ui_menu_item 7 "备份与恢复"
-    ui_menu_footer "退出" danger
+    ui_home_rule
+    ui_menu_item 0 "退出" danger
 }
 
 show_main_menu() {
@@ -4954,16 +4979,30 @@ show_main_menu() {
 
         # 状态检测
         if check_installed; then
-            SS_STATUS="${GREEN}● 已安装${NC}"
             if check_svc_running; then
                 SVC_LABEL="${GREEN}● 运行中${NC}"
             else
                 SVC_LABEL="${RED}● 已停止${NC}"
             fi
+            CORE_VERSION=$("$SS_BIN" --version 2>/dev/null | awk 'NR == 1 { print $NF }')
+            CORE_VERSION=${CORE_VERSION:-未知}
+            INBOUND_COUNT=$(python3 -c "
+import json
+try:
+    with open('$CONFIG') as f:
+        print(len(json.load(f).get('servers', [])))
+except Exception:
+    print(0)
+")
+            LINK_COUNT=$(grep -c '^ss://' "$LINKS_FILE" 2>/dev/null || true)
+            LINK_COUNT=${LINK_COUNT:-0}
         else
-            SS_STATUS="${RED}● 未安装${NC}"
             SVC_LABEL="${RED}● 未运行${NC}"
+            CORE_VERSION="未安装"
+            INBOUND_COUNT=0
+            LINK_COUNT=0
         fi
+        NODE_SUMMARY="$INBOUND_COUNT 个入站 / $LINK_COUNT 条链接"
 
         # 获取时间差（缓存 60 秒避免每次刷新都请求网络）
         if [ -z "$LAST_TIME_CHECK" ] || [ $(($(date +%s) - LAST_TIME_CHECK)) -gt 60 ]; then
@@ -4972,16 +5011,16 @@ show_main_menu() {
         fi
         TIME_STATUS=$(format_time_diff "$TIME_DIFF")
 
-        render_main_menu "$SS_STATUS" "$SVC_LABEL" "$TIME_STATUS"
-        ui_read_choice CHOICE "0-7"
+        render_main_menu "$SVC_LABEL" "$CORE_VERSION" "$NODE_SUMMARY" "$TIME_STATUS"
+        ui_read_home_choice CHOICE "0-7"
 
         case $CHOICE in
             1) show_install_menu ;;
-            2) open_installed_menu show_user_menu ;;
-            3) open_installed_menu show_link_menu ;;
-            4) open_installed_menu show_traffic_menu ;;
-            5) open_installed_menu show_acl_menu ;;
-            6) open_installed_menu show_service_menu ;;
+            2) open_installed_menu show_service_menu ;;
+            3) open_installed_menu show_user_menu ;;
+            4) open_installed_menu show_link_menu ;;
+            5) open_installed_menu show_traffic_menu ;;
+            6) open_installed_menu show_acl_menu ;;
             7) open_installed_menu show_data_menu ;;
             0)
                 echo -e "${GREEN}再见！${NC}"

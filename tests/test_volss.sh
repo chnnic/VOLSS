@@ -405,14 +405,21 @@ test_install_shortcut() {
 
 test_main_menu_layout() {
     local OUTPUT
-    OUTPUT=$(render_main_menu "已安装" "运行中" "已同步" | strip_ansi)
+    OUTPUT=$(render_main_menu "● 运行中" "1.23.5" "2 个入站 / 3 条链接" "已同步" | strip_ansi)
     assert_true "main menu shows large VOLSS brand" grep -Fq '██╗   ██╗ ██████╗ ██╗     ███████╗███████╗' <<< "$OUTPUT"
     assert_true "main menu shows script subtitle" grep -Fq 'Shadowsocks-Rust 管理脚本' <<< "$OUTPUT"
     assert_true "main menu shows timestamp" grep -Eq '[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}' <<< "$OUTPUT"
-    assert_true "main menu shows navigation heading" grep -Fq '功能导航' <<< "$OUTPUT"
+    assert_true "main menu shows core version" grep -Fq '核心: 1.23.5' <<< "$OUTPUT"
+    assert_true "main menu shows node summary" grep -Fq '节点: 2 个入站 / 3 条链接' <<< "$OUTPUT"
+    assert_true "main menu groups system actions" grep -Fq '📦 系统管理' <<< "$OUTPUT"
+    assert_true "main menu groups user actions" grep -Fq '👥 用户与节点' <<< "$OUTPUT"
+    assert_true "main menu groups traffic actions" grep -Fq '📊 流量与规则' <<< "$OUTPUT"
     assert_true "main menu starts with install category" grep -Fq '1) 安装与更新' <<< "$OUTPUT"
-    assert_true "main menu groups user management" grep -Fq '2) 用户管理' <<< "$OUTPUT"
-    assert_true "main menu groups client exports" grep -Fq '3) 链接与客户端导出' <<< "$OUTPUT"
+    assert_true "main menu keeps service beside installation" grep -Fq '2) 服务与诊断' <<< "$OUTPUT"
+    assert_true "main menu groups user management" grep -Fq '3) 用户管理' <<< "$OUTPUT"
+    assert_true "main menu groups client exports" grep -Fq '4) 链接与客户端导出' <<< "$OUTPUT"
+    assert_true "main menu groups traffic management" grep -Fq '5) 流量统计' <<< "$OUTPUT"
+    assert_true "main menu groups ACL management" grep -Fq '6) ACL 黑名单' <<< "$OUTPUT"
     assert_true "main menu ends with backup category" grep -Fq '7) 备份与恢复' <<< "$OUTPUT"
     assert_eq "7" "$(grep -Ec '^ +[1-7]\)' <<< "$OUTPUT")" "main menu uses consecutive category numbers"
     assert_true "main menu keeps zero as exit" grep -Fq '0) 退出' <<< "$OUTPUT"
