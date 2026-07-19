@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.6.6
+#   版本: V1.7.0
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.6.6"
+VERSION="V1.7.0"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -81,6 +81,13 @@ TRAFFIC_CHAIN="VOLSS_TRAFFIC"
 STATE_LOCK_DIR="/run/volss.lock"
 SS_USER="ssrust"
 SS_GROUP="ssrust"
+VPS_TOOLS_SCRIPT="${VPS_TOOLS_SCRIPT:-/usr/local/bin/vps-tools}"
+VPS_TOOLS_URL="https://raw.githubusercontent.com/chnnic/SSH-Hardening/refs/heads/main/SSH-Hardening.sh"
+VPS_TOOLS_CHECKSUM_URL="https://raw.githubusercontent.com/chnnic/SSH-Hardening/refs/heads/main/SSH-Hardening.sh.sha256"
+DDNS_ZONE_FILE="${DDNS_ZONE_FILE:-/root/.cf_zone}"
+DDNS_SCRIPT="${DDNS_SCRIPT:-/root/ddns.sh}"
+DDNS_DEFAULT_LOG="${DDNS_DEFAULT_LOG:-/var/log/ddns.log}"
+DDNS_CRON_MARKER="# VPS_TOOLS_DDNS"
 
 # ========== 安全写入与权限 ==========
 make_temp_for() {
@@ -524,6 +531,157 @@ print(ascii_host)
 PYEOF
 }
 
+# 仅解析开荒脚本 DDNS 的非敏感配置，不 source 配置文件。
+volss_ddns_cfg_get() {
+    local KEY=$1
+    [ -f "$DDNS_ZONE_FILE" ] || return 1
+    grep -m 1 "^${KEY}=" "$DDNS_ZONE_FILE" 2>/dev/null | cut -d= -f2-
+}
+
+volss_ddns_truthy() {
+    case "$1" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+volss_ddns_provider() {
+    local PROVIDER
+    PROVIDER=$(volss_ddns_cfg_get PROVIDER 2>/dev/null || true)
+    case "$PROVIDER" in
+        huawei) echo huawei ;;
+        *) echo cloudflare ;;
+    esac
+}
+
+volss_ddns_provider_label() {
+    case "$(volss_ddns_provider)" in
+        huawei) echo "华为云 DNS" ;;
+        *) echo "Cloudflare" ;;
+    esac
+}
+
+volss_ddns_enable_a() {
+    local ENABLED MODE
+    ENABLED=$(volss_ddns_cfg_get ENABLE_A 2>/dev/null || true)
+    if [ -n "$ENABLED" ]; then
+        volss_ddns_truthy "$ENABLED"
+        return
+    fi
+    MODE=$(volss_ddns_cfg_get MODE 2>/dev/null || true)
+    [ "$MODE" != "ipv6" ] && [ "$MODE" != "aaaa" ]
+}
+
+volss_ddns_enable_aaaa() {
+    local ENABLED MODE
+    ENABLED=$(volss_ddns_cfg_get ENABLE_AAAA 2>/dev/null || true)
+    if [ -n "$ENABLED" ]; then
+        volss_ddns_truthy "$ENABLED"
+        return
+    fi
+    MODE=$(volss_ddns_cfg_get MODE 2>/dev/null || true)
+    [ "$MODE" = "dual" ] || [ "$MODE" = "ipv6" ] || [ "$MODE" = "aaaa" ]
+}
+
+volss_ddns_domain4() {
+    local DOMAIN
+    DOMAIN=$(volss_ddns_cfg_get DOMAIN4 2>/dev/null || true)
+    [ -n "$DOMAIN" ] || DOMAIN=$(volss_ddns_cfg_get DOMAIN 2>/dev/null || true)
+    printf '%s\n' "$DOMAIN"
+}
+
+volss_ddns_domain6() {
+    local DOMAIN MODE
+    DOMAIN=$(volss_ddns_cfg_get DOMAIN6 2>/dev/null || true)
+    if [ -z "$DOMAIN" ]; then
+        MODE=$(volss_ddns_cfg_get MODE 2>/dev/null || true)
+        case "$MODE" in
+            dual|ipv6|aaaa) DOMAIN=$(volss_ddns_cfg_get DOMAIN 2>/dev/null || true) ;;
+        esac
+    fi
+    printf '%s\n' "$DOMAIN"
+}
+
+volss_ddns_ipv4_host() {
+    local DOMAIN
+    volss_ddns_enable_a || return 1
+    DOMAIN=$(volss_ddns_domain4)
+    [ -n "$DOMAIN" ] || return 1
+    normalize_server_host "$DOMAIN"
+}
+
+volss_ddns_ipv6_host() {
+    local DOMAIN
+    volss_ddns_enable_aaaa || return 1
+    DOMAIN=$(volss_ddns_domain6)
+    [ -n "$DOMAIN" ] || return 1
+    normalize_server_host "$DOMAIN"
+}
+
+volss_ddns_load_entry_hosts() {
+    local DOMAIN4 DOMAIN6
+    DDNS_ENTRY_HOSTS=()
+    DOMAIN4=$(volss_ddns_ipv4_host 2>/dev/null || true)
+    DOMAIN6=$(volss_ddns_ipv6_host 2>/dev/null || true)
+    [ -n "$DOMAIN4" ] && DDNS_ENTRY_HOSTS+=("$DOMAIN4")
+    if [ -n "$DOMAIN6" ] && [ "$DOMAIN6" != "$DOMAIN4" ]; then
+        DDNS_ENTRY_HOSTS+=("$DOMAIN6")
+    fi
+    [ "${#DDNS_ENTRY_HOSTS[@]}" -gt 0 ]
+}
+
+volss_ddns_mode_label() {
+    local DOMAIN4 DOMAIN6 HAS_A=0 HAS_AAAA=0
+    DOMAIN4=$(volss_ddns_ipv4_host 2>/dev/null || true)
+    DOMAIN6=$(volss_ddns_ipv6_host 2>/dev/null || true)
+    [ -n "$DOMAIN4" ] && HAS_A=1
+    [ -n "$DOMAIN6" ] && HAS_AAAA=1
+    if [ "$HAS_A" -eq 1 ] && [ "$HAS_AAAA" -eq 1 ]; then
+        if [ "$DOMAIN4" = "$DOMAIN6" ]; then
+            echo "IPv4 + IPv6（同域名）"
+        else
+            echo "IPv4 + IPv6（分别设置）"
+        fi
+    elif [ "$HAS_AAAA" -eq 1 ]; then
+        echo "仅 IPv6"
+    elif [ "$HAS_A" -eq 1 ]; then
+        echo "仅 IPv4"
+    else
+        echo "未配置有效域名"
+    fi
+}
+
+volss_ddns_interval() {
+    local INTERVAL
+    INTERVAL=$(volss_ddns_cfg_get INTERVAL_MIN 2>/dev/null || true)
+    if [[ "$INTERVAL" =~ ^[0-9]+$ ]] && [ "$INTERVAL" -ge 1 ] && [ "$INTERVAL" -le 59 ]; then
+        echo "$INTERVAL"
+    else
+        echo 5
+    fi
+}
+
+volss_ddns_log_path() {
+    local LOG_PATH
+    LOG_PATH=$(volss_ddns_cfg_get LOG 2>/dev/null || true)
+    case "$LOG_PATH" in
+        /var/log/ddns.log|/root/ddns.log) printf '%s\n' "$LOG_PATH" ;;
+        *) printf '%s\n' "$DDNS_DEFAULT_LOG" ;;
+    esac
+}
+
+volss_ddns_cron_status() {
+    if [ ! -f "$DDNS_SCRIPT" ]; then
+        echo "未安装"
+    elif ! command -v crontab >/dev/null 2>&1; then
+        echo "未启用（无 crontab）"
+    elif crontab -l 2>/dev/null | grep -Fq -e "$DDNS_CRON_MARKER" -e "$DDNS_SCRIPT"; then
+        echo "运行中"
+    else
+        echo "已暂停"
+    fi
+}
+
 format_ss_host() {
     if [[ "$1" == *:* ]]; then
         printf '[%s]\n' "$1"
@@ -587,14 +745,17 @@ select_entry_hosts() {
     local SAVE_DEFAULT=${2:-0}
     local DEFAULT_CHOICE INPUT_CHOICE INPUT_HOST NORMALIZED
 
-    if [ -n "${DETECTED_IPV4:-}" ] && [ -n "${DETECTED_IPV6:-}" ]; then
+    volss_ddns_load_entry_hosts >/dev/null 2>&1 || true
+    if [ "${#DDNS_ENTRY_HOSTS[@]}" -gt 0 ]; then
+        DEFAULT_CHOICE=4
+    elif [ -n "${DETECTED_IPV4:-}" ] && [ -n "${DETECTED_IPV6:-}" ]; then
         DEFAULT_CHOICE=3
     elif [ -n "${DETECTED_IPV4:-}" ]; then
         DEFAULT_CHOICE=1
     elif [ -n "${DETECTED_IPV6:-}" ]; then
         DEFAULT_CHOICE=2
     else
-        DEFAULT_CHOICE=4
+        DEFAULT_CHOICE=5
     fi
 
     while true; do
@@ -606,9 +767,14 @@ select_entry_hosts() {
         else
             ui_menu_item 3 "IPv4 + IPv6 ${RED}（需要双栈地址）${NC}" warning
         fi
-        ui_menu_item 4 "手动输入域名或 IP"
+        if [ "${#DDNS_ENTRY_HOSTS[@]}" -gt 0 ]; then
+            ui_menu_item 4 "开荒脚本 DDNS  ${DDNS_ENTRY_HOSTS[*]}"
+        else
+            ui_menu_item 4 "开荒脚本 DDNS ${RED}（未配置有效域名）${NC}" warning
+        fi
+        ui_menu_item 5 "手动输入域名或 IP"
         ui_choice_footer
-        ui_read_choice INPUT_CHOICE "1-4" "$DEFAULT_CHOICE"
+        ui_read_choice INPUT_CHOICE "1-5" "$DEFAULT_CHOICE"
         case $INPUT_CHOICE in
             1)
                 [ -n "${DETECTED_IPV4:-}" ] || {
@@ -632,6 +798,13 @@ select_entry_hosts() {
                 ENTRY_HOSTS=("$DETECTED_IPV4" "$DETECTED_IPV6")
                 ;;
             4)
+                if [ "${#DDNS_ENTRY_HOSTS[@]}" -eq 0 ]; then
+                    echo -e "${RED}❌ 开荒脚本尚未配置有效 DDNS 域名${NC}"
+                    continue
+                fi
+                ENTRY_HOSTS=("${DDNS_ENTRY_HOSTS[@]}")
+                ;;
+            5)
                 printf '  %b服务器域名或 IP%b: ' "$CYAN" "$NC"
                 read -r INPUT_HOST
                 if ! NORMALIZED=$(normalize_server_host "$INPUT_HOST" 2>/dev/null); then
@@ -1592,18 +1765,31 @@ write_links_file() {
     local OUTPUT_PATH=$2
     local FALLBACK_HOST=$3
     local DEFAULT_NAME=$4
-    python3 - "$CONFIG_PATH" "$OUTPUT_PATH" "$FALLBACK_HOST" "$DEFAULT_NAME" << 'PYEOF'
+    local DDNS_IPV4_HOST DDNS_IPV6_HOST
+    DDNS_IPV4_HOST=$(volss_ddns_ipv4_host 2>/dev/null || true)
+    DDNS_IPV6_HOST=$(volss_ddns_ipv6_host 2>/dev/null || true)
+    python3 - "$CONFIG_PATH" "$OUTPUT_PATH" "$FALLBACK_HOST" "$DEFAULT_NAME" "$DDNS_IPV4_HOST" "$DDNS_IPV6_HOST" << 'PYEOF'
 import base64
 import ipaddress
 import json
 import sys
 from urllib.parse import quote
 
-config_path, output_path, fallback_host, default_name = sys.argv[1:]
+config_path, output_path, fallback_host, default_name, ddns_ipv4_host, ddns_ipv6_host = sys.argv[1:]
 with open(config_path, encoding='utf-8') as f:
     config = json.load(f)
 servers = config.get('servers', [])
 lines = []
+
+def entry_label(host, entry_index):
+    try:
+        return f'IPv{ipaddress.ip_address(host).version}'
+    except ValueError:
+        if ddns_ipv4_host != ddns_ipv6_host and host == ddns_ipv4_host:
+            return 'IPv4'
+        if ddns_ipv4_host != ddns_ipv6_host and host == ddns_ipv6_host:
+            return 'IPv6'
+        return f'Entry{entry_index}'
 
 for index, server in enumerate(servers, 1):
     hosts = server.get('entry_hosts')
@@ -1621,11 +1807,7 @@ for index, server in enumerate(servers, 1):
         authority = f'[{host}]' if ':' in host else host
         name = base_name
         if len(hosts) > 1:
-            try:
-                label = f'IPv{ipaddress.ip_address(host).version}'
-            except ValueError:
-                label = f'Entry{entry_index}'
-            name = f'{base_name}-{label}'
+            name = f'{base_name}-{entry_label(host, entry_index)}'
         lines.append(
             f"ss://{userinfo}@{authority}:{int(server['server_port'])}#{quote(name, safe='')}"
         )
@@ -2047,21 +2229,23 @@ show_links() {
 }
 
 generate_client_configs() {
-    local EXPORT_HOST
+    local EXPORT_HOST DDNS_IPV4_HOST DDNS_IPV6_HOST
     EXPORT_HOST=$(get_server_host 2>/dev/null) || {
         echo -e "${RED}❌ 未找到服务器地址，无法导出客户端配置${NC}"
         return 1
     }
     mkdir -p "$EXPORT_DIR" || return 1
+    DDNS_IPV4_HOST=$(volss_ddns_ipv4_host 2>/dev/null || true)
+    DDNS_IPV6_HOST=$(volss_ddns_ipv6_host 2>/dev/null || true)
 
-    if ! python3 - "$CONFIG" "$EXPORT_HOST" "$CLASH_CONFIG" "$MIHOMO_CONFIG" "$SINGBOX_CONFIG" << 'PYEOF'
+    if ! python3 - "$CONFIG" "$EXPORT_HOST" "$CLASH_CONFIG" "$MIHOMO_CONFIG" "$SINGBOX_CONFIG" "$DDNS_IPV4_HOST" "$DDNS_IPV6_HOST" << 'PYEOF'
 import json
 import ipaddress
 import os
 import sys
 import tempfile
 
-config_file, host, clash_file, mihomo_file, singbox_file = sys.argv[1:]
+config_file, host, clash_file, mihomo_file, singbox_file, ddns_ipv4_host, ddns_ipv6_host = sys.argv[1:]
 with open(config_file, encoding='utf-8') as f:
     config = json.load(f)
 servers = config.get('servers', [])
@@ -2088,17 +2272,23 @@ def unique_name(candidate, port):
     used_names.add(name)
     return name
 
+def entry_label(entry_host, entry_index):
+    try:
+        return f'IPv{ipaddress.ip_address(entry_host).version}'
+    except ValueError:
+        if ddns_ipv4_host != ddns_ipv6_host and entry_host == ddns_ipv4_host:
+            return 'IPv4'
+        if ddns_ipv4_host != ddns_ipv6_host and entry_host == ddns_ipv6_host:
+            return 'IPv6'
+        return f'Entry{entry_index}'
+
 for index, server in enumerate(servers, 1):
     base_name = str(server.get('name') or f'user-{index}').strip()
     hosts = entry_hosts(server)
     for entry_index, entry_host in enumerate(hosts, 1):
         candidate = base_name
         if len(hosts) > 1:
-            try:
-                label = f'IPv{ipaddress.ip_address(entry_host).version}'
-            except ValueError:
-                label = f'Entry{entry_index}'
-            candidate = f'{base_name}-{label}'
+            candidate = f'{base_name}-{entry_label(entry_host, entry_index)}'
         name = unique_name(candidate, server['server_port'])
         users.append((name, server, entry_host))
 
@@ -2212,14 +2402,18 @@ generate_qr_codes() {
     mkdir -p "$QR_DIR" || return 1
     rm -f "$QR_DIR"/ss-*.png "$QR_DIR"/clash-config.png
 
+    local DDNS_IPV4_HOST DDNS_IPV6_HOST
     local -a QR_LABELS QR_LINKS
+    DDNS_IPV4_HOST=$(volss_ddns_ipv4_host 2>/dev/null || true)
+    DDNS_IPV6_HOST=$(volss_ddns_ipv6_host 2>/dev/null || true)
     mapfile -t QR_LINKS < "$LINKS_FILE"
-    mapfile -t QR_LABELS < <(python3 - "$LINKS_FILE" << 'PYEOF'
+    mapfile -t QR_LABELS < <(python3 - "$LINKS_FILE" "$DDNS_IPV4_HOST" "$DDNS_IPV6_HOST" << 'PYEOF'
 import collections
 import ipaddress
 import sys
 
 entries = []
+ddns_ipv4_host, ddns_ipv6_host = sys.argv[2:]
 with open(sys.argv[1], encoding='utf-8') as f:
     for line in f:
         line = line.strip()
@@ -2242,7 +2436,12 @@ for index, (host, port) in enumerate(entries, 1):
         try:
             label = f'{port}-ipv{ipaddress.ip_address(host).version}'
         except ValueError:
-            label = f'{port}-entry{index}'
+            if ddns_ipv4_host != ddns_ipv6_host and host == ddns_ipv4_host:
+                label = f'{port}-ipv4'
+            elif ddns_ipv4_host != ddns_ipv6_host and host == ddns_ipv6_host:
+                label = f'{port}-ipv6'
+            else:
+                label = f'{port}-entry{index}'
     candidate = label
     serial = 2
     while candidate in used:
@@ -4723,6 +4922,218 @@ manage_rulesets() {
 #   主菜单
 # =============================================
 
+volss_vps_tools_script_valid() {
+    local SCRIPT_PATH=$1
+    [ -f "$SCRIPT_PATH" ] && [ -r "$SCRIPT_PATH" ] || return 1
+    bash -n "$SCRIPT_PATH" >/dev/null 2>&1 || return 1
+    grep -qE '^APP_VERSION="V[0-9]+\.[0-9]+(\.[0-9]+)?"|VPS 开荒脚本 V[0-9]+' "$SCRIPT_PATH" 2>/dev/null || return 1
+    grep -Fq 'APP_UI_TITLE="VPS TOOLS"' "$SCRIPT_PATH" 2>/dev/null || return 1
+    grep -Fq -- '--ddns-menu)' "$SCRIPT_PATH" 2>/dev/null
+}
+
+volss_find_vps_tools() {
+    local CANDIDATE RESOLVED
+    local -a CANDIDATES=("$VPS_TOOLS_SCRIPT")
+    if [ "${VOLSS_SKIP_VPS_TOOLS_SHORTCUTS:-0}" != "1" ]; then
+        CANDIDATE=$(command -v v 2>/dev/null || true)
+        [ -n "$CANDIDATE" ] && CANDIDATES+=("$CANDIDATE")
+        CANDIDATE=$(command -v V 2>/dev/null || true)
+        [ -n "$CANDIDATE" ] && CANDIDATES+=("$CANDIDATE")
+    fi
+    for CANDIDATE in "${CANDIDATES[@]}"; do
+        [ -n "$CANDIDATE" ] || continue
+        RESOLVED=$(readlink -f "$CANDIDATE" 2>/dev/null || true)
+        [ -n "$RESOLVED" ] || RESOLVED=$CANDIDATE
+        if volss_vps_tools_script_valid "$RESOLVED"; then
+            printf '%s\n' "$RESOLVED"
+            return 0
+        fi
+    done
+    return 1
+}
+
+volss_download_and_run_vps_tools_ddns() {
+    local TMP_DIR TMP_SCRIPT TMP_CHECKSUM EXPECTED STATUS
+    TMP_DIR=$(mktemp -d /tmp/volss-vps-tools.XXXXXX) || {
+        echo -e "${RED}❌ 无法创建临时目录${NC}"
+        return 1
+    }
+    TMP_SCRIPT="$TMP_DIR/SSH-Hardening.sh"
+    TMP_CHECKSUM="$TMP_DIR/SSH-Hardening.sh.sha256"
+
+    echo -e "${YELLOW}>>> 未找到本地 VPS Tools，正在下载官方脚本并校验...${NC}"
+    if ! fetch_url "$VPS_TOOLS_URL" "$TMP_SCRIPT" 30 || ! fetch_url "$VPS_TOOLS_CHECKSUM_URL" "$TMP_CHECKSUM" 30; then
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ VPS Tools 官方脚本或校验文件下载失败${NC}"
+        return 1
+    fi
+    EXPECTED=$(awk 'NR == 1 { print tolower($1) }' "$TMP_CHECKSUM")
+    if [[ ! "$EXPECTED" =~ ^[0-9a-f]{64}$ ]] || ! verify_sha256 "$TMP_SCRIPT" "$EXPECTED"; then
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ VPS Tools SHA256 校验失败，已拒绝执行${NC}"
+        return 1
+    fi
+    if ! volss_vps_tools_script_valid "$TMP_SCRIPT"; then
+        rm -rf "$TMP_DIR"
+        echo -e "${RED}❌ VPS Tools 脚本语法或项目标识校验失败，已拒绝执行${NC}"
+        return 1
+    fi
+    chmod 700 "$TMP_SCRIPT" 2>/dev/null || true
+    bash "$TMP_SCRIPT" --ddns-menu
+    STATUS=$?
+    rm -rf "$TMP_DIR"
+    return "$STATUS"
+}
+
+run_vps_tools_ddns_menu() {
+    local SCRIPT_PATH
+    if SCRIPT_PATH=$(volss_find_vps_tools); then
+        bash "$SCRIPT_PATH" --ddns-menu
+    else
+        volss_download_and_run_vps_tools_ddns
+    fi
+}
+
+volss_ddns_run_now() {
+    local LOG_PATH STATUS
+    if [ ! -f "$DDNS_SCRIPT" ] || ! bash -n "$DDNS_SCRIPT" >/dev/null 2>&1; then
+        echo -e "${RED}❌ DDNS 更新脚本不存在或语法无效，请先打开完整 DDNS 配置${NC}"
+        return 1
+    fi
+    echo -e "${YELLOW}>>> 正在立即更新 DDNS...${NC}"
+    bash "$DDNS_SCRIPT"
+    STATUS=$?
+    LOG_PATH=$(volss_ddns_log_path)
+    if [ "$STATUS" -eq 0 ]; then
+        echo -e "${GREEN}✅ DDNS 更新完成${NC}"
+        [ -f "$LOG_PATH" ] && tail -n 3 "$LOG_PATH"
+    else
+        echo -e "${RED}❌ DDNS 更新失败，请查看日志${NC}"
+    fi
+    return "$STATUS"
+}
+
+volss_ddns_show_log() {
+    local LOG_PATH
+    LOG_PATH=$(volss_ddns_log_path)
+    if [ ! -f "$LOG_PATH" ]; then
+        echo -e "${YELLOW}⚠ 暂无 DDNS 日志: $LOG_PATH${NC}"
+        return 1
+    fi
+    ui_choice_header "最近 100 行 DDNS 日志"
+    tail -n 100 "$LOG_PATH"
+}
+
+apply_ddns_entries_to_all_users_locked() {
+    local ENTRY_HOSTS_JSON USER_COUNT
+    if ! check_installed; then
+        echo -e "${RED}❌ 请先安装 Shadowsocks-Rust${NC}"
+        return 1
+    fi
+    if ! volss_ddns_load_entry_hosts; then
+        echo -e "${RED}❌ 开荒脚本尚未配置有效 DDNS 域名${NC}"
+        return 1
+    fi
+    ENTRY_HOSTS_JSON=$(entry_hosts_json "${DDNS_ENTRY_HOSTS[@]}") || return 1
+    USER_COUNT=$(python3 - "$CONFIG" "$ENTRY_HOSTS_JSON" << 'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+config_file, entry_hosts_json = sys.argv[1:]
+with open(config_file, encoding='utf-8') as f:
+    config = json.load(f)
+servers = config.get('servers', [])
+if not servers:
+    raise SystemExit(1)
+entry_hosts = json.loads(entry_hosts_json)
+for server in servers:
+    server['entry_hosts'] = entry_hosts
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w', encoding='utf-8') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+os.replace(tmp, config_file)
+print(len(servers))
+PYEOF
+) || {
+        echo -e "${RED}❌ 更新用户 DDNS 入口失败${NC}"
+        return 1
+    }
+
+    save_server_host "${DDNS_ENTRY_HOSTS[0]}" || return 1
+    secure_data_files
+    rebuild_links || return 1
+    generate_client_configs || return 1
+    if command -v qrencode >/dev/null 2>&1; then
+        generate_qr_codes >/dev/null || echo -e "${YELLOW}⚠ DDNS 入口已应用，但二维码未完整更新${NC}"
+    fi
+    echo -e "${GREEN}✅ 已将 DDNS 入口应用到 $USER_COUNT 个用户${NC}"
+    echo -e "  入口: ${YELLOW}${DDNS_ENTRY_HOSTS[*]}${NC}"
+    echo "  用户端口、密码和服务状态均未改变"
+}
+
+apply_ddns_entries_to_all_users() {
+    if ! volss_ddns_load_entry_hosts; then
+        echo -e "${RED}❌ 开荒脚本尚未配置有效 DDNS 域名${NC}"
+        return 1
+    fi
+    echo -e "即将把全部用户入口改为: ${YELLOW}${DDNS_ENTRY_HOSTS[*]}${NC}"
+    read -r -p "确认应用？[y/N]: " CONFIRM
+    [[ "$CONFIRM" =~ ^[Yy]$ ]] || {
+        echo "已取消"
+        return 0
+    }
+    with_state_lock apply_ddns_entries_to_all_users_locked
+}
+
+show_ddns_summary() {
+    local DOMAIN4 DOMAIN6
+    echo -e "  服务商: ${GREEN}$(volss_ddns_provider_label)${NC}"
+    echo -e "  模式:   $(volss_ddns_mode_label)"
+    DOMAIN4=$(volss_ddns_ipv4_host 2>/dev/null || true)
+    DOMAIN6=$(volss_ddns_ipv6_host 2>/dev/null || true)
+    if volss_ddns_enable_a; then
+        echo -e "  IPv4 A: ${DOMAIN4:-${RED}配置无效${NC}}"
+    else
+        echo "  IPv4 A: 未启用"
+    fi
+    if volss_ddns_enable_aaaa; then
+        echo -e "  IPv6 AAAA: ${DOMAIN6:-${RED}配置无效${NC}}"
+    else
+        echo "  IPv6 AAAA: 未启用"
+    fi
+    echo -e "  定时任务: $(volss_ddns_cron_status) / 每 $(volss_ddns_interval) 分钟"
+}
+
+show_ddns_menu() {
+    while true; do
+        show_submenu_header "DDNS 管理（开荒脚本）"
+        if [ -f "$DDNS_ZONE_FILE" ]; then
+            show_ddns_summary
+        else
+            echo -e "  状态: ${YELLOW}尚未配置${NC}"
+            echo "  支持 Cloudflare / 华为云 DNS，IPv4 A 与 IPv6 AAAA 可同域名或分开设置"
+        fi
+        echo ""
+        ui_menu_item 1 "打开 VPS Tools 完整 DDNS 配置"
+        ui_menu_item 2 "立即更新 DDNS"
+        ui_menu_item 3 "将 DDNS 入口应用到全部 VOLSS 用户"
+        ui_menu_item 4 "查看最近 DDNS 日志"
+        ui_menu_footer "返回安装与更新"
+        ui_read_choice CHOICE "0-4"
+        case $CHOICE in
+            1) run_vps_tools_ddns_menu || true; pause_menu ;;
+            2) volss_ddns_run_now; pause_menu ;;
+            3) apply_ddns_entries_to_all_users; pause_menu ;;
+            4) volss_ddns_show_log || true; pause_menu ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
 pause_menu() {
     read -r -p "按回车继续..."
 }
@@ -4792,15 +5203,17 @@ show_install_menu() {
         ui_menu_item 2 "单独升级 ssserver"
         ui_menu_item 3 "更新 VOLSS 脚本"
         ui_menu_item 4 "安装/修复 volss 快捷命令"
-        ui_menu_item 5 "卸载 Shadowsocks-Rust" danger
+        ui_menu_item 5 "DDNS 管理（开荒脚本）"
+        ui_menu_item 6 "卸载 Shadowsocks-Rust" danger
         ui_menu_footer "返回首页"
-        ui_read_choice CHOICE "0-5"
+        ui_read_choice CHOICE "0-6"
         case $CHOICE in
             1) do_install ;;
             2) upgrade_ssserver; pause_menu ;;
             3) do_update; pause_menu ;;
             4) install_shortcut; pause_menu ;;
-            5) do_uninstall; pause_menu ;;
+            5) show_ddns_menu ;;
+            6) do_uninstall; pause_menu ;;
             0) return ;;
             *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
         esac
@@ -5123,6 +5536,7 @@ fi
 
 case "$1" in
     --menu)                     show_main_menu ;;
+    --ddns-menu)                show_ddns_menu ;;
     --install-shortcut)         install_shortcut ;;
     --save-traffic)             save_traffic ;;
     --save-traffic-if-unlocked) save_traffic_if_unlocked ;;

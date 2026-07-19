@@ -96,6 +96,162 @@ test_host_helpers() {
     TESTS=$((TESTS + 1))
 }
 
+test_ddns_config_helpers() {
+    local DDNS_DIR="$TMP_ROOT/ddns-config"
+    mkdir -p "$DDNS_DIR"
+    DDNS_ZONE_FILE="$DDNS_DIR/.cf_zone"
+    DDNS_SCRIPT="$DDNS_DIR/ddns.sh"
+    DDNS_DEFAULT_LOG="$DDNS_DIR/ddns.log"
+
+    cat > "$DDNS_ZONE_FILE" << 'EOF'
+PROVIDER=cloudflare
+DOMAIN=ss.example.com
+DOMAIN4=v4.example.com
+DOMAIN6=v6.example.com
+MODE=dual
+ENABLE_A=true
+ENABLE_AAAA=true
+INTERVAL_MIN=2
+LOG=/var/log/ddns.log
+EOF
+    assert_eq "cloudflare" "$(volss_ddns_provider)" "parse Cloudflare DDNS provider"
+    assert_eq "IPv4 + IPv6（分别设置）" "$(volss_ddns_mode_label)" "parse separate dual-stack DDNS mode"
+    assert_eq "2" "$(volss_ddns_interval)" "parse DDNS update interval"
+    volss_ddns_load_entry_hosts || fail "load Cloudflare dual-stack domains"
+    assert_eq "v4.example.com v6.example.com" "${DDNS_ENTRY_HOSTS[*]}" "load A and AAAA domains"
+
+    DETECTED_IPV4="198.51.100.50"
+    DETECTED_IPV6="2001:db8::50"
+    select_entry_hosts "DDNS 默认入口" 0 <<< $'\n' >/dev/null || fail "select DDNS as default entry"
+    assert_eq "v4.example.com v6.example.com" "${ENTRY_HOSTS[*]}" "prefer configured DDNS entry"
+
+    cat > "$DDNS_ZONE_FILE" << 'EOF'
+DOMAIN=shared.example.com
+MODE=dual
+EOF
+    assert_eq "cloudflare" "$(volss_ddns_provider)" "default legacy provider to Cloudflare"
+    volss_ddns_load_entry_hosts || fail "load legacy shared dual-stack domain"
+    assert_eq "1" "${#DDNS_ENTRY_HOSTS[@]}" "deduplicate shared A and AAAA hostname"
+    assert_eq "shared.example.com" "${DDNS_ENTRY_HOSTS[0]}" "fall back legacy DOMAIN for dual stack"
+
+    cat > "$DDNS_ZONE_FILE" << 'EOF'
+PROVIDER=huawei
+DOMAIN4=hk-v4.example.com
+DOMAIN6=hk-v6.example.com
+ENABLE_A=true
+ENABLE_AAAA=true
+INTERVAL_MIN=99
+EOF
+    assert_eq "华为云 DNS" "$(volss_ddns_provider_label)" "parse Huawei DNS provider"
+    volss_ddns_load_entry_hosts || fail "load Huawei dual-stack domains"
+    assert_eq "hk-v4.example.com hk-v6.example.com" "${DDNS_ENTRY_HOSTS[*]}" "parse Huawei A and AAAA domains"
+    assert_eq "5" "$(volss_ddns_interval)" "normalize invalid DDNS interval"
+
+    printf '#!/usr/bin/env bash\nexit 0\n' > "$DDNS_SCRIPT"
+    crontab() {
+        printf '*/2 * * * * /root/ddns.sh # VPS_TOOLS_DDNS\n'
+    }
+    assert_eq "运行中" "$(volss_ddns_cron_status)" "detect managed DDNS cron task"
+    unset -f crontab
+}
+
+test_ddns_apply_to_users() {
+    CONFIG_DIR="$TMP_ROOT/ddns-apply"
+    CONFIG="$CONFIG_DIR/config.json"
+    RUNTIME="$CONFIG_DIR/runtime.json"
+    LINKS_FILE="$CONFIG_DIR/links.txt"
+    SERVER_HOST_FILE="$CONFIG_DIR/server_host"
+    TRAFFIC_FILE="$CONFIG_DIR/traffic.json"
+    MANUAL_FILE="$CONFIG_DIR/manual.list"
+    ACL_PATH="$CONFIG_DIR/blocklist.acl"
+    ACL_RULESET_DIR="$CONFIG_DIR/rulesets"
+    EXPORT_DIR="$CONFIG_DIR/exports"
+    CLASH_CONFIG="$EXPORT_DIR/clash.yaml"
+    MIHOMO_CONFIG="$EXPORT_DIR/mihomo.yaml"
+    SINGBOX_CONFIG="$EXPORT_DIR/sing-box.json"
+    QR_DIR="$CONFIG_DIR/qrcodes"
+    TRAFFIC_BACKEND_FILE="$CONFIG_DIR/traffic_backend"
+    NFT_RULES_FILE="$CONFIG_DIR/volss.nft"
+    DDNS_ZONE_FILE="$CONFIG_DIR/.cf_zone"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' 'old.example.com' > "$SERVER_HOST_FILE"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":33001,"method":"aes-256-gcm","password":"keep-one","name":"Node One","entry_hosts":["198.51.100.1"]},{"server":"::","server_port":33002,"method":"aes-256-gcm","password":"keep-two","name":"Node Two","entry_hosts":["2001:db8::2"]}]}' > "$CONFIG"
+    cat > "$DDNS_ZONE_FILE" << 'EOF'
+PROVIDER=cloudflare
+DOMAIN4=v4.proxy.example.com
+DOMAIN6=v6.proxy.example.com
+ENABLE_A=true
+ENABLE_AAAA=true
+EOF
+    check_installed() { return 0; }
+
+    apply_ddns_entries_to_all_users_locked >/dev/null || fail "apply DDNS domains to all users"
+    assert_eq "v4.proxy.example.com v6.proxy.example.com|v4.proxy.example.com v6.proxy.example.com" "$(python3 -c "import json; c=json.load(open('$CONFIG')); print('|'.join(' '.join(s['entry_hosts']) for s in c['servers']))")" "persist DDNS entries for every user"
+    assert_eq "33001:keep-one 33002:keep-two" "$(python3 -c "import json; c=json.load(open('$CONFIG')); print(' '.join(f\"{s['server_port']}:{s['password']}\" for s in c['servers']))")" "preserve user ports and passwords"
+    assert_eq "v4.proxy.example.com" "$(cat "$SERVER_HOST_FILE")" "set DDNS IPv4 domain as primary fallback"
+    assert_true "rebuild DDNS IPv4 SS link" grep -Fq '@v4.proxy.example.com:33001#Node%20One-IPv4' "$LINKS_FILE"
+    assert_true "rebuild DDNS IPv6 SS link" grep -Fq '@v6.proxy.example.com:33001#Node%20One-IPv6' "$LINKS_FILE"
+    assert_true "export DDNS IPv4 Clash node" grep -Fq 'server: "v4.proxy.example.com"' "$CLASH_CONFIG"
+    assert_true "export DDNS IPv6 Clash node" grep -Fq 'server: "v6.proxy.example.com"' "$CLASH_CONFIG"
+    assert_true "label DDNS export by address family" grep -Fq 'name: "Node One-IPv6"' "$CLASH_CONFIG"
+    assert_true "export DDNS sing-box node" grep -Fq '"server": "v6.proxy.example.com"' "$SINGBOX_CONFIG"
+}
+
+test_vps_tools_ddns_invocation() {
+    local TOOL_DIR="$TMP_ROOT/vps-tools"
+    local TOOL_SCRIPT="$TOOL_DIR/vps-tools"
+    local REMOTE_SCRIPT="$TOOL_DIR/SSH-Hardening.sh"
+    local REMOTE_CHECKSUM="$TOOL_DIR/SSH-Hardening.sh.sha256"
+    mkdir -p "$TOOL_DIR"
+    export VPS_CAPTURE="$TOOL_DIR/invocations"
+    cat > "$TOOL_SCRIPT" << 'EOF'
+#!/usr/bin/env bash
+# VPS 开荒脚本 V3.10.6
+APP_UI_TITLE="VPS TOOLS"
+APP_VERSION="V3.10.6"
+case "${1:-}" in
+    --ddns-menu) printf 'local:%s\n' "$1" >> "$VPS_CAPTURE" ;;
+esac
+EOF
+    chmod +x "$TOOL_SCRIPT"
+    VPS_TOOLS_SCRIPT="$TOOL_SCRIPT"
+    VOLSS_SKIP_VPS_TOOLS_SHORTCUTS=1
+    run_vps_tools_ddns_menu || fail "invoke local VPS Tools DDNS menu"
+    assert_true "pass DDNS menu argument to local VPS Tools" grep -Fqx 'local:--ddns-menu' "$VPS_CAPTURE"
+
+    sed 's/local:/download:/' "$TOOL_SCRIPT" > "$REMOTE_SCRIPT"
+    printf '%s  SSH-Hardening.sh\n' "$(sha256_file "$REMOTE_SCRIPT")" > "$REMOTE_CHECKSUM"
+    VPS_TOOLS_SCRIPT="$TOOL_DIR/missing"
+    if ! (
+        fetch_url() {
+            case $1 in
+                *.sha256) cp "$REMOTE_CHECKSUM" "$2" ;;
+                *) cp "$REMOTE_SCRIPT" "$2" ;;
+            esac
+        }
+        run_vps_tools_ddns_menu >/dev/null
+    ); then
+        fail "run verified downloaded VPS Tools DDNS menu"
+    fi
+    TESTS=$((TESTS + 1))
+    assert_true "pass DDNS menu argument to downloaded VPS Tools" grep -Fqx 'download:--ddns-menu' "$VPS_CAPTURE"
+
+    printf '%064d  SSH-Hardening.sh\n' 0 > "$REMOTE_CHECKSUM"
+    if (
+        fetch_url() {
+            case $1 in
+                *.sha256) cp "$REMOTE_CHECKSUM" "$2" ;;
+                *) cp "$REMOTE_SCRIPT" "$2" ;;
+            esac
+        }
+        run_vps_tools_ddns_menu >/dev/null 2>&1
+    ); then
+        fail "execute downloaded VPS Tools with invalid checksum"
+    fi
+    TESTS=$((TESTS + 1))
+    unset VPS_CAPTURE VOLSS_SKIP_VPS_TOOLS_SHORTCUTS
+}
+
 test_link_name_management() {
     CONFIG_DIR="$TMP_ROOT/names"
     CONFIG="$CONFIG_DIR/config.json"
@@ -440,6 +596,20 @@ test_submenu_layouts() {
     done
 }
 
+test_ddns_menu_layout() {
+    local OUTPUT
+    clear() { :; }
+    DDNS_ZONE_FILE="$TMP_ROOT/ddns-menu-missing"
+    OUTPUT=$(show_ddns_menu <<< $'0\n' | strip_ansi) || fail "DDNS menu is available before Shadowsocks installation"
+    assert_true "DDNS menu uses shared VOLSS banner" grep -Fq 'Shadowsocks-Rust 管理脚本' <<< "$OUTPUT"
+    assert_true "DDNS menu opens VPS Tools configuration" grep -Fq '1) 打开 VPS Tools 完整 DDNS 配置' <<< "$OUTPUT"
+    assert_true "DDNS menu applies domains to users" grep -Fq '3) 将 DDNS 入口应用到全部 VOLSS 用户' <<< "$OUTPUT"
+    assert_true "DDNS menu returns to install category" grep -Fq '0) 返回安装与更新' <<< "$OUTPUT"
+
+    OUTPUT=$(show_install_menu <<< $'0\n' | strip_ansi) || fail "return from install menu with DDNS entry"
+    assert_true "install menu exposes bootstrap DDNS management" grep -Fq '5) DDNS 管理（开荒脚本）' <<< "$OUTPUT"
+}
+
 test_ruleset_menu_layout() {
     local OUTPUT
     ACL_RULESET_DIR="$TMP_ROOT/menu-rulesets"
@@ -659,6 +829,9 @@ test_nonblocking_stop_hook() {
 }
 
 test_host_helpers
+test_ddns_config_helpers
+test_ddns_apply_to_users
+test_vps_tools_ddns_invocation
 test_port_selection
 test_link_name_management
 test_runtime_omits_link_names
@@ -679,6 +852,7 @@ test_ssserver_upgrade_preserves_config
 test_install_shortcut
 test_main_menu_layout
 test_submenu_layouts
+test_ddns_menu_layout
 test_ruleset_menu_layout
 test_user_submenu_routing
 test_ruleset_browser_routing
