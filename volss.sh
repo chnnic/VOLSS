@@ -3,7 +3,7 @@
 
 # ========================================
 #   Shadowsocks-Rust 管理脚本
-#   版本: V1.7.0
+#   版本: V1.7.1
 #   快捷命令: volss
 #   支持: Debian / Ubuntu / Alpine
 # ========================================
@@ -30,7 +30,7 @@ if [ -z "$BASH_VERSION" ]; then
     fi
 fi
 
-VERSION="V1.7.0"
+VERSION="V1.7.1"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -3000,7 +3000,228 @@ PYEOF
     fi
     rebuild_links || return 1
     apply_config || return 1
+    refresh_client_exports || echo -e "${YELLOW}⚠ 密码已重置，但客户端导出或二维码未完整刷新${NC}"
     show_links
+}
+
+refresh_client_exports() {
+    generate_client_configs || return 1
+    if command -v qrencode >/dev/null 2>&1; then
+        generate_qr_codes >/dev/null || return 1
+    fi
+}
+
+show_reset_user_links() {
+    local NUMBER=$1
+    local SCOPE=$2
+    local FALLBACK_HOST DDNS_IPV4_HOST DDNS_IPV6_HOST LINK_LABEL LINK_VALUE FOUND=0
+    FALLBACK_HOST=$(get_server_host 2>/dev/null) || return 1
+    DDNS_IPV4_HOST=$(volss_ddns_ipv4_host 2>/dev/null || true)
+    DDNS_IPV6_HOST=$(volss_ddns_ipv6_host 2>/dev/null || true)
+
+    while IFS='|' read -r LINK_LABEL LINK_VALUE; do
+        if [ -z "$LINK_LABEL" ] || [ -z "$LINK_VALUE" ]; then
+            continue
+        fi
+        echo -e "  ${CYAN}${LINK_LABEL}${NC}"
+        printf '  %s\n' "$LINK_VALUE"
+        FOUND=1
+    done < <(python3 - "$CONFIG" "$LINKS_FILE" "$NUMBER" "$SCOPE" "$FALLBACK_HOST" "$DDNS_IPV4_HOST" "$DDNS_IPV6_HOST" << 'PYEOF'
+import ipaddress
+import json
+import sys
+
+config_file, links_file, number, scope, fallback_host, ddns_ipv4_host, ddns_ipv6_host = sys.argv[1:]
+with open(config_file, encoding='utf-8') as f:
+    servers = json.load(f).get('servers', [])
+index = int(number) - 1
+if not 0 <= index < len(servers):
+    raise SystemExit(1)
+server = servers[index]
+hosts = server.get('entry_hosts')
+if not isinstance(hosts, list) or not hosts or not all(isinstance(host, str) and host for host in hosts):
+    hosts = [fallback_host]
+hosts = list(dict.fromkeys(hosts))
+
+def label(host, entry_index):
+    try:
+        return f'IPv{ipaddress.ip_address(host).version}'
+    except ValueError:
+        if host == ddns_ipv4_host == ddns_ipv6_host:
+            return 'IPv4 + IPv6'
+        if ddns_ipv4_host != ddns_ipv6_host and host == ddns_ipv4_host:
+            return 'IPv4'
+        if ddns_ipv4_host != ddns_ipv6_host and host == ddns_ipv6_host:
+            return 'IPv6'
+        return f'入口 {entry_index}'
+
+if scope == 'all':
+    selected = list(enumerate(hosts, 1))
+else:
+    selected_index = int(scope)
+    if not 1 <= selected_index <= len(hosts):
+        raise SystemExit(1)
+    selected = [(selected_index, hosts[selected_index - 1])]
+selected_labels = {host: label(host, entry_index) for entry_index, host in selected}
+
+with open(links_file, encoding='utf-8') as f:
+    for line in f:
+        link = line.strip()
+        if not link or '@' not in link:
+            continue
+        authority = link.split('@', 1)[1].split('#', 1)[0]
+        try:
+            if authority.startswith('['):
+                end = authority.index(']')
+                host = authority[1:end]
+                port = authority[end + 2:]
+            else:
+                host, port = authority.rsplit(':', 1)
+        except ValueError:
+            continue
+        if port == str(server['server_port']) and host in selected_labels:
+            print(f"{selected_labels[host]}|{link}")
+PYEOF
+)
+    [ "$FOUND" -eq 1 ]
+}
+
+reset_user_links_locked() {
+    local NUMBER FALLBACK_HOST DDNS_IPV4_HOST DDNS_IPV6_HOST ENTRY_INFO CHOICE SCOPE
+    local -a RESET_ENTRY_HOSTS RESET_ENTRY_LABELS RESET_ENTRY_INFO
+    if ! check_installed; then
+        echo -e "${RED}❌ 请先安装 Shadowsocks-Rust${NC}"
+        return 1
+    fi
+
+    list_users
+    read -r -p "输入要重置链接的用户编号: " NUMBER
+    if ! is_uint "$NUMBER" || [ "$NUMBER" -lt 1 ]; then
+        echo -e "${RED}❌ 无效编号${NC}"
+        return 1
+    fi
+    FALLBACK_HOST=$(get_server_host 2>/dev/null) || {
+        echo -e "${RED}❌ 未找到服务器入口${NC}"
+        return 1
+    }
+    DDNS_IPV4_HOST=$(volss_ddns_ipv4_host 2>/dev/null || true)
+    DDNS_IPV6_HOST=$(volss_ddns_ipv6_host 2>/dev/null || true)
+    mapfile -t RESET_ENTRY_INFO < <(python3 - "$CONFIG" "$NUMBER" "$FALLBACK_HOST" "$DDNS_IPV4_HOST" "$DDNS_IPV6_HOST" << 'PYEOF'
+import ipaddress
+import json
+import sys
+
+config_file, number, fallback_host, ddns_ipv4_host, ddns_ipv6_host = sys.argv[1:]
+with open(config_file, encoding='utf-8') as f:
+    servers = json.load(f).get('servers', [])
+index = int(number) - 1
+if not 0 <= index < len(servers):
+    raise SystemExit(1)
+hosts = servers[index].get('entry_hosts')
+if not isinstance(hosts, list) or not hosts or not all(isinstance(host, str) and host for host in hosts):
+    hosts = [fallback_host]
+hosts = list(dict.fromkeys(hosts))
+if not 1 <= len(hosts) <= 2:
+    raise SystemExit(1)
+
+for entry_index, host in enumerate(hosts, 1):
+    try:
+        label = f'IPv{ipaddress.ip_address(host).version}'
+    except ValueError:
+        if host == ddns_ipv4_host == ddns_ipv6_host:
+            label = 'IPv4 + IPv6'
+        elif ddns_ipv4_host != ddns_ipv6_host and host == ddns_ipv4_host:
+            label = 'IPv4'
+        elif ddns_ipv4_host != ddns_ipv6_host and host == ddns_ipv6_host:
+            label = 'IPv6'
+        else:
+            label = f'入口 {entry_index}'
+    print(f'{host}|{label}')
+PYEOF
+)
+    if [ "${#RESET_ENTRY_INFO[@]}" -eq 0 ]; then
+        echo -e "${RED}❌ 无效编号或用户入口配置无效${NC}"
+        return 1
+    fi
+    for ENTRY_INFO in "${RESET_ENTRY_INFO[@]}"; do
+        RESET_ENTRY_HOSTS+=("${ENTRY_INFO%%|*}")
+        RESET_ENTRY_LABELS+=("${ENTRY_INFO#*|}")
+    done
+
+    ui_choice_header "重置用户 $NUMBER 的密码与链接"
+    echo -e "  ${YELLOW}安全说明：IPv4/IPv6 入口共用同一密码。重置后该用户的所有旧链接都会失效。${NC}"
+    if [ "${#RESET_ENTRY_HOSTS[@]}" -eq 1 ]; then
+        ui_menu_item 1 "重置密码并显示 ${RESET_ENTRY_LABELS[0]} 新链接  ${RESET_ENTRY_HOSTS[0]}" warning
+        ui_choice_footer
+        ui_read_choice CHOICE "0-1" 1
+        case $CHOICE in
+            1) SCOPE=1 ;;
+            0) return ;;
+            *) echo -e "${RED}❌ 无效选择${NC}"; return 1 ;;
+        esac
+    else
+        ui_menu_item 1 "重置密码并显示 ${RESET_ENTRY_LABELS[0]} 新链接  ${RESET_ENTRY_HOSTS[0]}" warning
+        ui_menu_item 2 "重置密码并显示 ${RESET_ENTRY_LABELS[1]} 新链接  ${RESET_ENTRY_HOSTS[1]}" warning
+        ui_menu_item 3 "重置密码并显示两个入口的新链接" warning
+        ui_choice_footer
+        ui_read_choice CHOICE "0-3" 3
+        case $CHOICE in
+            1|2) SCOPE=$CHOICE ;;
+            3) SCOPE=all ;;
+            0) return ;;
+            *) echo -e "${RED}❌ 无效选择${NC}"; return 1 ;;
+        esac
+    fi
+
+    read -r -p "确认重置？该用户的旧 IPv4/IPv6 链接都将失效 [y/N]: " CONFIRM
+    if [[ ! "$CONFIRM" =~ ^[Yy]$ ]]; then
+        echo "已取消"
+        return 0
+    fi
+    if ! python3 - "$CONFIG" "$NUMBER" << 'PYEOF'
+import json
+import os
+import subprocess
+import sys
+import tempfile
+
+config_file, number = sys.argv[1:]
+with open(config_file, encoding='utf-8') as f:
+    config = json.load(f)
+index = int(number) - 1
+servers = config.get('servers', [])
+if not 0 <= index < len(servers):
+    raise SystemExit(1)
+method = str(servers[index].get('method') or '')
+if 'aes-128' in method:
+    key_len = 16
+elif 'aes-256' in method or 'chacha20' in method:
+    key_len = 32
+else:
+    key_len = 0
+raw = subprocess.check_output(
+    ['openssl', 'rand', '-base64', str(key_len if key_len > 0 else 32)],
+    text=True,
+).strip()
+servers[index]['password'] = raw if key_len > 0 else raw.replace('=', '')[:24]
+fd, tmp = tempfile.mkstemp(prefix='.' + os.path.basename(config_file) + '.', dir=os.path.dirname(config_file), text=True)
+with os.fdopen(fd, 'w', encoding='utf-8') as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write('\n')
+os.replace(tmp, config_file)
+PYEOF
+    then
+        echo -e "${RED}❌ 重置用户密码失败${NC}"
+        return 1
+    fi
+    secure_data_files
+    rebuild_links || return 1
+    apply_config || return 1
+    refresh_client_exports || echo -e "${YELLOW}⚠ 密码已重置，但客户端导出或二维码未完整刷新${NC}"
+
+    echo -e "${GREEN}✅ 用户 $NUMBER 的密码已重置，所有旧链接均已失效${NC}"
+    echo "  请仅将以下新链接发送给用户："
+    show_reset_user_links "$NUMBER" "$SCOPE" || return 1
 }
 
 # ========== 添加新用户 ==========
@@ -3278,6 +3499,10 @@ delete_user() {
 
 regen_users() {
     with_state_lock regen_users_locked
+}
+
+reset_user_links() {
+    with_state_lock reset_user_links_locked
 }
 
 add_user() {
@@ -5220,6 +5445,22 @@ show_install_menu() {
     done
 }
 
+show_credential_menu() {
+    while true; do
+        show_submenu_header "密码与链接重置"
+        ui_menu_item 1 "重置单个用户密码并生成新链接" warning
+        ui_menu_item 2 "重新生成所有用户密码" warning
+        ui_menu_footer "返回用户管理"
+        ui_read_choice CHOICE "0-2"
+        case $CHOICE in
+            1) reset_user_links; pause_menu ;;
+            2) regen_users; pause_menu ;;
+            0) return ;;
+            *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
 show_user_menu() {
     while true; do
         show_submenu_header "用户管理"
@@ -5231,7 +5472,7 @@ show_user_menu() {
         ui_menu_item 6 "暂停用户" warning
         ui_menu_item 7 "恢复用户"
         ui_menu_item 8 "删除用户" danger
-        ui_menu_item 9 "重新生成所有用户密码" warning
+        ui_menu_item 9 "密码与链接重置" warning
         ui_menu_footer "返回首页"
         ui_read_choice CHOICE "0-9"
         case $CHOICE in
@@ -5243,7 +5484,7 @@ show_user_menu() {
             6) disable_user; pause_menu ;;
             7) enable_user; pause_menu ;;
             8) delete_user; pause_menu ;;
-            9) regen_users; pause_menu ;;
+            9) show_credential_menu ;;
             0) return ;;
             *) echo -e "${RED}无效选项${NC}"; sleep 1 ;;
         esac

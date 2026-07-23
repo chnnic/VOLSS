@@ -281,6 +281,70 @@ test_link_name_management() {
     assert_true "encode renamed link fragment" grep -Fq '#%E8%87%AA%E5%AE%9A%E4%B9%89%20Node' "$LINKS_FILE"
 }
 
+test_single_user_link_reset() {
+    CONFIG_DIR="$TMP_ROOT/reset-user-links"
+    CONFIG="$CONFIG_DIR/config.json"
+    RUNTIME="$CONFIG_DIR/runtime.json"
+    LINKS_FILE="$CONFIG_DIR/links.txt"
+    SERVER_HOST_FILE="$CONFIG_DIR/server_host"
+    TRAFFIC_FILE="$CONFIG_DIR/traffic.json"
+    MANUAL_FILE="$CONFIG_DIR/manual.list"
+    ACL_PATH="$CONFIG_DIR/blocklist.acl"
+    ACL_RULESET_DIR="$CONFIG_DIR/rulesets"
+    DDNS_ZONE_FILE="$CONFIG_DIR/no-ddns-config"
+    mkdir -p "$CONFIG_DIR"
+    printf '%s\n' '198.51.100.60' > "$SERVER_HOST_FILE"
+    printf '%s\n' '{"servers":[{"server":"::","server_port":34001,"method":"aes-256-gcm","password":"leaked-password","name":"Leaked Node","entry_hosts":["198.51.100.60","2001:db8::60"],"quota_bytes":1000,"expires_at":"2030-01-01"},{"server":"::","server_port":34002,"method":"aes-256-gcm","password":"other-password","name":"Other Node","entry_hosts":["198.51.100.61"]}]}' > "$CONFIG"
+
+    check_installed() { return 0; }
+    list_users() { :; }
+    secure_data_files() { :; }
+    APPLY_COUNT=0
+    EXPORT_REFRESH_COUNT=0
+    save_traffic() { :; }
+    svc_reload() { :; }
+    svc_restart() { APPLY_COUNT=$((APPLY_COUNT + 1)); }
+    refresh_client_exports() { EXPORT_REFRESH_COUNT=$((EXPORT_REFRESH_COUNT + 1)); }
+    rebuild_links || fail "build initial links for single-user reset"
+    OLD_LINKS=$(cat "$LINKS_FILE")
+
+    RESET_OUTPUT_FILE="$CONFIG_DIR/reset-ipv4-output"
+    reset_user_links_locked <<< $'1\n1\ny\n' > "$RESET_OUTPUT_FILE" || fail "reset and export selected IPv4 link"
+    RESET_OUTPUT=$(cat "$RESET_OUTPUT_FILE")
+    FIRST_PASSWORD=$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][0]['password'])")
+    assert_true "rotate leaked user password" test "$FIRST_PASSWORD" != "leaked-password"
+    assert_eq "other-password" "$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][1]['password'])")" "keep other user password"
+    assert_eq "34001 198.51.100.60 2001:db8::60 1000 2030-01-01" "$(python3 -c "import json; s=json.load(open('$CONFIG'))['servers'][0]; print(s['server_port'], *s['entry_hosts'], s['quota_bytes'], s['expires_at'])")" "preserve reset user port entries and policy"
+    if grep -Fqx "$(sed -n '1p' <<< "$OLD_LINKS")" "$LINKS_FILE" || grep -Fqx "$(sed -n '2p' <<< "$OLD_LINKS")" "$LINKS_FILE"; then
+        fail "invalidate all old dual-stack links"
+    fi
+    TESTS=$((TESTS + 1))
+    assert_true "show selected new IPv4 link" grep -Fq '@198.51.100.60:34001#Leaked%20Node-IPv4' <<< "$RESET_OUTPUT"
+    if grep -Fq '@[2001:db8::60]:34001#Leaked%20Node-IPv6' <<< "$RESET_OUTPUT"; then
+        fail "IPv4 reset also prints IPv6 delivery link"
+    fi
+    TESTS=$((TESTS + 1))
+
+    RESET_OUTPUT_FILE="$CONFIG_DIR/reset-ipv6-output"
+    reset_user_links_locked <<< $'1\n2\ny\n' > "$RESET_OUTPUT_FILE" || fail "reset and export selected IPv6 link"
+    RESET_OUTPUT=$(cat "$RESET_OUTPUT_FILE")
+    SECOND_PASSWORD=$(python3 -c "import json; print(json.load(open('$CONFIG'))['servers'][0]['password'])")
+    assert_true "rotate password again for IPv6 delivery" test "$SECOND_PASSWORD" != "$FIRST_PASSWORD"
+    assert_true "show selected new IPv6 link" grep -Fq '@[2001:db8::60]:34001#Leaked%20Node-IPv6' <<< "$RESET_OUTPUT"
+    if grep -Fq '@198.51.100.60:34001#Leaked%20Node-IPv4' <<< "$RESET_OUTPUT"; then
+        fail "IPv6 reset also prints IPv4 delivery link"
+    fi
+    TESTS=$((TESTS + 1))
+
+    RESET_OUTPUT_FILE="$CONFIG_DIR/reset-dual-output"
+    reset_user_links_locked <<< $'1\n3\ny\n' > "$RESET_OUTPUT_FILE" || fail "reset and export dual-stack links"
+    RESET_OUTPUT=$(cat "$RESET_OUTPUT_FILE")
+    assert_true "show IPv4 link for dual delivery" grep -Fq '@198.51.100.60:34001#Leaked%20Node-IPv4' <<< "$RESET_OUTPUT"
+    assert_true "show IPv6 link for dual delivery" grep -Fq '@[2001:db8::60]:34001#Leaked%20Node-IPv6' <<< "$RESET_OUTPUT"
+    assert_eq "3" "$APPLY_COUNT" "restart service for each credential reset"
+    assert_eq "3" "$EXPORT_REFRESH_COUNT" "refresh exports for each credential reset"
+}
+
 test_runtime_omits_link_names() {
     CONFIG_DIR="$TMP_ROOT/runtime-name"
     CONFIG="$CONFIG_DIR/config.json"
@@ -596,6 +660,18 @@ test_submenu_layouts() {
     done
 }
 
+test_credential_menu_routing() {
+    SUBMENU_ACTION=""
+    show_submenu_header() { :; }
+    pause_menu() { :; }
+    reset_user_links() { SUBMENU_ACTION="single-user"; }
+
+    show_credential_menu <<< $'1\n0\n' >/dev/null || fail "return from credential reset menu"
+    assert_eq "single-user" "$SUBMENU_ACTION" "credential menu routes individual reset"
+    OUTPUT=$(show_credential_menu <<< $'0\n' | strip_ansi) || fail "credential menu returns to users"
+    assert_true "credential menu returns to user management" grep -Fq '0) 返回用户管理' <<< "$OUTPUT"
+}
+
 test_ddns_menu_layout() {
     local OUTPUT
     clear() { :; }
@@ -834,6 +910,7 @@ test_ddns_apply_to_users
 test_vps_tools_ddns_invocation
 test_port_selection
 test_link_name_management
+test_single_user_link_reset
 test_runtime_omits_link_names
 test_add_user_custom_name
 test_configure_existing_user_entries
@@ -853,6 +930,7 @@ test_install_shortcut
 test_main_menu_layout
 test_submenu_layouts
 test_ddns_menu_layout
+test_credential_menu_routing
 test_ruleset_menu_layout
 test_user_submenu_routing
 test_ruleset_browser_routing
